@@ -1,0 +1,2 @@
+[entry-points."defsort.hook_adapters"]
+agy = "plugins.agy._defsort._adapter:AntigravityAdapter"

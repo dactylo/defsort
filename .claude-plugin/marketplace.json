@@ -1,0 +1,18 @@
+{
+  "name": "defsort",
+  "description": "Agent hook integration for defsort.",
+  "owner": {
+    "name": "defsort contributors"
+  },
+  "plugins": [
+    {
+      "name": "defsort",
+      "source": "./plugins/claude",
+      "description": "Install the defsort commit-time definition sorting hook for Claude Code.",
+      "version": "0.1.0",
+      "author": {
+        "name": "defsort contributors"
+      }
+    }
+  ]
+}

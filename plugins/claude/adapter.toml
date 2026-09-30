@@ -1,0 +1,2 @@
+[entry-points."defsort.hook_adapters"]
+claude = "plugins.claude._defsort._adapter:ClaudeAdapter"

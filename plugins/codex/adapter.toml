@@ -1,0 +1,2 @@
+[entry-points."defsort.hook_adapters"]
+codex = "plugins.codex._defsort._adapter:CodexAdapter"

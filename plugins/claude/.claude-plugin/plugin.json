@@ -1,0 +1,10 @@
+{
+  "name": "defsort",
+  "version": "0.1.0",
+  "description": "Install the defsort commit-time definition sorting hook for Claude Code.",
+  "author": {
+    "name": "defsort contributors"
+  },
+  "license": "MIT",
+  "keywords": ["definitions", "dependency", "hooks", "python", "sorting"]
+}

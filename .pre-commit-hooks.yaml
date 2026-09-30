@@ -1,0 +1,10 @@
+- id: defsort
+  name: defsort
+  entry: defsort --write
+  language: python
+  types: [python]
+- id: defsort-check
+  name: defsort-check
+  entry: defsort
+  language: python
+  types: [python]
