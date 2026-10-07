@@ -11,6 +11,7 @@ from defsort._core._analysis import (
     has_future_annotations_import,
 )
 from defsort._core._banners import (
+    compile_banner_pattern,
     order_within_sections,
 )
 from defsort._core._full import sort_file
@@ -75,8 +76,6 @@ class _IncrementalMethodResult:
     """Result of incremental method sorting across classes."""
 
     new_source: str | None
-    had_new_methods: bool
-    blocker: Blocker | None
     method_sorts: list[MethodSortInfo]
     banner_constraints: list[BannerConstraint]
     class_blockers: list[ClassBlocker]
@@ -102,7 +101,6 @@ class _TopLevelMergeResult:
     new_source: str
     blocker: Blocker | None
     sorted_defs: tuple[Definition, ...] = ()
-    boundary_layout: tuple[BoundaryLayoutPart, ...] = ()
     banner_constraints: tuple[BannerConstraint, ...] = ()
 
 
@@ -133,8 +131,6 @@ def _incremental_method_sort(
     if policy.method_order == 'none' and policy.banners != 'strip':
         return _IncrementalMethodResult(
             new_source=None,
-            had_new_methods=False,
-            blocker=None,
             method_sorts=[],
             banner_constraints=[],
             class_blockers=[],
@@ -153,15 +149,14 @@ def _incremental_method_sort(
     bl_classes = [n for n in baseline_tree.body if isinstance(n, ast.ClassDef)]
     matched = match_classes(cur_classes, bl_classes)
 
-    had_new_methods = False
     class_blockers: list[ClassBlocker] = []
-    last_blocker: Blocker | None = None
     method_sorts: list[MethodSortInfo] = []
     constraints: list[BannerConstraint] = []
     # Track replacements: list of (start_line, end_line, new_class_source)
     replacements: list[tuple[int, int, str]] = []
     current_seen: Counter[str] = Counter()
     collect_bodies = policy.method_order == 'dependency' and policy.method_bodies != 'ignore'
+    pattern = compile_banner_pattern(policy.banner_pattern) if policy.banners != 'ignore' else None
 
     for cur_cls, bl_cls in matched:
         current_seen[cur_cls.name] += 1
@@ -176,7 +171,7 @@ def _incremental_method_sort(
             cur_cls,
             cur_cs,
             banners=policy.banners,
-            banner_pattern=policy.banner_pattern,
+            banner_pattern=pattern,
             collect_bodies=collect_bodies,
         )
         original_parse = (
@@ -194,7 +189,7 @@ def _incremental_method_sort(
                 bl_cls,
                 bl_cs,
                 banners=policy.banners,
-                banner_pattern=policy.banner_pattern,
+                banner_pattern=pattern,
                 collect_bodies=collect_bodies,
             )
 
@@ -206,12 +201,10 @@ def _incremental_method_sort(
             cur_cs,
             policy=policy,
             original_parse=original_parse,
+            banner_pattern=pattern,
         )
 
-        if result.had_new_methods:
-            had_new_methods = True
         if result.blocker is not None:
-            last_blocker = result.blocker
             class_blockers.append(
                 ClassBlocker(
                     class_name=cur_cls.name,
@@ -230,16 +223,12 @@ def _incremental_method_sort(
     if new_source is None or new_source == source:
         return _IncrementalMethodResult(
             new_source=None,
-            had_new_methods=had_new_methods,
-            blocker=last_blocker,
             method_sorts=[],
             banner_constraints=constraints,
             class_blockers=class_blockers,
         )
     return _IncrementalMethodResult(
         new_source=new_source,
-        had_new_methods=had_new_methods,
-        blocker=last_blocker,
         method_sorts=method_sorts,
         banner_constraints=constraints,
         class_blockers=class_blockers,
@@ -349,7 +338,6 @@ def _top_level_incremental_merge(  # noqa: PLR0911, PLR0913
             new_source=source,
             blocker=None,
             sorted_defs=tuple(current_defs),
-            boundary_layout=tuple(boundary_layout),
             banner_constraints=tuple(constraints),
         )
 
@@ -363,7 +351,6 @@ def _top_level_incremental_merge(  # noqa: PLR0911, PLR0913
             new_source=source,
             blocker=None,
             sorted_defs=tuple(merged),
-            boundary_layout=tuple(boundary_layout),
             banner_constraints=tuple(constraints),
         )
 
@@ -375,7 +362,6 @@ def _top_level_incremental_merge(  # noqa: PLR0911, PLR0913
             new_source=source,
             blocker=None,
             sorted_defs=tuple(merged),
-            boundary_layout=tuple(boundary_layout),
             banner_constraints=tuple(constraints),
         )
 
@@ -383,7 +369,6 @@ def _top_level_incremental_merge(  # noqa: PLR0911, PLR0913
         new_source=new_source,
         blocker=None,
         sorted_defs=tuple(merged),
-        boundary_layout=tuple(boundary_layout),
         banner_constraints=tuple(constraints),
     )
 
@@ -484,7 +469,6 @@ def _sort_incremental(
             new_source=top_source,
             blocker=None,
             sorted_defs=tuple(current_defs),
-            boundary_layout=tuple(current_parsed.boundary_layout),
             banner_constraints=(),
         )
     else:

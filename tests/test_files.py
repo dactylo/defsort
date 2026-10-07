@@ -1,4 +1,3 @@
-import io
 import os
 import shutil
 import stat
@@ -11,15 +10,12 @@ import pytest
 
 import defsort._files as files_mod
 from defsort._files import (
-    _ReadResult,
     collect_files,
     encode_source,
-    ensure_utf8_stdio,
-    read_file,
     read_file_result,
     write_source,
 )
-from tests._helpers import _ENV, process_transcript, run_setup
+from tests._helpers import run_setup
 
 
 class TestCollectFiles:
@@ -264,132 +260,25 @@ class TestEncodeSource:
         assert result == b'\xef\xbb\xbfx = 1\r'
 
 
-class TestEnsureUtf8Stdio:
-    def test_noop_without_reconfigure(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr('sys.platform', 'win32')
-        monkeypatch.setattr('sys.stdin', io.StringIO())
-        monkeypatch.setattr('sys.stdout', io.StringIO())
-        monkeypatch.setattr('sys.stderr', io.StringIO())
-        ensure_utf8_stdio()  # StringIO lacks reconfigure; should not raise
-
-    def test_posix_stdout_uses_backslashreplace(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[dict[str, str]] = []
-
-        class _FakeStream:
-            errors = 'surrogateescape'
-
-            def reconfigure(self, **kwargs: str) -> None:
-                calls.append(kwargs)
-
-        stream = _FakeStream()
-        monkeypatch.setattr('sys.platform', 'linux')
-        monkeypatch.setattr('sys.stdin', stream)
-        monkeypatch.setattr('sys.stdout', stream)
-        monkeypatch.setattr('sys.stderr', stream)
-
-        ensure_utf8_stdio()
-
-        assert calls == [{'errors': 'backslashreplace'}]
-
-    def test_reconfigures_stderr(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[dict[str, str]] = []
-
-        class _FakeStderr:
-            errors = 'surrogatepass'
-
-            def reconfigure(self, **kwargs: str) -> None:
-                calls.append(kwargs)
-
-        monkeypatch.setattr('sys.platform', 'win32')
-        monkeypatch.setattr('sys.stdin', io.StringIO())  # no reconfigure
-        monkeypatch.setattr('sys.stdout', io.StringIO())  # no reconfigure
-        monkeypatch.setattr('sys.stderr', _FakeStderr())
-        ensure_utf8_stdio()
-        assert calls == [{'encoding': 'utf-8', 'errors': 'surrogatepass'}]
-
-    def test_reconfigures_stdin(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[dict[str, str]] = []
-
-        class _FakeStdin:
-            errors = 'surrogateescape'
-
-            def reconfigure(self, **kwargs: str) -> None:
-                calls.append(kwargs)
-
-        monkeypatch.setattr('sys.platform', 'win32')
-        monkeypatch.setattr('sys.stdin', _FakeStdin())
-        monkeypatch.setattr('sys.stdout', io.StringIO())  # no reconfigure
-        monkeypatch.setattr('sys.stderr', io.StringIO())  # no reconfigure
-        ensure_utf8_stdio()
-        assert calls == [{'encoding': 'utf-8', 'errors': 'surrogateescape'}]
-
-    def test_windows_stdout_uses_backslashreplace(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[dict[str, str]] = []
-
-        class _FakeStream:
-            errors = 'surrogateescape'
-
-            def reconfigure(self, **kw: str) -> None:
-                calls.append(kw)
-
-        monkeypatch.setattr('sys.platform', 'win32')
-        monkeypatch.setattr('sys.stdin', io.StringIO())  # no reconfigure
-        monkeypatch.setattr('sys.stdout', _FakeStream())
-        monkeypatch.setattr('sys.stderr', io.StringIO())  # no reconfigure
-        ensure_utf8_stdio()
-        assert calls == [{'encoding': 'utf-8', 'errors': 'backslashreplace'}]
-
-
-class TestReadFile:
+class TestReadFileResult:
     def test_bad_bytes_raises_unicode_error(self, tmp_path: Path) -> None:
         p = tmp_path / 'test.py'
         p.write_bytes(b'# -*- coding: ascii -*-\nx = "\xff"\n')
         with pytest.raises(UnicodeDecodeError):
-            read_file(p)
+            read_file_result(p)
 
     def test_bad_cookie_raises_syntax_error(self, tmp_path: Path) -> None:
         p = tmp_path / 'test.py'
         p.write_bytes(b'# -*- coding: nosuchcodec -*-\nx = 1\n')
         with pytest.raises(SyntaxError):
-            read_file(p)
+            read_file_result(p)
 
     def test_latin1_cookie(self, tmp_path: Path) -> None:
         p = tmp_path / 'test.py'
         p.write_bytes(b'# -*- coding: latin-1 -*-\nx = "\xe9"\n')
-        source, enc = read_file(p)
-        assert '\xe9' in source
-        assert enc == 'iso-8859-1'
-
-    def test_utf8_bom(self, tmp_path: Path) -> None:
-        p = tmp_path / 'test.py'
-        p.write_bytes(b'\xef\xbb\xbfx = 1\n')
-        source, enc = read_file(p)
-        assert source == 'x = 1\n'
-        assert enc == 'utf-8-sig'
-
-    def test_utf8_default(self, tmp_path: Path) -> None:
-        p = tmp_path / 'test.py'
-        p.write_bytes(b'x = 1\n')
-        source, enc = read_file(p)
-        assert source == 'x = 1\n'
-        assert enc == 'utf-8'
-
-
-class TestReadFileResult:
-    def test_encoding_cookie(self, tmp_path: Path) -> None:
-        p = tmp_path / 'test.py'
-        p.write_bytes(b'# -*- coding: latin-1 -*-\nx = "\xe9"\n')
-        r = read_file_result(p)
-        assert '\xe9' in r.source
-        assert r.encoding == 'iso-8859-1'
-
-    def test_matches_read_file(self, tmp_path: Path) -> None:
-        p = tmp_path / 'test.py'
-        p.write_bytes(b'x = 1\n')
-        r = read_file_result(p)
-        source, enc = read_file(p)
-        assert r.source == source
-        assert r.encoding == enc
+        result = read_file_result(p)
+        assert '\xe9' in result.source
+        assert result.encoding == 'iso-8859-1'
 
     @pytest.mark.parametrize(
         ('raw', 'expected'),
@@ -415,38 +304,19 @@ class TestReadFileResult:
         r = read_file_result(p)
         assert r.source == expected
 
-    def test_utf8_lf(self, tmp_path: Path) -> None:
+    def test_utf8_bom(self, tmp_path: Path) -> None:
+        p = tmp_path / 'test.py'
+        p.write_bytes(b'\xef\xbb\xbfx = 1\n')
+        result = read_file_result(p)
+        assert result.source == 'x = 1\n'
+        assert result.encoding == 'utf-8-sig'
+
+    def test_utf8_default(self, tmp_path: Path) -> None:
         p = tmp_path / 'test.py'
         p.write_bytes(b'x = 1\n')
-        r = read_file_result(p)
-        assert r.source == 'x = 1\n'
-        assert r.encoding == 'utf-8'
-
-
-class TestReadResult:
-    def test_fields(self) -> None:
-        r = _ReadResult(source='x = 1\n', encoding='utf-8')
-        assert r.source == 'x = 1\n'
-        assert r.encoding == 'utf-8'
-
-
-class TestStdoutEscapeBoundary:
-    def test_surrogate_path_text_renders_escaped(self) -> None:
-        code = (
-            'import sys\n'
-            'from defsort._files import ensure_utf8_stdio\n'
-            'ensure_utf8_stdio()\n'
-            'print(sys.stdout.errors)\n'
-            "print('bad\\udcff.py')\n"
-        )
-        proc = run_setup(
-            [sys.executable, '-c', code],
-            env={**_ENV, 'PYTHONIOENCODING': 'utf-8:strict'},
-            check=False,
-        )
-        assert proc.returncode == 0, process_transcript(proc)
-        assert b'backslashreplace' in proc.stdout
-        assert b'bad\\udcff.py' in proc.stdout
+        result = read_file_result(p)
+        assert result.source == 'x = 1\n'
+        assert result.encoding == 'utf-8'
 
 
 class TestWriteSource:

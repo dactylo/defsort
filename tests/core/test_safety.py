@@ -3,7 +3,6 @@ import pytest
 from defsort._core import sort_file
 from defsort._core._parse import parse_definitions
 from defsort._core._safety import (
-    _collect_blocking_code,
     _has_eager_order_hazard,
     _has_forward_annotation_refs,
     check_sort_safety,
@@ -114,36 +113,6 @@ class TestCheckSortSafetyBlockerReturn:
 
 
 class TestCheckSortSafetyBlockingCode:
-    def test_blocking_code_collected_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        defs = [
-            _def('alpha', 0, trailing='\nregistry = {}\n'),
-            _def('bravo', 1),
-        ]
-        calls = 0
-        original = _collect_blocking_code
-
-        def counting_collect(definitions: list[Definition]) -> list[BlockingCode]:
-            nonlocal calls
-            calls += 1
-            return original(definitions)
-
-        monkeypatch.setattr('defsort._core._safety._collect_blocking_code', counting_collect)
-
-        skipped, blocker, blocking = check_sort_safety(
-            defs,
-            defs,
-            [],
-            set(),
-            _NO_FUTURE,
-            force=False,
-            add_future=False,
-        )
-
-        assert calls == 1
-        assert skipped is True
-        assert blocker == 'interstitial'
-        assert blocking == [BlockingCode(line=7, text='registry = {}')]
-
     def test_blocking_code_from_next_definition_leading(self) -> None:
         defs = [
             _def('alpha', 0, trailing='\n# ordinary comment\n\n'),

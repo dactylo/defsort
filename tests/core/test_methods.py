@@ -1,5 +1,6 @@
 import ast
 import sys
+import textwrap
 from collections import Counter
 from dataclasses import replace
 from types import FunctionType
@@ -35,6 +36,7 @@ from defsort._types import (
     SortPolicy,
     SortScopeOrder,
 )
+from tests._helpers import execute_source
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -534,15 +536,16 @@ class TestConsecutiveSameNameGrouping:
         assert moved < first < second
 
     def test_overload_group_stays_atomic_under_edge(self) -> None:
-        original_namespace = _execute_source(_SRC_OVERLOAD_EDGE)
+        original_namespace = execute_source(_SRC_OVERLOAD_EDGE)
         result = defsort.sort(_SRC_OVERLOAD_EDGE)
-        sorted_namespace = _execute_source(result)
+        sorted_namespace = execute_source(result)
         stubs = result.index('@overload')
         impl = result.index('def foo(self, x, cb=helper)')
         helper = result.index('def helper')
         zulu = result.index('def zulu')
         tree = ast.parse(result)
-        cls = cast('ast.ClassDef', tree.body[1])
+        cls = tree.body[1]
+        assert isinstance(cls, ast.ClassDef)
         method_names = [method.name for method in cls.body if isinstance(method, ast.FunctionDef)]
 
         assert 'C' in original_namespace
@@ -597,7 +600,7 @@ class TestDecoratorBindingIdentity:
             '    def x(self, value):\n'
             '        pass\n'
         )
-        original_namespace = _execute_source(source)
+        original_namespace = execute_source(source)
         assert original_namespace['EVENTS'] == [('deleter', False), ('setter', True)]
         options = EngineOptions(
             policy=SortPolicy(definition_order='none', method_order='alphabetical'),
@@ -607,7 +610,7 @@ class TestDecoratorBindingIdentity:
 
         result = sort_file(source, options=options)
         repeated = sort_file(result.new_source, options=options)
-        unchanged_namespace = _execute_source(result.new_source)
+        unchanged_namespace = execute_source(result.new_source)
 
         assert result.skipped is True
         assert result.blocker == 'eager_order'
@@ -670,7 +673,7 @@ class TestDecoratorBindingIdentity:
             '    def x(self):\n'
             '        return 2\n'
         )
-        original_namespace = _execute_source(src)
+        original_namespace = execute_source(src)
         original_class = original_namespace['C']
         assert isinstance(original_class, type)
         original_descriptor = vars(original_class)['x']
@@ -683,7 +686,7 @@ class TestDecoratorBindingIdentity:
         assert result.skipped
         assert result.blocker == 'eager_order'
         assert result.new_source == src
-        unchanged_namespace = _execute_source(result.new_source)
+        unchanged_namespace = execute_source(result.new_source)
         unchanged_class = unchanged_namespace['C']
         assert isinstance(unchanged_class, type)
         unchanged_descriptor = vars(unchanged_class)['x']
@@ -702,7 +705,7 @@ class TestDefinitionTimeAnchorCrossing:
 
 class TestDuplicatePropertyBinders:
     def test_full_sort_blocks_duplicate_binders(self) -> None:
-        original_namespace = _execute_source(_SRC_DUP_PROPERTY_BINDERS)
+        original_namespace = execute_source(_SRC_DUP_PROPERTY_BINDERS)
         original_class = original_namespace['C']
         assert isinstance(original_class, type)
         original_descriptor = vars(original_class)['x']
@@ -724,7 +727,7 @@ class TestDuplicatePropertyBinders:
                 message='non-consecutive duplicate definitions',
             ),
         )
-        unchanged_namespace = _execute_source(result.candidate_source)
+        unchanged_namespace = execute_source(result.candidate_source)
         unchanged_class = unchanged_namespace['C']
         assert isinstance(unchanged_class, type)
         unchanged_descriptor = vars(unchanged_class)['x']
@@ -788,6 +791,33 @@ class TestDuplicatePropertyBinders:
 
 
 class TestFullMethodSortHazards:
+    @pytest.mark.parametrize('scope', ['class', 'module'])
+    def test_eager_groups_keep_definition_dependencies(self, scope: str) -> None:
+        definitions = (
+            'def y(function):\n'
+            '    return function\n\n'
+            '@y\n'
+            'def m():\n'
+            '    return 1\n\n'
+            '@staticmethod\n'
+            'def b():\n'
+            '    return 2\n'
+        )
+        source = (
+            f'class Example:\n{textwrap.indent(definitions, "    ")}'
+            if scope == 'class'
+            else definitions
+        )
+
+        options = EngineOptions(policy=SortPolicy(), add_future=False)
+        result = sort_file(source, options=options)
+
+        assert result.skipped is False
+        assert result.blocker is None
+        assert result.new_source.index('def y(') < result.new_source.index('def m(')
+        assert result.new_source.index('def m(') < result.new_source.index('def b(')
+        assert sort_file(result.new_source, options=options).new_source == result.new_source
+
     @pytest.mark.parametrize('force', [False, True], ids=['normal', 'forced'])
     @pytest.mark.parametrize(
         ('source', 'unsafe_source'),
@@ -838,10 +868,10 @@ class TestFullMethodSortHazards:
         force: bool,
         allow_reordering: bool,
     ) -> None:
-        _execute_source(source)
+        execute_source(source)
         if sys.version_info < (3, 14):
             with pytest.raises(NameError):
-                _execute_source(unsafe_source)
+                execute_source(unsafe_source)
         options = EngineOptions(
             policy=SortPolicy(
                 definition_order='none',
@@ -885,7 +915,7 @@ class TestFullMethodSortHazards:
 
         result = sort_file(source, options=options)
 
-        namespace = _execute_source(result.new_source)
+        namespace = execute_source(result.new_source)
         example = namespace['Example']
         assert isinstance(example, type)
         alpha = vars(example)['alpha']
@@ -919,7 +949,7 @@ class TestFullMethodSortHazards:
             '    def alpha(self, value: zeta_type):\n'
             '        return value\n'
         )
-        _execute_source(source)
+        execute_source(source)
         options = EngineOptions(
             policy=SortPolicy(definition_order='none', method_order='alphabetical'),
             add_future=add_future,
@@ -932,7 +962,7 @@ class TestFullMethodSortHazards:
             assert result.skipped is False
             assert result.new_source.index('def alpha') < result.new_source.index('def zeta_type')
             assert 'from __future__ import annotations' in result.new_source
-            _execute_source(result.new_source)
+            execute_source(result.new_source)
         else:
             assert result.skipped is True
             assert result.new_source == source
@@ -1005,9 +1035,9 @@ class TestGroupPropertyMethods:
 
     def test_mixed_property_and_regular(self) -> None:
         methods = [
-            _method('x', 0, prop_group='x'),  # @property
+            _method('x', 0, prop_group='x'),
             _method('process', 1),
-            _method('x', 2, prop_group='x'),  # @x.setter
+            _method('x', 2, prop_group='x'),
         ]
         groups = _group_property_methods(methods)
         # Should have 2 groups: property group for 'x' and single 'process'
@@ -1022,9 +1052,9 @@ class TestGroupPropertyMethods:
 
     def test_property_group_order_enforced(self) -> None:
         methods = [
-            _method('x', 0, prop_group='x'),  # @x.setter
-            _method('x', 1, prop_group='x'),  # @x.deleter
-            _method('x', 2, prop_group='x', is_getter=True),  # @property
+            _method('x', 0, prop_group='x'),
+            _method('x', 1, prop_group='x'),
+            _method('x', 2, prop_group='x', is_getter=True),
         ]
         groups = _group_property_methods(methods)
         assert len(groups) == 1
@@ -1387,7 +1417,7 @@ class TestInitialMethodGapOwnership:
             add_future=False,
             remove_future=False,
         )
-        original_class = _execute_source(source)['C']
+        original_class = execute_source(source)['C']
         assert isinstance(original_class, type)
         original_descriptor = vars(original_class)['value']
         assert isinstance(original_descriptor, property)
@@ -1395,7 +1425,7 @@ class TestInitialMethodGapOwnership:
 
         result = sort_file(source, options=options)
         repeated = sort_file(result.new_source, options=options)
-        unchanged_class = _execute_source(result.new_source)['C']
+        unchanged_class = execute_source(result.new_source)['C']
         assert isinstance(unchanged_class, type)
         unchanged_descriptor = vars(unchanged_class)['value']
         assert isinstance(unchanged_descriptor, property)
@@ -1806,18 +1836,12 @@ class TestMethodBanners:
         assert ('    # --------\n' in result.new_source) is has_banner
 
     @pytest.mark.parametrize(
-        ('mode', 'alpha_before_zulu'),
-        [
-            ('barriers', False),
-            ('ignore', False),
-            ('strip', False),
-        ],
+        'mode',
+        ['barriers', 'ignore', 'strip'],
     )
     def test_banner_modes_preserve_decorator_binding_identity(
         self,
         mode: BannerMode,
-        *,
-        alpha_before_zulu: bool,
     ) -> None:
         src = (
             'alpha = lambda fn: fn\n'
@@ -1847,7 +1871,7 @@ class TestMethodBanners:
         )
 
         actual = result.new_source.index('def alpha') < result.new_source.index('def zulu')
-        assert actual is alpha_before_zulu
+        assert not actual
 
     def test_banner_split_overload_family_blocks_class(self) -> None:
         src = (
@@ -2796,7 +2820,7 @@ class TestOrderMethodsAlphabetical:
 
         assert result.index('def zeta') < result.index('def alpha')
 
-    def test_eager_groups_keep_source_relative_slots(self) -> None:
+    def test_eager_groups_keep_source_relative_order(self) -> None:
         methods = [
             _method('zeta', 0),
             _method('omega', 1),
@@ -2895,7 +2919,7 @@ class TestOrderMethodsByDependency:
         assert len(result) == 4, f'Expected 4 methods, got {len(result)}: {names}'
         assert names.count('process') == 2
 
-    def test_eager_groups_keep_source_relative_slots(self) -> None:
+    def test_eager_groups_keep_source_relative_order(self) -> None:
         methods = [
             _method('zeta', 0),
             _method('omega', 1),
@@ -2907,7 +2931,7 @@ class TestOrderMethodsByDependency:
 
         result = _order_methods_by_dependency(methods)
 
-        assert [method.name for method in result] == ['zeta', 'beta', 'omega', 'alpha']
+        assert [method.name for method in result] == ['beta', 'omega', 'zeta', 'alpha']
 
     def test_empty_returns_empty(self) -> None:
         assert _order_methods_by_dependency([]) == []
@@ -3464,12 +3488,6 @@ class TestSortFileMethods:
         assert result.class_blockers == ()
 
 
-def _execute_source(source: str) -> dict[str, object]:
-    namespace: dict[str, object] = {}
-    FunctionType(compile(source, '<test>', 'exec'), namespace)()
-    return namespace
-
-
 def _make_methods(names: list[str]) -> list[MethodDefinition]:
     return [
         MethodDefinition(
@@ -3510,6 +3528,7 @@ def _method(
 
 def _sort_with_policy(source: str, policy: SortPolicy) -> str:
     tree = ast.parse(source)
-    cls = cast('ast.ClassDef', tree.body[0])
+    cls = tree.body[0]
+    assert isinstance(cls, ast.ClassDef)
     result = _sort_class_methods(cls, source, 1, policy=policy)
     return result.new_source if result.new_source is not None else source

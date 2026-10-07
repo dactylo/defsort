@@ -9,12 +9,13 @@ from defsort._core._parse import parse_definitions
 from defsort._display._movement import count_moved_split
 from defsort._types import (
     BannerMode,
+    DetectResult,
     EngineOptions,
     SortPolicy,
     SortScopeOrder,
     is_soft_blocker,
 )
-from tests.core.test_full import _execute_source
+from tests._helpers import execute_source
 
 _SRC_DEP = 'def alpha():\n    return 1\n\n\ndef bravo():\n    return alpha()\n'
 _SRC_UNORDERED = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
@@ -24,10 +25,8 @@ class TestDetectDefinitionOrder:
     def test_detect_definition_order_matches_global_detection(self) -> None:
         definitions = parse_definitions(_SRC_UNORDERED, banners='ignore').definitions
 
-        assert api_module.detect_definition_order(definitions, banners='ignore') == (
-            'unordered',
-            -1.0,
-            -1.0,
+        assert api_module.detect_definition_order(definitions, banners='ignore') == DetectResult(
+            order='unordered', dep_score=-1.0, alpha_score=-1.0
         )
 
     def test_detect_definition_order_matches_section_detection(self) -> None:
@@ -40,10 +39,8 @@ class TestDetectDefinitionOrder:
         )
         definitions = parse_definitions(source, banners='barriers').definitions
 
-        assert api_module.detect_definition_order(definitions, banners='barriers') == (
-            'dependency',
-            1.0,
-            -1.0,
+        assert api_module.detect_definition_order(definitions, banners='barriers') == DetectResult(
+            order='dependency', dep_score=1.0, alpha_score=-1.0
         )
 
 
@@ -52,7 +49,7 @@ class TestDetectOrder:
         src = 'def alpha():\n    pass\n\n\ndef bravo():\n    pass\n\n\ndef charlie():\n    pass\n'
         result = detect_order(src)
         assert result is not None
-        assert result[0] in ('alphabetical', 'both')
+        assert result.order in ('alphabetical', 'both')
 
     def test_banner_barriers_drop_sections_without_comparable_pairs(self) -> None:
         src = 'def bravo():\n    pass\n\n\n# --------\n\n\ndef alpha():\n    pass\n'
@@ -68,10 +65,8 @@ class TestDetectOrder:
             'def delta():\n    pass\n'
         )
 
-        assert detect_order(src, banners='barriers') == (
-            'unordered',
-            0.0,
-            0.0,
+        assert detect_order(src, banners='barriers') == DetectResult(
+            order='unordered', dep_score=0.0, alpha_score=0.0
         )
 
     def test_banner_barriers_multiple_perfect_sections_score_one(self) -> None:
@@ -83,10 +78,8 @@ class TestDetectOrder:
             'def charlie():\n    return delta()\n'
         )
 
-        assert detect_order(src, banners='barriers') == (
-            'dependency',
-            1.0,
-            -1.0,
+        assert detect_order(src, banners='barriers') == DetectResult(
+            order='dependency', dep_score=1.0, alpha_score=-1.0
         )
 
     def test_banner_barriers_multiple_reversed_sections_score_minus_one(self) -> None:
@@ -98,10 +91,8 @@ class TestDetectOrder:
             'def delta():\n    pass\n'
         )
 
-        assert detect_order(src, banners='barriers') == (
-            'alphabetical',
-            -1.0,
-            1.0,
+        assert detect_order(src, banners='barriers') == DetectResult(
+            order='alphabetical', dep_score=-1.0, alpha_score=1.0
         )
 
     def test_banner_barriers_without_banners_preserve_global_scores(self) -> None:
@@ -117,40 +108,37 @@ class TestDetectOrder:
         result = detect_order(src, banners=mode)
 
         assert result is not None
-        assert result[0] == 'both'
+        assert result.order == 'both'
 
     def test_dependency_order(self) -> None:
         result = detect_order(_SRC_DEP)
         assert result is not None
-        assert result[0] in ('dependency', 'both')
+        assert result.order in ('dependency', 'both')
 
     def test_detect_ignores_configured_policy(self) -> None:
         src = 'def zed():\n    return 1\n\n\ndef alpha():\n    return 2\n'
         result = detect_order(src)
         assert result is not None
-        kind, _dep, _alpha = result
-        assert kind == 'unordered'
+        assert result.order == 'unordered'
 
     def test_detect_main_sorted_conforming_file_is_unordered(self) -> None:
         src = 'def main():\n    return 1\n\n\ndef zed():\n    return 2\n'
         result = detect_order(src)
         assert result is not None
-        kind, _dep, _alpha = result
-        assert kind == 'unordered'
+        assert result.order == 'unordered'
 
     def test_detect_tracks_eager_main_rule(self) -> None:
         src = 'def main():\n    return 1\n\n\ndef alpha(cb=main):\n    return cb\n'
         result = detect_order(src)
         assert result is not None
-        kind, _dep, _alpha = result
-        assert kind == 'dependency'
+        assert result.order == 'dependency'
 
     def test_no_definitions(self) -> None:
         result = detect_order('x = 1\n')
         assert result is None
 
     def test_returns_scores(self) -> None:
-        assert detect_order(_SRC_DEP) == ('both', 1.0, 1.0)
+        assert detect_order(_SRC_DEP) == DetectResult(order='both', dep_score=1.0, alpha_score=1.0)
 
     def test_too_few_definitions(self) -> None:
         result = detect_order('def only():\n    pass\n')
@@ -159,7 +147,7 @@ class TestDetectOrder:
     def test_unordered(self) -> None:
         result = detect_order(_SRC_UNORDERED)
         assert result is not None
-        assert result[0] == 'unordered'
+        assert result.order == 'unordered'
 
 
 class TestEvaluationOrder:
@@ -265,8 +253,8 @@ class TestEvaluationOrder:
 
         assert result.blocker is None
         assert result.new_source == expected
-        assert _execute_source(source)['events'] == ['zeta', 'alpha']
-        assert _execute_source(result.new_source)['events'] == (
+        assert execute_source(source)['events'] == ['zeta', 'alpha']
+        assert execute_source(result.new_source)['events'] == (
             ['alpha', 'zeta'] if allow_reordering else ['zeta', 'alpha']
         )
         assert sort_file(expected, options=options).new_source == expected

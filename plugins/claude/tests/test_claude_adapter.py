@@ -8,7 +8,7 @@ from typing import Literal
 
 import pytest
 
-from defsort._cli import _build_hook_parser
+from defsort._hook_front import _build_hook_parser
 from defsort.hooks import (
     API_VERSION,
     HookAdapter,

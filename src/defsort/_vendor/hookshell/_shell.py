@@ -6,24 +6,31 @@ import stat
 import sys
 from pathlib import Path
 
-MSYS_MOUNT_RE = re.compile(r'^/([a-zA-Z])(/.*)?$')
+_MSYS_MOUNT_RE = re.compile(r'^/([a-zA-Z])(/.*)?$')
+
+
+def is_msys_mount_path(path_str: str) -> bool:
+    """Return whether the entire path uses the single-letter MSYS mount syntax."""
+    return _MSYS_MOUNT_RE.fullmatch(path_str) is not None
 
 
 def normalize_msys_path(path_str: str) -> str:
     """Convert MSYS2/Git Bash mount paths to Windows format.
 
+    /c/Users/... -> C:/Users/...
+    /d/ -> D:/
+    /c -> C:/
+    Already-Windows paths and non-matching paths pass through unchanged.
+
     Args:
         path_str: Path string that may be in POSIX mount format.
-
-    On Windows, `/c/Users/...` maps to `C:/Users/...`, `/d/` to `D:/`, and `/c`
-    to `C:/`. Existing Windows paths and other paths pass through.
 
     Returns:
         The normalized Windows path on Windows, otherwise the original path.
     """
     if sys.platform != 'win32':
         return path_str
-    m = MSYS_MOUNT_RE.match(path_str)
+    m = _MSYS_MOUNT_RE.match(path_str)
     if m:
         drive = m.group(1).upper()
         rest = m.group(2) or '/'

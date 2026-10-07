@@ -5,8 +5,8 @@ import sys
 from collections.abc import Iterator
 
 from defsort._color import BOLD, GREEN, RED, colorize
-from defsort._display._terminal import escape_terminal_text
 from defsort._source import split_physical_lines, terminal_line_ending
+from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import SortResult
 
 _DIFF_HEADER_COUNT = 2
@@ -55,7 +55,7 @@ def _iter_diff(
     original_lines = split_physical_lines(result.original_source, keepends=True)
     new_lines = split_physical_lines(result.new_source, keepends=True)
     if terminal:
-        path = escape_terminal_text(path)
+        path = escape_terminal_text(path_text(path))
     diff = difflib.unified_diff(
         original_lines,
         new_lines,
@@ -100,6 +100,6 @@ def print_diff(
     """
     if result.original_source == result.new_source:
         if verbose:
-            print(f'{escape_terminal_text(path)}: already in {ordering} order')
+            print(f'{escape_terminal_text(path_text(path))}: already in {ordering} order')
         return
     sys.stdout.writelines(_iter_diff(result, path, color=color, terminal=sys.stdout.isatty()))

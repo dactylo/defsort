@@ -2,10 +2,11 @@ import contextlib
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 
-from tests._helpers import PROCESS_GROUP_FLAGS, decode_text, finish_process
+from tests._helpers import _ENV, PROCESS_GROUP_FLAGS, decode_text, finish_process, run_setup
 
 
 def test_decode_text_uses_universal_newlines() -> None:
@@ -62,3 +63,20 @@ def test_finish_process_timeout_reaps_child_and_reports_output() -> None:
         reader.join(timeout=2)
         assert not reader.is_alive()
         process.communicate(timeout=2)
+
+
+def test_subprocess_host_roots_cleaned_after_normal_exit() -> None:
+    roots: list[Path] = []
+    for _ in range(2):
+        result = run_setup(
+            [
+                sys.executable,
+                '-c',
+                'from tests._helpers import _HOSTS; assert _HOSTS.is_dir(); print(_HOSTS)',
+            ],
+            env=_ENV,
+        )
+        roots.append(Path(decode_text(result.stdout).strip()))
+
+    assert roots[0] != roots[1]
+    assert all(not root.exists() for root in roots)

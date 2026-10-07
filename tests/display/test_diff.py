@@ -1,7 +1,9 @@
 import sys
+from pathlib import PureWindowsPath
 
 import pytest
 
+from defsort import _terminal
 from defsort._color import BOLD, GREEN, RED
 from defsort._display._diff import _colorize_diff_line, print_diff
 from defsort._types import SortResult
@@ -41,7 +43,10 @@ class TestPrintDiff:
         result = _make_result(changed=True)
         print_diff(result, 'test.py', verbose=False, ordering='dependency', color=False)
         output = capsys.readouterr().out
-        assert '---' in output or 'test.py' in output
+        assert '--- test.py (original)\n' in output
+        assert '+++ test.py (sorted)\n' in output
+        assert '-def bravo():' in output
+        assert '+def bravo():' in output
 
     def test_hunk_numbers_count_physical_lines(self, capsys: pytest.CaptureFixture[str]) -> None:
         result = SortResult(
@@ -210,3 +215,17 @@ class TestPrintDiff:
         result = _make_result(changed=False)
         print_diff(result, 'test.py', verbose=True, ordering='dependency', color=False)
         assert 'already in dependency order' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('terminal', [False, True])
+def test_windows_diff_path_preserves_redirected_output(
+    terminal: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(_terminal, 'PurePath', PureWindowsPath)
+    monkeypatch.setattr(sys.stdout, 'isatty', lambda: terminal)
+    result = _make_result()
+    print_diff(result, r'C:\repo\file.py', verbose=False, ordering='dependency', color=False)
+    expected = 'C:/repo/file.py' if terminal else r'C:\repo\file.py'
+    assert capsys.readouterr().out.startswith(f'--- {expected} (original)\n')

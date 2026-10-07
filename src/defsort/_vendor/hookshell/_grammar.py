@@ -1,5 +1,7 @@
 """Accept the closed commit command grammar over a parsed shell tree."""
 
+# pyright: reportPrivateUsage=false
+
 import re
 import sys
 from collections.abc import Sequence
@@ -7,11 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from defsort._detector import is_git_executable
-from defsort._shell import MSYS_MOUNT_RE, normalize_msys_path, resolve_route
-from defsort._shellparse import (
-    IDENTIFIER_BODY,
-    IDENTIFIER_START,
+from ._detector import is_git_executable
+from ._shell import is_msys_mount_path, normalize_msys_path, resolve_route
+from ._shellparse import (
+    NAME_CHARACTERS,
+    NAME_START,
     Command,
     ExpansionPart,
     GlobPart,
@@ -23,23 +25,8 @@ from defsort._shellparse import (
     Word,
     WordPart,
 )
-from defsort._types import PreCommitAdd
 
-_ELEMENT_RELATIVE_ROUTE = 'relative route without a known working directory'
-_ELEMENT_UNKNOWN_CWD = 'unknown working directory'
-_HINT_ADD = (
-    'supported add: git add [--] PATHSPEC... or git add (-A|--all|-u|--update) [--] [PATHSPEC...]'
-)
-_HINT_COMMIT = 'supported commit options are listed in docs/hook.md'
-_HINT_EXECUTABLE = 'use the bare executable name git; PATH resolves the installed git'
-_HINT_READ_ONLY = 'read-only segments accept only the documented git status, diff, and log options'
-_HINT_ROUTE = (
-    'supported form: git -C /absolute/repo commit ... or cd /absolute/repo && git commit ...'
-)
-_HINT_SEQUENCE = (
-    'supported form: [cd DIR &&] [git add ...;] git commit ...; run checks in an earlier tool call'
-)
-_ADD_SELECTORS = frozenset({'-A', '-u', '--all', '--update'})
+ADD_SELECTORS = frozenset({'-A', '-u', '--all', '--update'})
 _AMEND_DATE_COMMAND = ('git', 'log', '-1', '--format=%aI')
 _ASSIGNMENT_NAME = 'GIT_COMMITTER_DATE'
 _CD_SEGMENT_SIZE = 2
@@ -85,17 +72,17 @@ _COMMIT_INTERACTIVE_LONG = {
 }
 _COMMIT_OPTIONAL_VALUE_SHORT = frozenset('Su')
 _COMMIT_SELECTION_LONG = {
-    '--all': ('auto_stage', True),
-    '--include': ('include', True),
-    '--no-all': ('auto_stage', False),
-    '--no-include': ('include', False),
-    '--no-only': ('only', False),
-    '--only': ('only', True),
+    '--all': ('_auto_stage', True),
+    '--include': ('_include', True),
+    '--no-all': ('_auto_stage', False),
+    '--no-include': ('_include', False),
+    '--no-only': ('_only', False),
+    '--only': ('_only', True),
 }
 _COMMIT_SELECTION_SHORT = {
-    'a': ('auto_stage', True),
-    'i': ('include', True),
-    'o': ('only', True),
+    'a': ('_auto_stage', True),
+    'i': ('_include', True),
+    'o': ('_only', True),
 }
 _COMMIT_STATUS_LONG = frozenset({'--dry-run', '--long', '--null', '--porcelain', '--short'})
 _COMMIT_VALUE_LONG = frozenset(
@@ -117,14 +104,32 @@ _COMMIT_VALUE_LONG = frozenset(
     }
 )
 _COMMIT_VALUE_SHORT = frozenset('CFcmt')
+_ELEMENT_RELATIVE_ROUTE = 'relative route without a known working directory'
+_ELEMENT_UNKNOWN_CWD = 'unknown working directory'
 _FRAGMENT_LIMIT = 40
 _GIT_ROUTE_INDEX = 2
 _GIT_SUBCOMMANDS = frozenset({'add', 'commit', 'diff', 'log', 'status'})
-_HEREDOC_DELIMITER = 'EOF'
 _HEREDOC_ELEMENT_COUNT = 3
+_HINT_ADD = (
+    'supported add: git add [--] PATHSPEC... or git add (-A|--all|-u|--update) [--] [PATHSPEC...]'
+)
+_HINT_COMMIT = 'supported commit options are listed in docs/hook.md'
+_HINT_EXECUTABLE = 'use the bare executable name git; PATH resolves the installed git'
+_HINT_PRECHECK = (
+    'run the check or observation in a separate tool call, then run the add/commit command '
+    'only after success; for a check after staging, run add plus check without a real commit, '
+    'then submit the commit separately'
+)
+_HINT_READ_ONLY = 'read-only segments accept only the documented git status, diff, and log options'
+_HINT_ROUTE = (
+    'supported form: git -C /absolute/repo commit ... or cd /absolute/repo && git commit ...'
+)
+_HINT_SEQUENCE = 'supported form: [cd DIR &&] [git add ...;] git commit ...'
 _LOG_COUNT_RE = re.compile(r'-[0-9]+')
 _READ_ONLY_OPTIONS = {
-    'diff': frozenset({'--cached', '--check', '--name-only', '--name-status', '--stat'}),
+    'diff': frozenset(
+        {'--cached', '--check', '--name-only', '--name-status', '--staged', '--stat'}
+    ),
     'log': frozenset({'--oneline', '--stat'}),
     'status': frozenset(
         {'--branch', '--porcelain', '--porcelain=v1', '--short', '--untracked-files=all'}
@@ -133,10 +138,25 @@ _READ_ONLY_OPTIONS = {
 _SEQUENCE_TERMINATORS = frozenset({'&&', ';', '\n'})
 
 
+@dataclass(frozen=True, slots=True)
+class PreCommitAdd:
+    """Parsed Git add command that precedes a commit.
+
+    Attributes:
+        tokens: Parsed arguments for the Git add command.
+        exec_cwd: Directory in which the command segment executes.
+        git_cwd: Git working directory after `-C` or `cd` routing.
+    """
+
+    tokens: tuple[str, ...]
+    exec_cwd: str
+    git_cwd: str
+
+
 class CommitMode(NamedTuple):
     """Selection state of an accepted `git commit` command.
 
-    Args:
+    Attributes:
         auto_stage: Whether the commit stages tracked changes automatically.
         include: Whether named paths are staged in addition to the index.
         only: Whether only named paths are committed.
@@ -157,7 +177,7 @@ class CommitMode(NamedTuple):
 class CommitPlan:
     """Accepted command that will create a commit, resolved to its execution directory.
 
-    Args:
+    Attributes:
         cwd: Established directory in which Git runs the commit. It is never a
             substituted session or process directory.
         mode: Selection state of the commit.
@@ -178,7 +198,7 @@ class NoCommit:
 class Rejection:
     """First unsupported element of a command and the nearest accepted form.
 
-    Args:
+    Attributes:
         element: Short phrase naming the unsupported element.
         hint: Nearest accepted form.
     """
@@ -191,43 +211,42 @@ class _CommitState:
     """Mutable option state while a commit segment is parsed."""
 
     __slots__ = (
-        'auto_stage',
-        'heredoc_messages',
-        'include',
-        'interactive',
-        'interactive_option',
-        'only',
-        'options_ended',
-        'pathspec_file_nul',
-        'pathspec_from_file',
-        'pathspecs',
-        'status_only',
+        '_auto_stage',
+        '_heredoc_messages',
+        '_include',
+        '_interactive',
+        '_interactive_option',
+        '_only',
+        '_options_ended',
+        '_pathspec_file_nul',
+        '_pathspec_from_file',
+        '_pathspecs',
+        '_status_only',
     )
 
     def __init__(self) -> None:
         """Initialize selection and metadata state before reading commit options."""
-        self.auto_stage = False
-        self.heredoc_messages = 0
-        self.include = False
-        self.interactive = False
-        self.interactive_option = ''
-        self.only = False
-        self.options_ended = False
-        self.pathspec_file_nul = False
-        self.pathspec_from_file: str | None = None
-        self.pathspecs: list[str] = []
-        self.status_only = False
+        self._auto_stage = False
+        self._heredoc_messages = 0
+        self._include = False
+        self._interactive = False
+        self._interactive_option = ''
+        self._only = False
+        self._options_ended = False
+        self._pathspec_file_nul = False
+        self._pathspec_from_file: str | None = None
+        self._pathspecs: list[str] = []
+        self._status_only = False
 
 
-@dataclass(frozen=True, slots=True)
-class _GitSegment:
+class _GitSegment(NamedTuple):
     """One accepted git segment with its route, argv, and parsed commit state."""
 
     subcommand: str
     route: str | None
     tokens: tuple[str, ...]
     text: str
-    commit: '_CommitState | None' = None
+    commit: _CommitState | None = None
 
 
 def _amend_value_accepted(rest: str, remaining: Sequence[WordPart]) -> bool:
@@ -253,8 +272,8 @@ def _assignment_name(word: Word) -> tuple[str, str] | None:
     valid = (
         bool(separator)
         and bool(name)
-        and name[0] in IDENTIFIER_START
-        and all(character in IDENTIFIER_BODY for character in name)
+        and name[0] in NAME_START
+        and all(character in NAME_CHARACTERS for character in name)
     )
     return (name, rest) if valid else None
 
@@ -268,12 +287,6 @@ def _check_shape(cd_route: str | None, parsed: Sequence[_GitSegment]) -> Rejecti
     for git in parsed[:-1]:
         if git.subcommand == 'commit' or (git.subcommand == 'add' and seen_add):
             return Rejection(f"segment '{git.text}'", _HINT_SEQUENCE)
-        if (
-            git.subcommand in _READ_ONLY_OPTIONS
-            and commit.commit is not None
-            and not commit.commit.status_only
-        ):
-            return Rejection(f"segment '{git.text}'", _HINT_SEQUENCE)
         seen_add = seen_add or git.subcommand == 'add'
     if len({git.route for git in parsed}) > 1:
         return Rejection('-C route differs between segments', _HINT_SEQUENCE)
@@ -284,20 +297,20 @@ def _check_shape(cd_route: str | None, parsed: Sequence[_GitSegment]) -> Rejecti
 
 def _commit_finish(state: _CommitState) -> _CommitState | Rejection:
     """Check the final selection state of a commit segment."""
-    has_inline = bool(state.pathspecs)
-    has_file = state.pathspec_from_file is not None
+    has_inline = bool(state._pathspecs)
+    has_file = state._pathspec_from_file is not None
     has_pathspec = has_inline or has_file
     defects = (
-        (state.interactive, f'option {state.interactive_option}'),
+        (state._interactive, f'option {state._interactive_option}'),
         (
-            state.pathspec_file_nul and not has_file,
+            state._pathspec_file_nul and not has_file,
             '--pathspec-file-nul without --pathspec-from-file',
         ),
-        (state.auto_stage and has_pathspec, 'pathspec with --all'),
+        (state._auto_stage and has_pathspec, 'pathspec with --all'),
         (has_inline and has_file, '--pathspec-from-file with pathspecs'),
-        (state.include and state.only, '--include with --only'),
-        (state.include and not has_pathspec, '--include without pathspec'),
-        (state.only and not has_pathspec, '--only without pathspec'),
+        (state._include and state._only, '--include with --only'),
+        (state._include and not has_pathspec, '--include without pathspec'),
+        (state._only and not has_pathspec, '--only without pathspec'),
     )
     for defect, element in defects:
         if defect:
@@ -312,12 +325,12 @@ def _commit_flag(name: str, state: _CommitState) -> bool:
     if selection is not None:
         setattr(state, selection[0], selection[1])
     elif interactive is not None:
-        state.interactive = interactive
-        state.interactive_option = name
+        state._interactive = interactive
+        state._interactive_option = name
     elif name in _COMMIT_STATUS_LONG:
-        state.status_only = True
+        state._status_only = True
     elif name == '--pathspec-file-nul':
-        state.pathspec_file_nul = True
+        state._pathspec_file_nul = True
     else:
         return name in _COMMIT_BOOL_LONG
     return True
@@ -329,10 +342,10 @@ def _commit_short_flag(character: str, state: _CommitState) -> bool:
     if selection is not None:
         setattr(state, selection[0], selection[1])
     elif character == 'z':
-        state.status_only = True
+        state._status_only = True
     elif character == 'p':
-        state.interactive = True
-        state.interactive_option = '-p'
+        state._interactive = True
+        state._interactive_option = '-p'
     else:
         return character in _COMMIT_BOOL_SHORT
     return True
@@ -381,7 +394,7 @@ def _parse_add(texts: Sequence[str]) -> Rejection | None:
     """Check a `git add` segment against the closed add forms."""
     if not texts:
         return Rejection('git add without pathspec', _HINT_ADD)
-    selector = texts[0] in _ADD_SELECTORS
+    selector = texts[0] in ADD_SELECTORS
     index = 1 if selector else 0
     options_ended = index < len(texts) and texts[index] == '--'
     if options_ended:
@@ -403,6 +416,15 @@ def _parse_read_only(subcommand: str, texts: Sequence[str]) -> Rejection | None:
     while index < len(texts):
         text = texts[index]
         if text in allowed:
+            index += 1
+            continue
+        if (
+            subcommand == 'status'
+            and len(text) > 1
+            and text.startswith('-')
+            and not text.startswith('--')
+            and all(character in 'sb' for character in text[1:])
+        ):
             index += 1
             continue
         if subcommand == 'log':
@@ -446,7 +468,6 @@ def _heredoc_message(word: Word) -> Rejection | None:
         and elements[1].text == '<<'
         and isinstance(elements[2], Heredoc)
         and elements[2].quoted
-        and elements[2].delimiter == _HEREDOC_DELIMITER
     )
     if not shape:
         return _reject_word(word, _HINT_COMMIT)
@@ -460,8 +481,8 @@ def _commit_message_word(value: Word, state: _CommitState) -> Rejection | None:
     rejection = _heredoc_message(value)
     if rejection is not None:
         return rejection
-    state.heredoc_messages += 1
-    if state.heredoc_messages > 1:
+    state._heredoc_messages += 1
+    if state._heredoc_messages > 1:
         return Rejection('second heredoc message', _HINT_COMMIT)
     return None
 
@@ -484,7 +505,7 @@ def _commit_value(
     if name == '--pathspec-from-file':
         if literal in ('', '-'):
             return Rejection('option --pathspec-from-file=-', _HINT_COMMIT)
-        state.pathspec_from_file = literal
+        state._pathspec_from_file = literal
     return next_index
 
 
@@ -556,12 +577,12 @@ def _parse_commit(words: Sequence[Word]) -> _CommitState | Rejection:
         text = word.literal_text
         if text is None:
             return _reject_word(word, _HINT_COMMIT)
-        if state.options_ended or not text.startswith('-') or text == '-':
-            state.pathspecs.append(text)
+        if state._options_ended or not text.startswith('-') or text == '-':
+            state._pathspecs.append(text)
             index += 1
             continue
         if text == '--':
-            state.options_ended = True
+            state._options_ended = True
             index += 1
             continue
         if text in _COMMIT_HELP:
@@ -609,7 +630,7 @@ def _resolve_plan(
     state = parsed[-1].commit
     if state is None:
         raise ValueError('a validated commit sequence must contain commit state')
-    if state.status_only:
+    if state._status_only:
         return NoCommit()
     route = cd_route if cd_route is not None else parsed[0].route
     if route is None:
@@ -619,17 +640,20 @@ def _resolve_plan(
     else:
         if command_cwd is None and not _is_absolute_route(route):
             return Rejection(_ELEMENT_RELATIVE_ROUTE, _HINT_ROUTE)
-        resolved = resolve_route(route, command_cwd, logical=cd_route is not None)
+        try:
+            resolved = resolve_route(route, command_cwd, logical=cd_route is not None)
+        except (OSError, ValueError):
+            return Rejection('unresolvable directory route', _HINT_ROUTE)
         if resolved is None:
             return NoCommit()
         cwd = resolved
     mode = CommitMode(
-        auto_stage=state.auto_stage,
-        include=state.include,
-        only=state.only,
-        pathspecs=tuple(state.pathspecs),
-        pathspec_from_file=state.pathspec_from_file,
-        pathspec_file_nul=state.pathspec_file_nul,
+        auto_stage=state._auto_stage,
+        include=state._include,
+        only=state._only,
+        pathspecs=tuple(state._pathspecs),
+        pathspec_from_file=state._pathspec_from_file,
+        pathspec_file_nul=state._pathspec_file_nul,
     )
     exec_cwd = command_cwd if cd_route is None and command_cwd is not None else cwd
     pre_commit_adds = tuple(
@@ -667,9 +691,7 @@ def _word_text(word: Word) -> str:
 
 def _has_msys_path(words: Sequence[Word]) -> bool:
     """Return whether a Windows command carries an MSYS mount path."""
-    return sys.platform == 'win32' and any(
-        MSYS_MOUNT_RE.fullmatch(_word_text(word)) for word in words
-    )
+    return sys.platform == 'win32' and any(is_msys_mount_path(_word_text(word)) for word in words)
 
 
 def _segment_text(words: Sequence[Word]) -> str:
@@ -702,8 +724,8 @@ def _parse_git_segment(segment: Segment, *, final: bool) -> _GitSegment | Reject
     if isinstance(words, Rejection):
         return words
     text = _segment_text(words)
-    first_word = words[0]
-    prefix = _amend_prefix(first_word) if final else False
+    assignment_word = words[0]
+    prefix = _amend_prefix(words[0]) if final else False
     if isinstance(prefix, Rejection):
         return prefix
     if prefix:
@@ -729,7 +751,7 @@ def _parse_git_segment(segment: Segment, *, final: bool) -> _GitSegment | Reject
     if subcommand is None or subcommand not in _GIT_SUBCOMMANDS:
         return segment_rejection
     if prefix and subcommand != 'commit':
-        return Rejection(f"assignment '{_fragment(first_word.raw)}'", _HINT_SEQUENCE)
+        return Rejection(f"assignment '{_fragment(assignment_word.raw)}'", _HINT_SEQUENCE)
     return _parse_git_arguments(_GitSegment(subcommand, route, (), text), words, index + 1)
 
 
@@ -782,4 +804,11 @@ def classify_grammar(
     rejection = _check_shape(cd_route, parsed)
     if rejection is not None:
         return rejection
-    return _resolve_plan(cd_route, parsed, command_cwd)
+    plan = _resolve_plan(cd_route, parsed, command_cwd)
+    if isinstance(plan, CommitPlan):
+        for git in parsed[:-1]:
+            if git.subcommand in _READ_ONLY_OPTIONS:
+                return Rejection(
+                    f'read-only git {git.subcommand} before git commit', _HINT_PRECHECK
+                )
+    return plan

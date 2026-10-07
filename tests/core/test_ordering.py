@@ -1,5 +1,3 @@
-from types import FunctionType
-
 import pytest
 
 from defsort._core import sort_file
@@ -20,6 +18,7 @@ from defsort._types import (
     SortPolicy,
     SortScopeOrder,
 )
+from tests._helpers import execute_source
 
 _DEFAULT_POLICY = SortPolicy()
 
@@ -93,8 +92,7 @@ class TestEagerDefinitionOrder:
         options = EngineOptions(policy=SortPolicy(definition_order=definition_order))
 
         result = sort_file(source, options=options)
-        namespace: dict[str, object] = {}
-        FunctionType(compile(result.new_source, '<test>', 'exec'), namespace)()
+        namespace = execute_source(result.new_source)
 
         assert namespace['events'] == ['zeta', 'alpha']
         assert result.new_source.index('def beta') < result.new_source.index('def omega')

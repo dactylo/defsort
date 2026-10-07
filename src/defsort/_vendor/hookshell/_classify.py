@@ -3,12 +3,13 @@
 from dataclasses import dataclass
 from typing import Literal
 
-from defsort._detector import detect_commit
-from defsort._display._terminal import escape_terminal_text
-from defsort._grammar import CommitPlan, NoCommit, Rejection, classify_grammar
-from defsort._shellparse import parse_command
+from ._detector import detect_commit
+from ._grammar import CommitPlan, NoCommit, Rejection, classify_grammar
+from ._shellparse import parse_command
 
-_REASON_PREFIX = 'defsort: unsupported commit command'
+_C0_LIMIT = 0x20
+_C1_END = 0x9F
+_DEL_CODEPOINT = 0x7F
 
 type _Outcome = Literal['unrelated', 'supported', 'unsupported']
 
@@ -17,7 +18,7 @@ type _Outcome = Literal['unrelated', 'supported', 'unsupported']
 class Classification:
     """Outcome of classifying one command.
 
-    Args:
+    Attributes:
         outcome: `unrelated`, `supported`, or `unsupported`.
         plan: Resolved commit plan, or `NoCommit`, for a supported command.
         reason: Deny reason for an unsupported command.
@@ -28,18 +29,35 @@ class Classification:
     reason: str | None = None
 
 
-def _deny_reason(rejection: Rejection) -> str:
-    """Render one sanitized reason for a rejected command."""
-    return escape_terminal_text(f'{_REASON_PREFIX}: {rejection.element}; {rejection.hint}')
+def _escape_controls(text: str) -> str:
+    """Render C0, DEL, and C1 controls as lowercase hexadecimal escapes."""
+    return ''.join(
+        f'\\x{codepoint:02x}'
+        if codepoint < _C0_LIMIT or _DEL_CODEPOINT <= codepoint <= _C1_END
+        else character
+        for character in text
+        for codepoint in (ord(character),)
+    )
 
 
-def classify_command(text: str, command_cwd: str | None) -> Classification:
+def _deny_reason(rejection: Rejection, reason_prefix: str) -> str:
+    """Render a sanitized deny reason for a rejected command."""
+    return _escape_controls(f'{reason_prefix}: {rejection.element}; {rejection.hint}')
+
+
+def classify_command(
+    text: str,
+    command_cwd: str | None,
+    *,
+    reason_prefix: str,
+) -> Classification:
     """Classify a shell command as unrelated, supported, or unsupported.
 
     Args:
         text: Shell command text from the hook payload.
         command_cwd: Absolute directory the command executes in, or `None` when
             unknown.
+        reason_prefix: Caller-specific prefix for unsupported-command reasons.
 
     Returns:
         The classification. The grammar decides first; a rejected command is
@@ -51,6 +69,6 @@ def classify_command(text: str, command_cwd: str | None) -> Classification:
     result = classify_grammar(command, command_cwd)
     if isinstance(result, Rejection):
         if detect_commit(command):
-            return Classification('unsupported', reason=_deny_reason(result))
+            return Classification('unsupported', reason=_deny_reason(result, reason_prefix))
         return Classification('unrelated')
     return Classification('supported', plan=result)

@@ -11,7 +11,7 @@ from defsort._display._types import (
     MethodMovementRecord,
     MovementRecord,
 )
-from defsort._types import BannerConstraint, JsonStatus, OrderKind, SortResult
+from defsort._types import BannerConstraint, DetectResult, JsonStatus, OrderKind, SortResult
 
 
 def _banner_constraint_record(constraint: BannerConstraint) -> BannerConstraintRecord:
@@ -42,7 +42,7 @@ def build_json_record(
     *,
     warning: str | None = None,
     result: SortResult | None = None,
-    detect_result: tuple[OrderKind, float, float] | None = None,
+    detect_result: DetectResult | None = None,
 ) -> JsonFileRecord:
     """Build a single file record for the unified JSON schema.
 
@@ -58,9 +58,9 @@ def build_json_record(
         The version-1 JSON record for the file.
     """
     if detect_result is not None:
-        order: OrderKind | None = detect_result[0]
-        dep_score: float | None = detect_result[1]
-        alpha_score: float | None = detect_result[2]
+        order: OrderKind | None = detect_result.order
+        dep_score: float | None = detect_result.dep_score
+        alpha_score: float | None = detect_result.alpha_score
     else:
         order = None
         dep_score = None

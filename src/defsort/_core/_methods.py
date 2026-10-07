@@ -49,7 +49,7 @@ from defsort._types import (
     BoundaryLayoutPart,
     ClassBlocker,
     ClassSlice,
-    IncrementalClassResult,
+    ClassSortResult,
     MethodDefinition,
     MethodSortInfo,
     PropertyKind,
@@ -111,18 +111,6 @@ class _MethodParseResult:
     boundary_layout: list[BoundaryLayoutPart]
     layout: SourceLayout
     blocks: dict[int, str]
-
-
-@dataclass(frozen=True, slots=True)
-class _MethodProcessResult:
-    """Result of processing methods in one class."""
-
-    new_source: str | None
-    sort_info: MethodSortInfo | None
-    boundaries: list[SectionBoundary]
-    boundary_layout: list[BoundaryLayoutPart]
-    banner_constraints: list[BannerConstraint]
-    blocker: Blocker | None = None
 
 
 def _analyze_method_deps(
@@ -189,6 +177,21 @@ def _group_has_eager_evaluation(group: list[MethodDefinition]) -> bool:
     return any(method.has_eager_evaluation for method in group)
 
 
+def _add_eager_method_edges(
+    group_keys: list[_GK],
+    groups_by_key: dict[_GK, list[MethodDefinition]],
+    semantic_adj: dict[_GK, set[_GK]],
+) -> None:
+    """Keep eager method groups in source order within the dependency graph."""
+    previous_eager: _GK | None = None
+    for gk in group_keys:
+        if not _group_has_eager_evaluation(groups_by_key[gk]):
+            continue
+        if previous_eager is not None:
+            semantic_adj[gk].add(previous_eager)
+        previous_eager = gk
+
+
 def _has_duplicate_method_groups(groups: list[list[MethodDefinition]]) -> bool:
     """Check for repeated display names across distinct method groups."""
     names = [group[0].property_group or group[0].name for group in groups]
@@ -223,11 +226,10 @@ def _has_unsafe_method_trailing(methods: list[MethodDefinition], cs: ClassSlice)
 def _incremental_method_no_merge(
     cur_parsed: _MethodParseResult,
     cur_cs: ClassSlice,
-    original_parse: _MethodParseResult,
     constraints: list[BannerConstraint],
     *,
     banners: BannerMode,
-) -> IncrementalClassResult:
+) -> ClassSortResult:
     """Return an unchanged or strip-only incremental class result."""
     new_source: str | None = None
     if banners == 'strip' and cur_parsed.boundaries:
@@ -236,12 +238,10 @@ def _incremental_method_no_merge(
             cur_parsed.boundaries,
             source_start_line=cur_cs.start_line,
         )
-    return IncrementalClassResult(
+    return ClassSortResult(
         new_source,
         None,
         None,
-        had_new_methods=False,
-        boundary_layout=tuple(original_parse.boundary_layout),
         banner_constraints=tuple(constraints),
     )
 
@@ -276,11 +276,9 @@ def _class_initial_layout(
     cs: ClassSlice,
     first_method: ast.FunctionDef | ast.AsyncFunctionDef,
     first_method_line: int,
-    banner_settings: tuple[BannerMode, str | None],
-) -> tuple[GapClassification, str, re.Pattern[str] | None]:
-    """Return the classified initial gap, exact prefix, and banner pattern."""
-    banners, banner_pattern = banner_settings
-    pattern = compile_banner_pattern(banner_pattern) if banners != 'ignore' else None
+    banner_settings: tuple[BannerMode, re.Pattern[str] | None],
+) -> tuple[GapClassification, str]:
+    """Return the classified initial gap and exact prefix."""
     structural_end = _class_structural_end_line(cls, cs, first_method)
     initial_raw = ''.join(
         cs.lines[structural_end - cs.start_line + 1 : first_method_line - cs.start_line]
@@ -289,14 +287,14 @@ def _class_initial_layout(
         initial_raw,
         content_start_line=structural_end + 1,
         scope_indent=_class_scope_indent(cls, cs),
-        banner_settings=(banners, pattern),
+        banner_settings=banner_settings,
     )
     prefix = (
         ''.join(cs.lines[: structural_end - cs.start_line + 1])
         + initial_gap.trailing
         + initial_gap.separator
     )
-    return initial_gap, prefix, pattern
+    return initial_gap, prefix
 
 
 def _method_group_key(name: str, policy: SortPolicy) -> tuple[int, str]:
@@ -313,6 +311,38 @@ def _method_group_key(name: str, policy: SortPolicy) -> tuple[int, str]:
     if policy.method_visibility == 'public-first' and name.startswith('_'):
         rank += 1
     return (rank, name)
+
+
+def _method_index(m: MethodDefinition) -> int:
+    """Return a method's stable source index."""
+    return m.index
+
+
+def _method_is_overload(m: MethodDefinition) -> bool:
+    """Return whether a method is an overload declaration."""
+    return m.is_overload
+
+
+def _method_key(m: MethodDefinition) -> tuple[str, PropertyKind | None]:
+    """Return the name and property kind that identify a method group."""
+    return (m.name, m.property_kind)
+
+
+def _method_semantic_adjacency(
+    group_keys: list[_GK],
+    groups_by_key: dict[_GK, list[MethodDefinition]],
+    semantic_names: dict[_GK, set[str]],
+    name_to_keys: dict[str, list[_GK]],
+    policy: SortPolicy,
+) -> dict[_GK, set[_GK]]:
+    """Build definition-time edges, including preserved eager order."""
+    semantic_adj = {
+        gk: {key for name in semantic_names[gk] for key in name_to_keys.get(name, ())} - {gk}
+        for gk in group_keys
+    }
+    if policy.evaluation_order == 'preserve':
+        _add_eager_method_edges(group_keys, groups_by_key, semantic_adj)
+    return semantic_adj
 
 
 def _build_method_dep_graph(
@@ -347,9 +377,13 @@ def _build_method_dep_graph(
     def _edges_for(names: set[str], name_to_gkeys: dict[str, list[_GK]]) -> set[_GK]:
         return {gk for name in names for gk in name_to_gkeys.get(name, ())}
 
-    semantic_adj = {
-        gk: _edges_for(gkey_to_semantic[gk], name_to_gkeys) - {gk} for gk in group_keys
-    }
+    semantic_adj = _method_semantic_adjacency(
+        group_keys,
+        gkey_to_group,
+        gkey_to_semantic,
+        name_to_gkeys,
+        policy,
+    )
     body_adj: dict[_GK, set[_GK]] = {}
     if policy.method_bodies == 'within-categories':
         body_adj = {
@@ -385,21 +419,6 @@ def _build_method_dep_graph(
     return group_keys, gkey_to_group, in_degree, reverse_deps
 
 
-def _method_index(m: MethodDefinition) -> int:
-    """Return a method's stable source index."""
-    return m.index
-
-
-def _method_is_overload(m: MethodDefinition) -> bool:
-    """Return whether a method is an overload declaration."""
-    return m.is_overload
-
-
-def _method_key(m: MethodDefinition) -> tuple[str, PropertyKind | None]:
-    """Return the name and property kind that identify a method group."""
-    return (m.name, m.property_kind)
-
-
 def _pin_eager_groups(
     groups: list[list[MethodDefinition]],
     *,
@@ -430,12 +449,11 @@ def _process_method_gap(
     statement_lines: frozenset[int],
 ) -> _MethodGap:
     """Classify one exact inter-method gap into owned and fixed source."""
-    banners, banner_pattern = banner_settings
     gap = classify_gap(
         raw_between,
         location=location,
         section=section,
-        banner_settings=(banners, banner_pattern),
+        banner_settings=banner_settings,
         statement_lines=statement_lines,
     )
     return _MethodGap(
@@ -695,6 +713,18 @@ def _record_method_layout(
         state.guard_required_before.add(method.index)
 
 
+def _resolved_banner_pattern(
+    banners: BannerMode,
+    banner_pattern: str | re.Pattern[str] | None,
+) -> re.Pattern[str] | None:
+    """Reuse an already compiled class banner pattern when available."""
+    if banners == 'ignore':
+        return None
+    if isinstance(banner_pattern, re.Pattern):
+        return banner_pattern
+    return compile_banner_pattern(banner_pattern)
+
+
 def apply_class_replacements(
     source_lines: Iterable[str],
     replacements: Collection[tuple[int, int, str]],
@@ -752,7 +782,7 @@ def parse_class_methods(
     cs: ClassSlice,
     *,
     banners: BannerMode = 'ignore',
-    banner_pattern: str | None = None,
+    banner_pattern: str | re.Pattern[str] | None = None,
     collect_bodies: bool = True,
 ) -> _MethodParseResult:
     """Extract MethodDefinition objects from a class body.
@@ -761,7 +791,8 @@ def parse_class_methods(
         cls: The class AST node.
         cs: The class source slice (lines, start_line, source).
         banners: Treatment of recognized class-local banners.
-        banner_pattern: Optional custom banner regular expression.
+        banner_pattern: Optional custom banner regular expression or a compiled
+            pattern shared by classes in one file.
         collect_bodies: Whether to collect method-body references. When false,
             each method's `body_refs` is empty; all other analysis is retained.
 
@@ -833,25 +864,25 @@ def parse_class_methods(
             blocks={},
         )
 
-    initial_gap, prefix, pattern = _class_initial_layout(
+    banner_settings = (banners, _resolved_banner_pattern(banners, banner_pattern))
+    initial_gap, prefix = _class_initial_layout(
         cls,
         cs,
         method_nodes[0],
         methods[0].start_line,
-        (banners, banner_pattern),
+        banner_settings,
     )
     boundaries: list[SectionBoundary] = list(initial_gap.boundaries)
     boundary_layout: list[BoundaryLayoutPart] = list(initial_gap.boundary_layout)
     layout_state = _MethodLayoutState({}, [], [], set(), set())
     pending_leading = initial_gap.leading
     section = initial_gap.next_section
-    gap_ranges = tuple(
-        (method.end_line + 1, methods[index + 1].start_line - 1)
-        for index, method in enumerate(methods[:-1])
-    )
     statement_lines_by_gap = statement_owned_lines_by_gap(
         cls.body,
-        gap_ranges,
+        tuple(
+            (method.end_line + 1, methods[index + 1].start_line - 1)
+            for index, method in enumerate(methods[:-1])
+        ),
         movable_types=(ast.AsyncFunctionDef, ast.FunctionDef),
     )
     for index, method in enumerate(methods):
@@ -868,7 +899,7 @@ def parse_class_methods(
                 raw_between,
                 GapLocation(method.end_line + 1, scope_indent),
                 section,
-                (banners, pattern),
+                banner_settings,
                 statement_lines=statement_lines_by_gap[index],
             )
         else:
@@ -904,7 +935,8 @@ def _sort_class_methods(
     class_start: int,
     *,
     policy: SortPolicy,
-) -> _MethodProcessResult:
+    banner_pattern: re.Pattern[str] | None = None,
+) -> ClassSortResult:
     """Sort methods within a class and return new class source."""
     class_lines = split_physical_lines(class_source, keepends=True)
     cs = ClassSlice(lines=class_lines, start_line=class_start)
@@ -912,23 +944,21 @@ def _sort_class_methods(
         cls,
         cs,
         banners=policy.banners,
-        banner_pattern=policy.banner_pattern,
+        banner_pattern=banner_pattern if banner_pattern is not None else policy.banner_pattern,
         collect_bodies=policy.method_order == 'dependency' and policy.method_bodies != 'ignore',
     )
     methods = parsed.methods
 
     if len(methods) < MIN_METHODS_FOR_SORT and not parsed.boundaries:
-        return _MethodProcessResult(None, None, [], [], [])
+        return ClassSortResult(None, None, None)
 
     constraints = _class_banner_constraints(parsed, cls.name, policy=policy)
     if policy.method_order != 'none' and _has_duplicate_method_names(methods, policy.banners):
-        return _MethodProcessResult(
+        return ClassSortResult(
             None,
+            'duplicates',
             None,
-            parsed.boundaries,
-            parsed.boundary_layout,
-            constraints,
-            blocker='duplicates',
+            banner_constraints=tuple(constraints),
         )
 
     new_order = _order_methods_for_policy(methods, policy=policy)
@@ -945,26 +975,22 @@ def _sort_class_methods(
 
     boundaries_removed = policy.banners == 'strip' and bool(parsed.boundaries)
     if not order_changed and not boundaries_removed:
-        return _MethodProcessResult(
+        return ClassSortResult(
             None,
+            method_blocker,
             None,
-            parsed.boundaries,
-            parsed.boundary_layout,
-            constraints,
-            blocker=method_blocker,
+            banner_constraints=tuple(constraints),
         )
     if not order_changed:
-        return _MethodProcessResult(
+        return ClassSortResult(
             remove_boundary_lines(
                 class_source,
                 parsed.boundaries,
                 source_start_line=class_start,
             ),
+            method_blocker,
             None,
-            parsed.boundaries,
-            parsed.boundary_layout,
-            constraints,
-            blocker=method_blocker,
+            banner_constraints=tuple(constraints),
         )
 
     new_class_source = _reassemble_class(parsed, new_order)
@@ -973,12 +999,11 @@ def _sort_class_methods(
         original_order=list(methods),
         new_order=list(new_order),
     )
-    return _MethodProcessResult(
+    return ClassSortResult(
         new_class_source,
+        None,
         info,
-        parsed.boundaries,
-        parsed.boundary_layout,
-        constraints,
+        banner_constraints=tuple(constraints),
     )
 
 
@@ -1004,6 +1029,7 @@ def collect_method_coordinates(
         Parsed method metadata keyed by class identity.
     """
     lines = split_physical_lines(source, keepends=True)
+    pattern = compile_banner_pattern(banner_pattern) if banners != 'ignore' else None
     seen: Counter[str] = Counter()
     result: dict[_ClassIdentity, _MethodParseResult] = {}
     for class_node in (node for node in tree.body if isinstance(node, ast.ClassDef)):
@@ -1015,7 +1041,7 @@ def collect_method_coordinates(
             class_node,
             class_slice,
             banners=banners,
-            banner_pattern=banner_pattern,
+            banner_pattern=pattern,
             collect_bodies=collect_bodies,
         )
     return result
@@ -1061,7 +1087,8 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
     *,
     policy: SortPolicy,
     original_parse: _MethodParseResult,
-) -> IncrementalClassResult:
+    banner_pattern: re.Pattern[str] | None = None,
+) -> ClassSortResult:
     """Incrementally sort methods within one class.
 
     Args:
@@ -1072,13 +1099,12 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
         cur_cs: Current class source slice.
         policy: Concrete ordering policy.
         original_parse: Original current-class method coordinates.
+        banner_pattern: Compiled banner pattern shared by classes in the file.
 
     Returns:
         The class source and method movement when sorting changes them, with a
-        blocker when sorting cannot proceed. The result also retains the
-        original method layout and banner constraints. `had_new_methods` is
-        true only when eligible incremental processing finds new methods in an
-        existing class; it stays false for a new class or an early exit.
+        blocker when sorting cannot proceed. The result also retains the banner
+        constraints from the original class layout.
 
     Raises:
         LayoutPreservationError: If the requested method order cannot preserve
@@ -1086,21 +1112,19 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
             file.
     """
     # New class (no baseline match): delegate to full method sort.
-    # had_new_methods stays False -- new classes are not "incremental".
     if bl_cls is None:
         result = _sort_class_methods(
             cur_cls,
             cur_cs.source,
             cur_cs.start_line,
             policy=policy,
+            banner_pattern=banner_pattern,
         )
         constraints = _class_banner_constraints(original_parse, cur_cls.name, policy=policy)
-        return IncrementalClassResult(
+        return ClassSortResult(
             result.new_source,
             result.blocker,
-            result.sort_info,
-            had_new_methods=False,
-            boundary_layout=tuple(original_parse.boundary_layout),
+            result.method_sort,
             banner_constraints=tuple(constraints),
         )
 
@@ -1111,35 +1135,29 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
         return _incremental_method_no_merge(
             cur_parsed,
             cur_cs,
-            original_parse,
             [],
             banners=policy.banners,
         )
 
     if len(cur_methods) < MIN_METHODS_FOR_SORT:
         if not cur_parsed.boundaries:
-            return IncrementalClassResult(
+            return ClassSortResult(
                 None,
                 None,
                 None,
-                had_new_methods=False,
-                boundary_layout=tuple(original_parse.boundary_layout),
             )
         return _incremental_method_no_merge(
             cur_parsed,
             cur_cs,
-            original_parse,
             [],
             banners=policy.banners,
         )
 
     if _has_duplicate_method_names(cur_methods, policy.banners):
-        return IncrementalClassResult(
+        return ClassSortResult(
             None,
             'duplicates',
             None,
-            had_new_methods=False,
-            boundary_layout=tuple(original_parse.boundary_layout),
         )
 
     order_fn = partial(
@@ -1151,12 +1169,10 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
     new_methods = find_new_items(bl_methods, cur_methods, _method_key, _method_is_overload)
 
     if new_methods and _has_unsafe_method_trailing(cur_methods, cur_cs):
-        return IncrementalClassResult(
+        return ClassSortResult(
             None,
             'interstitial',
             None,
-            had_new_methods=True,
-            boundary_layout=tuple(original_parse.boundary_layout),
             banner_constraints=tuple(constraints),
         )
 
@@ -1171,12 +1187,10 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
         min_baseline=MIN_METHODS_FOR_SORT,
     )
     if blocker is not None:
-        return IncrementalClassResult(
+        return ClassSortResult(
             None,
             blocker,
             None,
-            had_new_methods=bool(new_methods),
-            boundary_layout=tuple(original_parse.boundary_layout),
             banner_constraints=tuple(constraints),
         )
 
@@ -1184,7 +1198,6 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
         return _incremental_method_no_merge(
             cur_parsed,
             cur_cs,
-            original_parse,
             constraints,
             banners=policy.banners,
         )
@@ -1194,11 +1207,8 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
         return _incremental_method_no_merge(
             cur_parsed,
             cur_cs,
-            original_parse,
             constraints,
             banners=policy.banners,
-        )._replace(
-            had_new_methods=True,
         )
 
     new_cls_source = _reassemble_class(cur_parsed, merged)
@@ -1207,12 +1217,10 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
         original_order=list(cur_methods),
         new_order=list(merged),
     )
-    return IncrementalClassResult(
+    return ClassSortResult(
         new_cls_source,
         None,
         info,
-        had_new_methods=True,
-        boundary_layout=tuple(original_parse.boundary_layout),
         banner_constraints=tuple(constraints),
     )
 
@@ -1242,6 +1250,7 @@ def sort_file_methods(
         return _FileMethodSortResult(source, (), (), ())
 
     source_lines = split_physical_lines(source, keepends=True)
+    pattern = compile_banner_pattern(policy.banner_pattern) if policy.banners != 'ignore' else None
     replacements: list[tuple[int, int, str]] = []
     method_sorts: list[MethodSortInfo] = []
     constraints: list[BannerConstraint] = []
@@ -1258,11 +1267,12 @@ def sort_file_methods(
             class_source,
             start,
             policy=policy,
+            banner_pattern=pattern,
         )
         if result.new_source is not None:
             replacements.append((start, end, result.new_source))
-        if result.sort_info is not None:
-            method_sorts.append(result.sort_info)
+        if result.method_sort is not None:
+            method_sorts.append(result.method_sort)
         constraints.extend(result.banner_constraints)
         if result.blocker is not None:
             class_blockers.append(

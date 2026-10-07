@@ -176,23 +176,6 @@ class TestEvaluateReorderGuard:
         assert result.moved == 0
 
 
-class TestReorderGuardParams:
-    def test_disabled_when_both_none(self) -> None:
-        defs = _parse_defs('def a():\n    pass\n')
-        params = ReorderGuardParams(baseline_defs=defs)
-        assert params._enabled is False
-
-    def test_enabled_when_count_set(self) -> None:
-        defs = _parse_defs('def a():\n    pass\n')
-        params = ReorderGuardParams(baseline_defs=defs, max_reorder_count=5)
-        assert params._enabled is True
-
-    def test_enabled_when_percent_set(self) -> None:
-        defs = _parse_defs('def a():\n    pass\n')
-        params = ReorderGuardParams(baseline_defs=defs, max_reorder_percent=50)
-        assert params._enabled is True
-
-
 class TestReorderGuardResult:
     def test_message_format(self) -> None:
         result = _ReorderGuardResult(moved=5, total=8, reasons=('max-reorder-percent = 60',))

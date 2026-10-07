@@ -8,25 +8,33 @@ import pytest
 from defsort import resolve_config, sort
 from tests._helpers import _HOSTS, decode_text, process_transcript, run_cli, run_setup, shell_path
 
-CORPUS = Path(__file__).parent / 'data' / 'commit_classification.json'
-SRC = Path(__file__).resolve().parents[1] / 'src'
-NEEDS_SORT = (
-    'def bravo_{name}():\n    return alpha_{name}()\n\n\ndef alpha_{name}():\n    return 1\n'
+AMEND_COMMAND = (
+    'GIT_COMMITTER_DATE="$(git log -1 --format=%aI)" git commit --amend'
+    " -m 'docs: amended subject' -m 'Amended body.'"
 )
-SORTED = 'def alpha_{name}():\n    return 1\n\n\ndef bravo_{name}():\n    return alpha_{name}()\n'
 CONFORMING_BASELINE = 'def alpha():\n    return 1\n\n\ndef bravo():\n    return alpha()\n'
 ADDED_ON_TOP = 'def charlie():\n    return 2\n\n\n' + CONFORMING_BASELINE
+CORPUS = Path(__file__).parent / 'hookshell' / 'data' / 'commit_classification.json'
+DIRECT_COMMAND = "git commit -m 'probe: direct commit'"
 EXPECTED_INCREMENTAL = CONFORMING_BASELINE + '\n\ndef charlie():\n    return 2\n'
+HEREDOC_COMMAND = (
+    "git add sample.py && git commit -m \"$(cat <<'EOF'\n"
+    'feat: sample\n'
+    '\n'
+    'Body mentioning git commit forms.\n'
+    'EOF\n'
+    ')"'
+)
 INCIDENT_FILES = (
-    'src/sequential_hooks/_adapters/_common.py',
-    'src/sequential_hooks/_containment/__init__.py',
-    'src/sequential_hooks/_containment/_posix.py',
-    'src/sequential_hooks/_containment/_uncontained.py',
-    'src/sequential_hooks/_containment/_windows.py',
-    'src/sequential_hooks/_containment/_windows_api.py',
-    'src/sequential_hooks/_doctor/__init__.py',
-    'src/sequential_hooks/_doctor/_types.py',
-    'src/sequential_hooks/_runner.py',
+    'src/example/_adapters/_common.py',
+    'src/example/_containment/__init__.py',
+    'src/example/_containment/_posix.py',
+    'src/example/_containment/_uncontained.py',
+    'src/example/_containment/_windows.py',
+    'src/example/_containment/_windows_api.py',
+    'src/example/_doctor/__init__.py',
+    'src/example/_doctor/_types.py',
+    'src/example/_runner.py',
 )
 INCIDENT_COMMAND = (
     'git add ' + ' '.join(INCIDENT_FILES) + '\n'
@@ -39,21 +47,9 @@ INCIDENT_COMMAND = (
     'Validation: exact proposal matching, non-docstring AST comparison, and\n'
     "make check passed. Native Windows tests remain platform-skipped.'"
 )
-HEREDOC_COMMAND = (
-    "git add sample.py && git commit -m \"$(cat <<'EOF'\n"
-    'feat: sample\n'
-    '\n'
-    'Body mentioning git commit forms.\n'
-    'EOF\n'
-    ')"'
+NEEDS_SORT = (
+    'def bravo_{name}():\n    return alpha_{name}()\n\n\ndef alpha_{name}():\n    return 1\n'
 )
-AMEND_COMMAND = (
-    'GIT_COMMITTER_DATE="$(git log -1 --format=%aI)" git commit --amend'
-    " -m 'docs: amended subject' -m 'Amended body.'"
-)
-DIRECT_COMMAND = "git commit -m 'probe: direct commit'"
-
-
 SELECTION_CASES = (
     ('auto-stage-short', 'auto'),
     ('auto-stage-long', 'auto'),
@@ -72,6 +68,8 @@ SELECTION_CASES = (
     ('only-reset', 'normal'),
     ('include-reset', 'normal'),
 )
+SORTED = 'def alpha_{name}():\n    return 1\n\n\ndef bravo_{name}():\n    return alpha_{name}()\n'
+SRC = Path(__file__).resolve().parents[1] / 'src'
 
 
 class Harness:
@@ -374,6 +372,27 @@ def harness(tmp_path: Path) -> Harness:
 
 
 class TestSelectionForms:
+    def test_add_update_pathspec_preserves_unstaged_worktree_outside_pathspec(
+        self, harness: Harness
+    ) -> None:
+        sub = harness.repo / 'sub'
+        sub.mkdir()
+        harness.stage('sub/in.py', SORTED.format(name='in'))
+        harness.stage('top.py', SORTED.format(name='top'))
+        harness.git('commit', '-qm', 'baseline')
+
+        staged_top = NEEDS_SORT.format(name='top')
+        harness.stage('top.py', staged_top)
+        worktree_top = (staged_top + '\n# unstaged edit\n').encode()
+        (harness.repo / 'top.py').write_bytes(worktree_top)
+        (sub / 'in.py').write_text(NEEDS_SORT.format(name='in'), encoding='utf-8')
+
+        _assert_allow(harness.hook("git add -u sub/ && git commit -m 'pathspec'"), 2)
+
+        assert harness.git('show', ':top.py') == SORTED.format(name='top')
+        assert harness.git('show', ':sub/in.py') == SORTED.format(name='in')
+        assert (harness.repo / 'top.py').read_bytes() == worktree_top
+
     @pytest.mark.parametrize(('case_id', 'mode'), SELECTION_CASES)
     def test_committed_content_matches_selection(
         self, harness: Harness, case_id: str, mode: str

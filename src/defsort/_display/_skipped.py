@@ -5,8 +5,8 @@ import textwrap
 
 from defsort._color import BOLD, colorize
 from defsort._display._movement import format_movement_table
-from defsort._display._terminal import escape_terminal_text
 from defsort._display._types import CliMode
+from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import ClassBlocker, SortResult
 
 _BLOCKER_LABELS = {
@@ -32,7 +32,7 @@ def _format_blocking_code(result: SortResult) -> str:
 
 def _format_compact_header(path: str, result: SortResult, *, color: bool) -> str:
     """Format a compact skipped-file line."""
-    safe_path = escape_terminal_text(path)
+    safe_path = escape_terminal_text(path_text(path))
     label = colorize(safe_path, BOLD) if color else safe_path
     reason = escape_terminal_text(result.warning or 'safety check')
     return f'{label}: skipped ({reason})'
@@ -40,7 +40,7 @@ def _format_compact_header(path: str, result: SortResult, *, color: bool) -> str
 
 def _format_detailed_header(path: str, *, color: bool) -> str:
     """Format a detailed preview skipped-file header."""
-    safe_path = escape_terminal_text(path)
+    safe_path = escape_terminal_text(path_text(path))
     label = colorize(safe_path, BOLD) if color else safe_path
     return f'{label}: skipped'
 
@@ -80,7 +80,7 @@ def format_class_blocker(cb: ClassBlocker) -> str:
         cb: The blocked-class record to render.
 
     Returns:
-        The indented diagnostic line for summary and preview output.
+        The indented diagnostic line for text output.
     """
     label = escape_terminal_text(_BLOCKER_LABELS.get(cb.blocker, cb.message))
     return f'  class {cb.class_name}: skipped ({label})'

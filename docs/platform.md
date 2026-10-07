@@ -29,7 +29,7 @@ Choose the adapter for your coding agent; see [agent selection](hook.md#agent-se
 
 ## Source encoding and line endings
 
-Defsort reads Python source using its encoding declaration, including PEP 263 coding cookies and a
+defsort reads Python source using its encoding declaration, including PEP 263 coding cookies and a
 UTF-8 byte-order mark. Files without a declaration use Python's UTF-8 default. Writes use the same
 encoding, and a UTF-8 BOM is preserved.
 
@@ -84,7 +84,7 @@ git -C C:/repo commit -m "Update helpers"
 
 A detected commit is denied if a Git segment contains a literal word matching `/<single-letter>` or
 `/<single-letter>/...`, such as `/c` or `/c/repo`. The restriction includes quoted words, commit
-messages, and add operands. Defsort cannot reproduce Git Bash's argument conversion when it replays
+messages, and add operands. defsort cannot reproduce Git Bash's argument conversion when it replays
 an add, so it rejects those ambiguous commands before touching the repository.
 
 Host payload paths and a supported routing `cd` are normalized separately: `/c/repo` becomes
@@ -111,7 +111,7 @@ preserve their bytes. Passing pathspecs through a file can avoid shell quoting p
 
 ## Git executable lookup
 
-Defsort resolves Git from `PATH` before each Git launch, so later `PATH` changes take effect.
+defsort resolves Git from `PATH` before each Git launch, so later `PATH` changes take effect.
 
 | Platform       | Lookup behavior                                                                                                                                                                                               |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -131,6 +131,12 @@ form. In particular, `GIT_DIR` and `GIT_WORK_TREE` cannot redirect a supported h
 [command detection](hook.md#command-detection).
 
 ## Terminal output
+
+Human-readable file paths use forward slashes on every platform, including Windows under Git Bash
+or PowerShell. Drive letters and relative paths retain their meaning. Special Windows namespace
+paths keep their original spelling. Literal backslashes in POSIX filenames are preserved. This
+display convention does not change JSON paths, redirected patches, filesystem operations, or shell
+quoting.
 
 Windows standard input, output, and error use UTF-8. On every platform, stdout escapes characters
 that its encoding cannot represent, including undecodable POSIX filename bytes.

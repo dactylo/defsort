@@ -27,7 +27,7 @@ def _allow_response(result: HookResult) -> HostResponse:
 
 
 def _base_cwd(payload: Mapping[str, object], args: Mapping[str, object]) -> str:
-    """Resolve the target directory from Cwd, workspace paths, or the process."""
+    """Resolve the directory from Cwd, workspace paths, payload cwd, or the process."""
     cwd = args.get('Cwd')
     if isinstance(cwd, str) and cwd:
         return cwd

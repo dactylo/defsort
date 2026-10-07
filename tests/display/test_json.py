@@ -4,6 +4,7 @@ from defsort._display._json import build_json_record, format_json
 from defsort._types import (
     BannerConstraint,
     ClassBlocker,
+    DetectResult,
     HeldItem,
     MethodDefinition,
     MethodSortInfo,
@@ -90,7 +91,7 @@ class TestBuildJsonRecord:
             'test.py',
             'changed',
             result=result,
-            detect_result=('dependency', 0.9, 0.1),
+            detect_result=DetectResult(order='dependency', dep_score=0.9, alpha_score=0.1),
         )
         assert record['methods'] == {'moved': 2, 'total': 3}
         assert record['method_movements'] == [
@@ -119,7 +120,7 @@ class TestBuildJsonRecord:
             'test.py',
             'changed',
             result=result,
-            detect_result=('unordered', 0.5, 0.5),
+            detect_result=DetectResult(order='unordered', dep_score=0.5, alpha_score=0.5),
         )
         assert record['definitions'] == {'moved': 2, 'total': 3}
         assert record['movements'] == [
@@ -202,7 +203,7 @@ class TestBuildJsonRecord:
             'skipped',
             warning='code between definitions',
             result=result,
-            detect_result=('unordered', 0.3, 0.4),
+            detect_result=DetectResult(order='unordered', dep_score=0.3, alpha_score=0.4),
         )
         assert record['definitions'] == {'moved': 2, 'total': 2}
         assert record['movements'] == []
@@ -223,7 +224,7 @@ class TestBuildJsonRecord:
             'test.py',
             'unchanged',
             result=result,
-            detect_result=('dependency', 0.95, 0.12),
+            detect_result=DetectResult(order='dependency', dep_score=0.95, alpha_score=0.12),
         )
         # All 12 per-file fields present
         expected_keys = {
@@ -314,7 +315,9 @@ class TestFormatJson:
                     'example.py',
                     'changed',
                     result=result,
-                    detect_result=('unordered', 0.25, 0.75),
+                    detect_result=DetectResult(
+                        order='unordered', dep_score=0.25, alpha_score=0.75
+                    ),
                 )
             ]
         )
@@ -408,3 +411,10 @@ class TestFormatJson:
         assert len(data['files']) == 1
         assert data['files'][0]['path'] == 'a.py'
         assert '\n' in raw
+
+
+def test_windows_json_path_keeps_native_spelling() -> None:
+    path = r'C:\repo\file.py'
+    record = build_json_record(path, 'unchanged')
+    assert record['path'] == path
+    assert json.loads(format_json([record]))['files'][0]['path'] == path

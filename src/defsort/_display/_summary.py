@@ -5,9 +5,9 @@ from typing import NamedTuple
 
 from defsort._color import BOLD, YELLOW, colorize
 from defsort._display._movement import count_moved_split
-from defsort._display._terminal import escape_terminal_text
 from defsort._display._types import SummaryRow
 from defsort._display._width import display_width, pad_cells
+from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import SortResult
 
 _MIN_FILES_FOR_TOTAL = 2
@@ -197,7 +197,9 @@ def format_summary_rows(
     visible_rows = rows if verbose else [row for row in rows if row.changed]
     if not visible_rows:
         return ''
-    visible_rows = [row._replace(path=escape_terminal_text(row.path)) for row in visible_rows]
+    visible_rows = [
+        row._replace(path=escape_terminal_text(path_text(row.path))) for row in visible_rows
+    ]
     n_changed = sum(1 for row in visible_rows if row.changed)
     show_total = n_changed >= _MIN_FILES_FOR_TOTAL
     totals = _compute_summary_totals(visible_rows)

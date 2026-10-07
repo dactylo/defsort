@@ -38,6 +38,7 @@ from defsort._types import (
     SortScopeOrder,
     sort_policy_from_config,
 )
+from tests._helpers import execute_source
 from tests.core._helpers import _SRC_BASELINE, _SRC_WITH_NEW
 
 _DEFAULT_SORT_POLICY = SortPolicy()
@@ -139,7 +140,7 @@ class TestIncrementalAnnotationOrderSafety:
             'class Alpha:\n'
             '    pass\n'
         )
-        _execute_source(current)
+        execute_source(current)
         options = EngineOptions(
             policy=SortPolicy(
                 definition_order='alphabetical',
@@ -176,7 +177,7 @@ class TestIncrementalAnnotationOrderSafety:
             '    class Nested:\n'
             '        value: ZetaType\n'
         )
-        _execute_source(current)
+        execute_source(current)
         options = EngineOptions(
             policy=SortPolicy(
                 definition_order='alphabetical',
@@ -201,7 +202,7 @@ class TestIncrementalAnnotationOrderSafety:
         )
         assert 'from __future__ import annotations' in result.new_source
         assert result.new_source.index('class Alpha') < result.new_source.index('class ZetaType')
-        _execute_source(result.new_source)
+        execute_source(result.new_source)
         repeated = sort_file_incremental(result.new_source, baseline, options=options)
         assert repeated.new_source == result.new_source
 
@@ -214,7 +215,7 @@ class TestIncrementalAnnotationOrderSafety:
             '    class Nested:\n'
             '        value: ZetaType\n'
         )
-        _execute_source(current)
+        execute_source(current)
         options = EngineOptions(
             policy=SortPolicy(definition_order='alphabetical', method_order='none'),
             add_future=True,
@@ -226,7 +227,7 @@ class TestIncrementalAnnotationOrderSafety:
         assert result.blocker is None
         assert 'from __future__ import annotations' in result.new_source
         assert result.new_source.index('class Alpha') < result.new_source.index('class ZetaType')
-        _execute_source(result.new_source)
+        execute_source(result.new_source)
         repeated = sort_file_incremental(result.new_source, baseline, options=options)
         assert repeated.new_source == result.new_source
 
@@ -264,7 +265,7 @@ class TestIncrementalAnnotationOrderSafety:
         assert result.new_source is not None
         assert 'from __future__ import annotations' in result.new_source
         assert result.new_source.index('class Alpha') < result.new_source.index('class ZetaType')
-        _execute_source(result.new_source)
+        execute_source(result.new_source)
 
     @pytest.mark.parametrize('surface', ['public', 'hook'])
     def test_class_suite_annotation_without_addition_blocks(self, surface: str) -> None:
@@ -318,7 +319,7 @@ class TestIncrementalAnnotationOrderSafety:
             'class Alpha:\n'
             '    value = ZetaValue()\n'
         )
-        _execute_source(current)
+        execute_source(current)
 
         result = _sort_incremental(
             current,
@@ -352,7 +353,7 @@ class TestIncrementalAnnotationOrderSafety:
             'class Alpha:\n'
             '    value: ZetaType\n'
         )
-        _execute_source(current)
+        execute_source(current)
 
         result = _sort_incremental(
             current,
@@ -375,7 +376,7 @@ class TestIncrementalAnnotationOrderSafety:
             '    def alpha(self, value: zeta_type):\n'
             '        return value\n'
         )
-        _execute_source(current)
+        execute_source(current)
         options = EngineOptions(
             policy=SortPolicy(definition_order='none', method_order='alphabetical'),
             add_future=True,
@@ -387,7 +388,7 @@ class TestIncrementalAnnotationOrderSafety:
         assert result.blocker is None
         assert 'from __future__ import annotations' in result.new_source
         assert result.new_source.index('def alpha') < result.new_source.index('def zeta_type')
-        _execute_source(result.new_source)
+        execute_source(result.new_source)
         repeated = sort_file_incremental(result.new_source, baseline, options=options)
         assert repeated.new_source == result.new_source
 
@@ -425,7 +426,7 @@ class TestIncrementalAnnotationOrderSafety:
         assert result.new_source is not None
         assert 'from __future__ import annotations' in result.new_source
         assert result.new_source.index('def alpha') < result.new_source.index('def zeta_type')
-        _execute_source(result.new_source)
+        execute_source(result.new_source)
 
     @pytest.mark.parametrize('surface', ['public', 'hook'])
     def test_method_annotation_without_addition_blocks(self, surface: str) -> None:
@@ -612,7 +613,9 @@ class TestIncrementalBanners:
 
         constraint = class_result.banner_constraints[0]
         retained_boundary = next(
-            part for part in class_result.boundary_layout if isinstance(part, SectionBoundary)
+            part
+            for part in original_coordinates[('C', 1)].boundary_layout
+            if isinstance(part, SectionBoundary)
         )
         assert retained_boundary.start_line == banner_line
         assert constraint.boundary.start_line == banner_line
@@ -1681,7 +1684,7 @@ class TestIncrementalEagerOrderSafety:
         *,
         force: bool,
     ) -> None:
-        _execute_source(current)
+        execute_source(current)
         options = EngineOptions(
             policy=SortPolicy(definition_order='none', method_order='alphabetical'),
             force=force,
@@ -1751,7 +1754,7 @@ class TestIncrementalEagerOrderSafety:
         allow_reordering: bool,
     ) -> None:
         current = f'{baseline}\n\n{reader}'
-        _execute_source(current)
+        execute_source(current)
         options = EngineOptions(
             policy=SortPolicy(
                 definition_order='alphabetical',
@@ -1803,9 +1806,9 @@ class TestIncrementalEagerOrderSafety:
             remove_future=False,
         )
 
-        original_namespace = _execute_source(current)
+        original_namespace = execute_source(current)
         result = sort_file_incremental(current, baseline, options=options)
-        accepted_namespace = _execute_source(result.new_source)
+        accepted_namespace = execute_source(result.new_source)
 
         assert result.new_source == expected
         assert result.new_source != result.original_source
@@ -2118,12 +2121,8 @@ class TestMethodIncremental:
         # Add a new top-level def so something triggers incremental sort.
         current = baseline + '\n\ndef new_top():\n    pass\n'
         result = _sort_incremental(current, baseline)
-        new_source = result.new_source
-        # Class methods should not be reordered (non-conforming class).
-        # new_source may or may not be None (top-level may have changes),
-        # but if it's not None, bravo must still precede alpha.
-        source_to_check = new_source if new_source is not None else current
-        assert source_to_check.index('bravo') < source_to_check.index('alpha')
+        assert result.new_source is None
+        assert [blocker.blocker for blocker in result.class_blockers] == ['non_conforming']
 
     def test_incremental_duplicate_class_blocker_is_local(self) -> None:
         baseline = (
@@ -2361,9 +2360,9 @@ class TestMethodIncremental:
             '        return x\n'
         )
         result = _sort_incremental(current, baseline)
-        # Overloads should not be treated as new methods.
-        # Either no changes needed (None) or changes are made without blocker.
         assert result.blocker is None
+        assert result.new_source is None
+        assert result.class_blockers == ()
 
     def test_property_and_setter_not_confused(self) -> None:
         baseline = (
@@ -2390,8 +2389,10 @@ class TestMethodIncremental:
         )
         result = _sort_incremental(current, baseline)
         assert result.blocker is None
-        # alpha is new and should be placed; property pair should stay together
         assert result.new_source is not None
+        assert result.new_source.index('def alpha') < result.new_source.index('def value')
+        assert result.new_source.count('def value') == 2
+        assert result.new_source.index('@value.setter') > result.new_source.index('def value')
 
 
 class TestMethodTargetDrift:
@@ -2426,7 +2427,8 @@ class TestSortFileIncremental:
         assert result.warning is not None
         # Must be human-readable (not the raw machine key "non_conforming")
         assert result.warning != 'non_conforming'
-        assert 'baseline' in result.warning.lower() or 'order' in result.warning.lower()
+        assert 'baseline' in result.warning.lower()
+        assert 'order' in result.warning.lower()
         assert result.blocker == 'non_conforming'
 
     def test_empty_baseline_matches_full_sort_duplicate_blocker(self) -> None:
@@ -2594,12 +2596,12 @@ class TestSortFileIncremental:
             with_new_definition=with_new_definition,
         )
         options = EngineOptions(policy=SortPolicy(), add_future=False, remove_future=True)
-        _execute_source(current)
+        execute_source(current)
 
         result = sort_file_incremental(current, baseline, options=options)
 
         assert 'from __future__ import annotations' in result.new_source
-        _execute_source(result.new_source)
+        execute_source(result.new_source)
         assert (
             sort_file_incremental(result.new_source, baseline, options=options).new_source
             == result.new_source
@@ -3055,6 +3057,10 @@ class TestSortIncremental:
         result = _sort_incremental(current, baseline)
         # Should not produce user_reordered or any false blocker
         assert result.blocker is None
+        assert result.new_source == baseline.replace(
+            'def zoo() -> None:\n    pass\n',
+            'def new_func() -> None:\n    pass\n\n\ndef zoo() -> None:\n    pass\n',
+        )
 
     def test_invalid_baseline_skips(self) -> None:
         current = _SRC_WITH_NEW
@@ -3073,14 +3079,9 @@ class TestSortIncremental:
         # dependency). If target places charlie after bravo, the merge
         # produces the same source -> return (None, None).
         current = baseline + '\n\ndef charlie():\n    return alpha()\n'
-        # In dep order: alpha, charlie, bravo. If charlie is already placed
-        # correctly relative to existing defs, merge produces same as source.
-        # But if charlie needs to move, we get a different source.
-        # Either way, NO false target_incompatible.
         result = _sort_incremental(current, baseline)
-        # Key assertions: blocker must be None (no error condition),
-        # and no false target_incompatible.
         assert result.blocker is None
+        assert result.new_source is None
 
     def test_new_def_sorted(self) -> None:
         result = _sort_incremental(_SRC_WITH_NEW, _SRC_BASELINE)
@@ -3135,7 +3136,7 @@ class TestSortIncrementalDetailedFutureRemoval:
             'def feature():\n    return annotations.compiler_flag\n'
         )
         current = baseline + '\n\ndef other():\n    pass\n' if with_new_definition else baseline
-        original = _execute_source(current)['feature']
+        original = execute_source(current)['feature']
         assert isinstance(original, FunctionType)
         assert original() == 16777216
         options = EngineOptions(policy=SortPolicy())
@@ -3146,7 +3147,7 @@ class TestSortIncrementalDetailedFutureRemoval:
             else sort_file_incremental(current, baseline, options=options)
         )
         transformed_source = result.new_source or current
-        transformed = _execute_source(transformed_source)['feature']
+        transformed = execute_source(transformed_source)['feature']
         assert isinstance(transformed, FunctionType)
         assert transformed() == 16777216
         assert 'from __future__ import annotations' in transformed_source
@@ -3197,13 +3198,13 @@ class TestSortIncrementalDetailedFutureRemoval:
             annotated=True,
             with_new_definition=with_new_definition,
         )
-        _execute_source(current)
+        execute_source(current)
 
         result = sort_incremental_detailed(current, baseline, policy=SortPolicy())
         transformed = result.new_source or current
 
         assert 'from __future__ import annotations' in transformed
-        _execute_source(transformed)
+        execute_source(transformed)
         repeated = sort_incremental_detailed(transformed, baseline, policy=SortPolicy())
         assert (repeated.new_source or transformed) == transformed
 
@@ -3341,12 +3342,6 @@ class TestTreeThreading:
         # Verify exact order, not just membership -- order must be preserved
         # through future-annotation insertion
         assert new_names == ['alpha', 'charlie', 'beta']
-
-
-def _execute_source(source: str) -> dict[str, object]:
-    namespace: dict[str, object] = {}
-    FunctionType(compile(source, '<test>', 'exec'), namespace)()
-    return namespace
 
 
 def _future_sources(*, annotated: bool, with_new_definition: bool) -> tuple[str, str]:

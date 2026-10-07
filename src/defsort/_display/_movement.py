@@ -4,9 +4,9 @@ from collections.abc import Iterable, Sequence
 
 from defsort._color import BOLD, colorize, spectral_map
 from defsort._display._constraints import format_banner_constraint_details
-from defsort._display._terminal import escape_terminal_text
 from defsort._display._types import MovementPositions, MovementRow
 from defsort._display._width import display_width, pad_cells
+from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import Definition, MethodDefinition, MethodSortInfo, SortResult
 
 
@@ -23,7 +23,7 @@ def _print_unchanged_preview(
         return False
     if separate:
         print()
-    safe_path = escape_terminal_text(path)
+    safe_path = escape_terminal_text(path_text(path))
     label = colorize(safe_path, BOLD) if color else safe_path
     print(f'{label}: already in {ordering} order')
     return True
@@ -228,7 +228,7 @@ def print_preview(  # noqa: PLR0913
         Whether output was emitted, for inter-file separator tracking.
     """
     constraint_details = format_banner_constraint_details(result.banner_constraints)
-    safe_path = escape_terminal_text(path)
+    safe_path = escape_terminal_text(path_text(path))
 
     # Unchanged file
     if result.original_source == result.new_source:

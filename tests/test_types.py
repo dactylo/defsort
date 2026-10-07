@@ -20,7 +20,6 @@ from defsort._types import (
     METHOD_VISIBILITY_VALUES,
     SORT_SCOPE_ORDER_VALUES,
     TIE_BREAK_VALUES,
-    BannerConstraint,
     BannerMode,
     BlobReadResult,
     BlobReadStatus,
@@ -32,7 +31,6 @@ from defsort._types import (
     EngineOptions,
     EvaluationOrder,
     FallbackMode,
-    HeldItem,
     HookContext,
     JsonStatus,
     MainPlacement,
@@ -85,13 +83,6 @@ class TestBannerRecords:
 
     def test_boundary_layout_part_runtime_value(self) -> None:
         assert BoundaryLayoutPart.__value__ == str | SectionBoundary
-
-    def test_constraint_fields(self) -> None:
-        boundary = SectionBoundary(1, 3, 5, '# ----\n', '# ----')
-        held = HeldItem('alpha', 'function', 1, 10, 'after')
-        constraint = BannerConstraint('definitions', None, boundary, (held,))
-        assert constraint.boundary is boundary
-        assert constraint.held == (held,)
 
     def test_type_module_has_no_interstitial_alias(self) -> None:
         source_path = Path(__file__).parents[1] / 'src' / 'defsort' / '_types.py'
@@ -195,11 +186,6 @@ class TestBlocker:
         )
 
 
-class TestBlockingCode:
-    def test_not_in_public_all(self) -> None:
-        assert 'BlockingCode' not in defsort.__all__
-
-
 class TestClassBlocker:
     def test_message_is_required(self) -> None:
         with pytest.raises(TypeError, match='message'):
@@ -223,9 +209,6 @@ class TestClassSlice:
 
 
 class TestColorMode:
-    def test_not_publicly_exported(self) -> None:
-        assert 'ColorMode' not in defsort.__all__
-
     def test_values(self) -> None:
         assert set(get_args(ColorMode)) == {'auto', 'always', 'never'}
 
@@ -367,7 +350,6 @@ class TestEngineOptions:
         assert all(parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in parameters)
 
     def test_is_not_publicly_exported(self) -> None:
-        assert 'EngineOptions' not in defsort.__all__
         assert not hasattr(defsort, 'EngineOptions')
 
     def test_sort_options_convert_every_axis_to_one_policy(self) -> None:
@@ -551,9 +533,6 @@ class TestSortOverrides:
         with pytest.raises(TypeError):
             SortOverrides(None, None, None)  # pyright: ignore[reportCallIssue]
 
-    def test_not_in_all(self) -> None:
-        assert 'SortOverrides' not in defsort.__all__
-
 
 class TestSortPolicy:
     def test_fields_and_defaults(self) -> None:
@@ -649,6 +628,7 @@ class TestVocabularyValidators:
             r'^# \.\*\+\?\(\)\{\}\|\^\$$',
             r'^# []A-Z]+$',
             r'^# [^]]+$',
+            r'^# [{}]+$',
         ],
     )
     def test_validate_banner_pattern_accepts_safe_subset(self, pattern: str) -> None:
@@ -670,6 +650,7 @@ class TestVocabularyValidators:
             r'^# (a+)+$',
             r'^# (TOP|METHOD)$',
             r'^# a{2}$',
+            r'^# {x}$',
             r'^# a?$',
             r'^# (a)\1$',
             r'^# (?=a)a$',

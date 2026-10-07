@@ -405,7 +405,11 @@ def _body_ref_scope_parts(
         comprehension_inner.extend((generator.iter, generator.target, *generator.ifs))
     if kind == 'dict_comprehension':
         dictionary = cast('ast.DictComp', comprehension)
-        comprehension_inner.extend((dictionary.key, dictionary.value))
+        comprehension_inner.append(dictionary.key)
+        # Python 3.15 allows a missing value for dict unpacking comprehensions.
+        value: object = vars(dictionary).get('value')
+        if isinstance(value, ast.expr):
+            comprehension_inner.append(value)
     else:
         comprehension_inner.append(
             cast(

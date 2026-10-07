@@ -34,6 +34,8 @@ from defsort._types import (
     BannerMode,
     DefsortConfig,
     SortOverrides,
+    SortPolicy,
+    sort_policy_from_config,
 )
 from tests._helpers import _ENV, decode_text, run_setup
 
@@ -94,108 +96,6 @@ class TestAllowOnFailure:
         assert cfg.allow_on_failure is True
 
 
-class TestBannerConfig:
-    def test_default_is_barriers(self) -> None:
-        cfg = DefsortConfig()
-        assert cfg.banners == 'barriers'
-        assert cfg.banner_pattern is None
-
-    def test_effective_mode_override_preserves_config_pattern(self) -> None:
-        cfg = ResolvedConfig(
-            transform=DefsortConfig(
-                banners='strip',
-                banner_pattern=r'# Section',
-            ),
-        )
-        result = effective_config(cfg, SortOverrides(banners='ignore'))
-        assert result.transform.banners == 'ignore'
-        assert result.transform.banner_pattern == r'# Section'
-
-    def test_effective_pattern_override_wins(self) -> None:
-        cfg = ResolvedConfig(transform=DefsortConfig(banner_pattern=r'# Config'))
-        result = effective_config(cfg, SortOverrides(banner_pattern=r'# Library'))
-        assert result.transform.banner_pattern == r'# Library'
-
-    def test_invalid_mode_warns_and_defaults(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.defsort]\nbanners = "move"\n',
-            encoding='utf-8',
-        )
-        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banners'):
-            cfg = resolve_config(tmp_path)
-        assert cfg.banners == 'barriers'
-        assert capsys.readouterr().err == ''
-
-    def test_invalid_pattern_is_validated_in_ignore_mode(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            "[tool.defsort]\nbanners = 'ignore'\nbanner-pattern = '('\n",
-            encoding='utf-8',
-        )
-        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
-            cfg = resolve_config(tmp_path)
-        assert cfg.banners == 'ignore'
-        assert cfg.banner_pattern is None
-        assert capsys.readouterr().err == ''
-
-    def test_invalid_pattern_warns_and_uses_builtin_fallback(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            "[tool.defsort]\nbanner-pattern = '[unterminated'\n",
-            encoding='utf-8',
-        )
-        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
-            cfg = resolve_config(tmp_path)
-        assert cfg.banner_pattern is None
-        assert capsys.readouterr().err == ''
-
-    def test_non_string_pattern_warns_and_uses_builtin_fallback(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.defsort]\nbanner-pattern = 42\n',
-            encoding='utf-8',
-        )
-        with pytest.warns(DefsortConfigWarning, match='expected string'):
-            cfg = resolve_config(tmp_path)
-        assert cfg.banner_pattern is None
-        assert capsys.readouterr().err == ''
-
-    def test_reads_valid_custom_pattern(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            "[tool.defsort]\nbanner-pattern = '^# Section: .+$'\n",
-            encoding='utf-8',
-        )
-        assert resolve_config(tmp_path).banner_pattern == '^# Section: .+$'
-
-    @pytest.mark.parametrize(
-        ('raw', 'expected'),
-        [('ignore', 'ignore'), ('strip', 'strip')],
-    )
-    def test_reads_valid_mode(self, tmp_path: Path, raw: str, expected: BannerMode) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            f'[tool.defsort]\nbanners = "{raw}"\n',
-            encoding='utf-8',
-        )
-        assert resolve_config(tmp_path).banners == expected
-
-    def test_unsafe_banner_pattern_warns_and_uses_builtin_fallback(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        (tmp_path / 'pyproject.toml').write_text(
-            "[tool.defsort]\nbanner-pattern = '^# (a+)+$'\n",
-            encoding='utf-8',
-        )
-        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
-            cfg = resolve_config(tmp_path)
-        assert cfg.banner_pattern is None
-        assert capsys.readouterr().err == ''
-
-
 class TestConfig:
     def test_explicit_incremental_false(self, tmp_path: Path) -> None:
         toml = '[tool.defsort]\nincremental = false\n'
@@ -243,7 +143,7 @@ class TestConfigCache:
         assert decode_text(proc.stderr).count('Unknown [tool.defsort] key: bogus-key') == 2
 
     def test_distinct_nested_sources_load_separately(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, counted_config_load: list[Path]
     ) -> None:
         (tmp_path / 'pyproject.toml').write_text(
             '[tool.defsort]\nmethod-order = "none"\n', encoding='utf-8'
@@ -254,23 +154,14 @@ class TestConfigCache:
             '[tool.defsort]\nmethod-order = "alphabetical"\n', encoding='utf-8'
         )
 
-        original_load = _load_toml
-        calls = 0
-
-        def counting_load(path: Path) -> dict[str, object] | None:
-            nonlocal calls
-            calls += 1
-            return original_load(path)
-
-        monkeypatch.setattr('defsort._config._load_toml', counting_load)
         outer = resolve_config(tmp_path / 'outer.py')
         inner = resolve_config(nested / 'inner.py')
-        assert calls == 2
+        assert len(counted_config_load) == 2
         assert outer.method_order == 'none'
         assert inner.method_order == 'alphabetical'
 
     def test_invalid_shared_source_warns_once_per_cache_lifetime(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, counted_config_load: list[Path]
     ) -> None:
         (tmp_path / 'pyproject.toml').write_text('not valid toml [', encoding='utf-8')
         first = tmp_path / 'first'
@@ -278,32 +169,23 @@ class TestConfigCache:
         first.mkdir()
         second.mkdir()
 
-        original_load = _load_toml
-        calls = 0
-
-        def counting_load(path: Path) -> dict[str, object] | None:
-            nonlocal calls
-            calls += 1
-            return original_load(path)
-
-        monkeypatch.setattr('defsort._config._load_toml', counting_load)
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter('always', DefsortConfigWarning)
             assert resolve_config(first) == DefsortConfig()
             assert resolve_config(second) == DefsortConfig()
-            assert calls == 1
+            assert len(counted_config_load) == 1
             assert len(captured) == 1
 
             clear_config_cache()
             assert resolve_config(first) == DefsortConfig()
             assert resolve_config(second) == DefsortConfig()
 
-        assert calls == 2
+        assert len(counted_config_load) == 2
         assert len(captured) == 2
         assert all('Cannot read configuration' in str(item.message) for item in captured)
 
     def test_missing_source_skips_load(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, counted_config_load: list[Path]
     ) -> None:
         (tmp_path / '.git').mkdir()
         first = tmp_path / 'first'
@@ -311,18 +193,9 @@ class TestConfigCache:
         first.mkdir()
         second.mkdir()
 
-        original_load = _load_toml
-        calls = 0
-
-        def counting_load(path: Path) -> dict[str, object] | None:
-            nonlocal calls
-            calls += 1
-            return original_load(path)
-
-        monkeypatch.setattr('defsort._config._load_toml', counting_load)
         assert resolve_config(first) == DefsortConfig()
         assert resolve_config(second) == DefsortConfig()
-        assert calls == 0
+        assert counted_config_load == []
 
     def test_repeated_resolution_is_cached(self, tmp_path: Path) -> None:
         clear_config_cache()
@@ -335,7 +208,7 @@ class TestConfigCache:
         assert resolve_config(tmp_path / 'mod.py').method_order == 'none'
 
     def test_starting_directories_share_governing_source_load(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, counted_config_load: list[Path]
     ) -> None:
         (tmp_path / 'pyproject.toml').write_text(
             '[tool.defsort]\nmethod-order = "none"\n', encoding='utf-8'
@@ -345,18 +218,9 @@ class TestConfigCache:
         first.mkdir()
         second.mkdir(parents=True)
 
-        original_load = _load_toml
-        calls = 0
-
-        def counting_load(path: Path) -> dict[str, object] | None:
-            nonlocal calls
-            calls += 1
-            return original_load(path)
-
-        monkeypatch.setattr('defsort._config._load_toml', counting_load)
         assert resolve_config(first).method_order == 'none'
         assert resolve_config_sourced(second)[0].transform.method_order == 'none'
-        assert calls == 1
+        assert len(counted_config_load) == 1
 
 
 class TestConfigWarningRendering:
@@ -477,20 +341,6 @@ class TestEffectiveConfig:
 
 
 class TestEffectiveConfigScopedOverrides:
-    def test_cli_alpha_with_scoped_override(self, tmp_path: Path) -> None:
-        toml = '[tool.defsort]\n'
-        (tmp_path / 'pyproject.toml').write_text(toml, encoding='utf-8')
-        cfg = resolve_runtime_config(tmp_path)
-        result = effective_config(
-            cfg,
-            SortOverrides(
-                order='alphabetical',
-                method_order='dependency',
-            ),
-        )
-        assert result.transform.definition_order == 'alphabetical'
-        assert result.transform.method_order == 'dependency'
-
     def test_cli_scoped_overrides_config_order(self, tmp_path: Path) -> None:
         toml = '[tool.defsort]\norder = "alphabetical"\n'
         (tmp_path / 'pyproject.toml').write_text(toml, encoding='utf-8')
@@ -898,12 +748,6 @@ class TestResolveConfigContract:
 
 
 class TestScopedEffectiveConfig:
-    def test_cli_alpha_sets_both_scopes(self) -> None:
-        cfg = ResolvedConfig()
-        result = effective_config(cfg, SortOverrides(order='alphabetical'))
-        assert result.transform.definition_order == 'alphabetical'
-        assert result.transform.method_order == 'alphabetical'
-
     def test_cli_scoped_overrides_alpha(self) -> None:
         cfg = ResolvedConfig()
         result = effective_config(
@@ -994,6 +838,121 @@ def _parse_for(body: str) -> ResolvedConfig:
     return _parse_section(data['tool']['defsort'])
 
 
+@pytest.fixture
+def counted_config_load(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    calls: list[Path] = []
+    original_load = _load_toml
+
+    def counting_load(path: Path) -> dict[str, object] | None:
+        calls.append(path)
+        return original_load(path)
+
+    monkeypatch.setattr('defsort._config._load_toml', counting_load)
+    return calls
+
+
+class TestBannerConfig:
+    def test_default_is_barriers(self) -> None:
+        cfg = DefsortConfig()
+        assert cfg.banners == 'barriers'
+        assert cfg.banner_pattern is None
+
+    def test_effective_mode_override_preserves_config_pattern(self) -> None:
+        cfg = ResolvedConfig(
+            transform=DefsortConfig(
+                banners='strip',
+                banner_pattern=r'# Section',
+            ),
+        )
+        result = effective_config(cfg, SortOverrides(banners='ignore'))
+        assert result.transform.banners == 'ignore'
+        assert result.transform.banner_pattern == r'# Section'
+
+    def test_effective_pattern_override_wins(self) -> None:
+        cfg = ResolvedConfig(transform=DefsortConfig(banner_pattern=r'# Config'))
+        result = effective_config(cfg, SortOverrides(banner_pattern=r'# Library'))
+        assert result.transform.banner_pattern == r'# Library'
+
+    def test_invalid_mode_warns_and_defaults(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.defsort]\nbanners = "move"\n',
+            encoding='utf-8',
+        )
+        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banners'):
+            cfg = resolve_config(tmp_path)
+        assert cfg.banners == 'barriers'
+        assert capsys.readouterr().err == ''
+
+    def test_invalid_pattern_is_validated_in_ignore_mode(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            "[tool.defsort]\nbanners = 'ignore'\nbanner-pattern = '('\n",
+            encoding='utf-8',
+        )
+        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
+            cfg = resolve_config(tmp_path)
+        assert cfg.banners == 'ignore'
+        assert cfg.banner_pattern is None
+        assert capsys.readouterr().err == ''
+
+    def test_invalid_pattern_warns_and_uses_builtin_fallback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            "[tool.defsort]\nbanner-pattern = '[unterminated'\n",
+            encoding='utf-8',
+        )
+        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
+            cfg = resolve_config(tmp_path)
+        assert cfg.banner_pattern is None
+        assert capsys.readouterr().err == ''
+
+    def test_non_string_pattern_warns_and_uses_builtin_fallback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.defsort]\nbanner-pattern = 42\n',
+            encoding='utf-8',
+        )
+        with pytest.warns(DefsortConfigWarning, match='expected string'):
+            cfg = resolve_config(tmp_path)
+        assert cfg.banner_pattern is None
+        assert capsys.readouterr().err == ''
+
+    def test_reads_valid_custom_pattern(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            "[tool.defsort]\nbanner-pattern = '^# Section: .+$'\n",
+            encoding='utf-8',
+        )
+        assert resolve_config(tmp_path).banner_pattern == '^# Section: .+$'
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [('ignore', 'ignore'), ('strip', 'strip')],
+    )
+    def test_reads_valid_mode(self, tmp_path: Path, raw: str, expected: BannerMode) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            f'[tool.defsort]\nbanners = "{raw}"\n',
+            encoding='utf-8',
+        )
+        assert resolve_config(tmp_path).banners == expected
+
+    def test_unsafe_banner_pattern_warns_and_uses_builtin_fallback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            "[tool.defsort]\nbanner-pattern = '^# (a+)+$'\n",
+            encoding='utf-8',
+        )
+        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
+            cfg = resolve_config(tmp_path)
+        assert cfg.banner_pattern is None
+        assert capsys.readouterr().err == ''
+
+
 @pytest.fixture(autouse=True)  # noqa: V103
 def isolate_config_cache() -> Iterator[None]:
     clear_config_cache()
@@ -1029,10 +988,8 @@ def test_clear_then_explicit_banner_pattern_override() -> None:
     assert effective.transform.banner_pattern == '^# Replacement'
 
 
-def test_default_values_never_warn(tmp_path: Path) -> None:
-    with warnings.catch_warnings():
-        warnings.simplefilter('error')
-        resolve_config(tmp_path)
+def test_default_config_matches_default_sort_policy() -> None:
+    assert sort_policy_from_config(DefsortConfig()) == SortPolicy()
 
 
 @pytest.mark.parametrize(('key', 'value', 'field'), _ALL_AXIS_VALUES)

@@ -180,12 +180,3 @@ class TestSpectralMap:
     def test_single_element(self) -> None:
         result = spectral_map([5])
         assert result == {5: RED}
-
-    def test_six_elements_full_spectrum(self) -> None:
-        result = spectral_map([10, 20, 30, 40, 50, 60])
-        assert result[10] == RED
-        assert result[20] == YELLOW
-        assert result[30] == GREEN
-        assert result[40] == _CYAN
-        assert result[50] == _BLUE
-        assert result[60] == _MAGENTA

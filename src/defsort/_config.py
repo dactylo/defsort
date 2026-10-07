@@ -12,10 +12,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
-from defsort._display._terminal import escape_terminal_text
+from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import (
     BANNER_MODE_VALUES,
+    COLOR_MODE_VALUES,
     EVALUATION_ORDER_VALUES,
+    FALLBACK_MODE_VALUES,
     MAIN_PLACEMENT_VALUES,
     METHOD_BODIES_VALUES,
     METHOD_DUNDERS_VALUES,
@@ -62,8 +64,6 @@ _KNOWN_KEYS: frozenset[str] = frozenset(
 _MAX_PERCENT = 100
 _RENDER_CONFIG_WARNINGS = ContextVar('render_config_warnings', default=False)
 _SCOPE_ORDER_LABEL = "'dependency', 'alphabetical', or 'none'"
-_VALID_COLORS: tuple[ColorMode, ...] = ('auto', 'always', 'never')
-_VALID_FALLBACK_MODES: tuple[FallbackMode, ...] = ('warn', 'full-sort')
 
 
 class DefsortConfigWarning(UserWarning):
@@ -144,13 +144,15 @@ def _defsort_section(data: dict[str, Any] | None, path: Path) -> dict[str, objec
     if tool is None:
         return None
     if not isinstance(tool, dict):
-        _warn_config(f'Invalid [tool] table in {path}: not a table, using defaults')
+        _warn_config(f'Invalid [tool] table in {path_text(path)}: not a table, using defaults')
         return None
     section = cast('dict[str, Any]', tool).get('defsort')
     if section is None:
         return None
     if not isinstance(section, dict):
-        _warn_config(f'Invalid [tool.defsort] section in {path}: not a table, using defaults')
+        _warn_config(
+            f'Invalid [tool.defsort] section in {path_text(path)}: not a table, using defaults'
+        )
         return None
     return cast('dict[str, object]', section)
 
@@ -161,7 +163,7 @@ def _load_toml(path: Path) -> dict[str, Any] | None:
         with path.open('rb') as f:
             return tomllib.load(f)
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        _warn_config(f'Cannot read configuration from {path}: {exc}, using defaults')
+        _warn_config(f'Cannot read configuration from {path_text(path)}: {exc}, using defaults')
         return None
 
 
@@ -317,13 +319,15 @@ def _parse_section(section: dict[str, object]) -> ResolvedConfig:
         incremental = None
 
     incremental_fallback: FallbackMode = _parse_vocabulary(
-        section, 'incremental-fallback', _VALID_FALLBACK_MODES, "'warn' or 'full-sort'", 'warn'
+        section, 'incremental-fallback', FALLBACK_MODE_VALUES, "'warn' or 'full-sort'", 'warn'
     )
 
     color_raw = _parse_string_literal(
-        section, 'color', frozenset(_VALID_COLORS), "'auto', 'always', or 'never'"
+        section, 'color', frozenset(COLOR_MODE_VALUES), "'auto', 'always', or 'never'"
     )
-    color: ColorMode | None = next((value for value in _VALID_COLORS if value == color_raw), None)
+    color: ColorMode | None = next(
+        (value for value in COLOR_MODE_VALUES if value == color_raw), None
+    )
 
     max_reorder_count = _parse_bounded_int(section, 'max-reorder-count')
     max_reorder_percent = _parse_bounded_int(section, 'max-reorder-percent', max_val=_MAX_PERCENT)
@@ -456,30 +460,31 @@ def ineffective_policy_values(policy: DefsortConfig) -> list[str]:
     Returns:
         The ineffective policy key names.
     """
+    defaults = DefsortConfig()
     checks = (
         (
             'method-bodies',
-            policy.method_bodies != 'within-categories',
+            policy.method_bodies != defaults.method_bodies,
             policy.method_order != 'dependency',
         ),
         (
             'tie-break',
-            policy.tie_break != 'alphabetical',
+            policy.tie_break != defaults.tie_break,
             policy.definition_order != 'dependency' and policy.method_order != 'dependency',
         ),
         (
             'method-visibility',
-            policy.method_visibility != 'mixed',
+            policy.method_visibility != defaults.method_visibility,
             policy.method_order == 'none',
         ),
         (
             'method-dunders',
-            policy.method_dunders != 'before-regular',
+            policy.method_dunders != defaults.method_dunders,
             policy.method_order == 'none',
         ),
         (
             'main',
-            policy.main != 'last',
+            policy.main != defaults.main,
             policy.definition_order == 'none',
         ),
     )

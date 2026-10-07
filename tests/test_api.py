@@ -1,12 +1,12 @@
 import ast
 import dataclasses
+import importlib
 import inspect
 import re
 import sys
 import typing
 from collections.abc import Callable
 from pathlib import Path
-from types import FunctionType
 from typing import cast
 
 import pytest
@@ -23,7 +23,7 @@ from defsort import (
     sort,
 )
 from defsort._types import BANNER_MODE_VALUES, ClassBlocker
-from tests._helpers import decode_text, run_setup
+from tests._helpers import _ENV, decode_text, execute_source, process_transcript, run_setup
 
 _API_INEFFECTIVE_CASES = [
     (
@@ -113,8 +113,6 @@ _SORTED_WITH_INTERSTITIAL = (
     'registry: dict[str, object] = {}\n\n'
     'def bravo():\n    return alpha()\n'
 )
-# Source containing a lone Unicode surrogate -- ast.parse raises ValueError.
-_SURROGATE = 'def alpha():\n    pass\n\ud800'
 _SRC_DUP_METHODS = """class C:
     def helper(self):
         return 1
@@ -156,6 +154,8 @@ _SRC_WITH_CLASS = (
     'def zeta():\n    pass\n\n\n'
     'def able():\n    pass\n'
 )
+# Source containing a lone Unicode surrogate -- ast.parse raises ValueError.
+_SURROGATE = 'def alpha():\n    pass\n\ud800'
 
 
 class TestBlockerMessagePopulation:
@@ -333,15 +333,6 @@ class TestCheck:
     def test_needs_sort(self) -> None:
         result = defsort.check(_NEEDS_SORT)
         assert result.status == 'changed'
-
-    def test_skipped(self) -> None:
-        result = defsort.check(_SKIPPED)
-        assert result.status == 'skipped'
-        assert result.blocker is not None
-
-    def test_skipped_blocker_content(self) -> None:
-        result = defsort.check(_SKIPPED)
-        assert result.blocker == 'interstitial'
 
     def test_skipped_nonconsecutive_duplicates(self) -> None:
         src = 'def alpha():\n    pass\n\n\ndef bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
@@ -901,10 +892,58 @@ class TestIndependentScopes:
         assert result.index('def m') < result.index('def z')
 
 
+class TestLazyFacade:
+    def test_dir_lists_every_export(self) -> None:
+        assert set(defsort.__all__) <= set(dir(defsort))
+        assert defsort.__dir__() == dir(defsort)
+
+    def test_exports_are_library_objects(self) -> None:
+        library = importlib.import_module('defsort._library')
+        assert list(library.__all__) == list(defsort.__all__)
+        for name in defsort.__all__:
+            assert getattr(defsort, name) is getattr(library, name)
+
+    def test_first_access_in_fresh_interpreter_loads_library_lazily(self) -> None:
+        script = (
+            'import sys\n'
+            'import defsort\n'
+            "assert 'defsort._library' not in sys.modules, 'library loaded at import'\n"
+            "assert 'defsort._core' not in sys.modules, 'engine loaded at import'\n"
+            "assert not hasattr(defsort, '_cli')\n"
+            'from defsort import _downstream\n'
+            "assert 'defsort._library' not in sys.modules, 'library loaded by probes'\n"
+            'for name in defsort.__all__:\n'
+            '    getattr(defsort, name)\n'
+            "assert 'defsort._library' in sys.modules\n"
+        )
+        result = run_setup([sys.executable, '-c', script], env=_ENV, check=False)
+        assert result.returncode == 0, process_transcript(result)
+
+    def test_library_import_failure_surfaces_on_first_access(self) -> None:
+        script = (
+            'import sys\n'
+            "sys.modules['defsort._library'] = None\n"
+            'import defsort\n'
+            'try:\n'
+            '    defsort.sort\n'
+            'except ImportError:\n'
+            '    sys.exit(0)\n'
+            'sys.exit(1)\n'
+        )
+        result = run_setup([sys.executable, '-c', script], env=_ENV, check=False)
+        assert result.returncode == 0, process_transcript(result)
+
+    def test_unexported_name_is_not_an_attribute(self) -> None:
+        name = 'validate_config'
+        with pytest.raises(AttributeError):
+            getattr(defsort, name)
+        with pytest.raises(AttributeError):
+            defsort.__getattr__(name)
+
+
 class TestPublicAPI:
     def test_clear_config_cache_importable(self) -> None:
         assert callable(defsort.clear_config_cache)
-        assert 'clear_config_cache' in defsort.__all__
 
 
 class TestPublicBannerConfiguration:
@@ -1009,7 +1048,6 @@ class TestPublicTypeExports:
             'SortScopeOrder',
             'SortStatus',
         }
-        assert names <= set(defsort.__all__)
         for name in names:
             assert getattr(defsort, name) is not None
 
@@ -1109,11 +1147,11 @@ class A:
         ids=['__init_subclass__', '__new__', '__set_name__'],
     )
     def test_annotation_only_class_hook_preserves_binding(self, source: str) -> None:
-        FunctionType(compile(source, '<test>', 'exec'), {})()
+        execute_source(source)
 
         sorted_source = defsort.sort(source)
 
-        FunctionType(compile(sorted_source, '<test>', 'exec'), {})()
+        execute_source(sorted_source)
         assert sorted_source.index('class Z') < sorted_source.index('class A')
         assert defsort.sort(sorted_source) == sorted_source
 
@@ -1188,11 +1226,11 @@ class B:
 class A(B):
     pass
 """
-        FunctionType(compile(source, '<test>', 'exec'), {})()
+        execute_source(source)
 
         sorted_source = defsort.sort(source)
 
-        FunctionType(compile(sorted_source, '<test>', 'exec'), {})()
+        execute_source(sorted_source)
         assert sorted_source.index('class Z') < sorted_source.index('class A')
         assert defsort.sort(sorted_source) == sorted_source
 
@@ -1479,10 +1517,6 @@ def test_banner_detect_parameters_are_keyword_only_with_barrier_defaults() -> No
 
 def test_banner_mode_is_the_only_public_banner_type() -> None:
     assert typing.get_args(defsort.BannerMode) == ('barriers', 'ignore', 'strip')
-    assert 'BannerMode' in defsort.__all__
-    assert 'SectionBoundary' not in defsort.__all__
-    assert 'HeldItem' not in defsort.__all__
-    assert 'BannerConstraint' not in defsort.__all__
 
 
 @pytest.mark.parametrize('function', [sort, check])

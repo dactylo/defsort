@@ -150,8 +150,8 @@ policy change can therefore invalidate a baseline that conformed under the previ
 includes adopting new defaults or changing strategies, method-body scope, categories, `main()`
 placement, tie-breaking, evaluation order, or banner recognition.
 
-A baseline that no longer matches the target reports `NON_CONFORMING`; one whose existing items
-cannot reach the new target without reordering reports `TARGET_INCOMPATIBLE`. The CLI skips that
+A baseline that no longer matches the target reports `non_conforming`; one whose existing items
+cannot reach the new target without reordering reports `target_incompatible`. The CLI skips that
 file. The hook either warns and skips or uses its configured full-sort fallback. Full sorting
 remains the canonical way to establish a baseline for the new policy.
 
@@ -172,9 +172,9 @@ Incremental sorting applies this complete boundary-edit policy:
   definitions or methods does not change. A boundary edit alone does not create a blocker.
 - Existing definitions or methods may change section membership when a boundary moves. This is
   legal while their global relative order remains unchanged. A global existing-item reorder still
-  produces `USER_REORDERED`.
+  produces `user_reordered`.
 - Each current section is checked against its configured target independently. If the existing
-  items in one current section conflict with that target, the result is `TARGET_INCOMPATIBLE`.
+  items in one current section conflict with that target, the result is `target_incompatible`.
 - New definitions and methods merge only into the section assigned by the current source. They do
   not cross a current boundary to reach a global target position.
 - A boundary-only edit with no new definitions is preserved byte-for-byte in `barriers` mode.
@@ -245,11 +245,11 @@ preserves or adds the future import, or blocks when addition is disabled. This t
 check applies to the proposed order once it changes.
 
 Structural and policy checks remain authoritative when they prevent an unambiguous candidate. These
-include applicable `INTERSTITIAL`, `DUPLICATES`, `NON_CONFORMING`, `TARGET_INCOMPATIBLE`, and
-`USER_REORDERED` results.
+include applicable `interstitial`, `duplicates`, `non_conforming`, `target_incompatible`, and
+`user_reordered` results.
 
 Once actual top-level and method candidates exist, semantic hazards are aggregated across both
-scopes. `EAGER_ORDER` precedes `FORWARD_REFS`, even when the eager and annotation hazards occur in
+scopes. `eager_order` precedes `forward_refs`, even when the eager and annotation hazards occur in
 different scopes. This prevents a future import from being presented as a repair for an eager
 decorator, default, base, class-keyword, or class-suite read.
 

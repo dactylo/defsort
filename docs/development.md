@@ -2,7 +2,7 @@
 
 ## Local environment
 
-Run `make setup` from the checkout with uv 0.12.13 and a supported `python` on `PATH`. It
+Run `make setup` from the checkout with uv 0.12.23 and a supported `python` on `PATH`. It
 synchronizes the hashed development lock into `.venv` and installs the checkout in editable mode.
 `make quality` runs the read-only formatting, lock, type, dead-code, manifest, and whitespace
 checks; `make check` adds the full test suite. `make test` runs that suite alone, and `make format`
@@ -86,11 +86,6 @@ tool-version, Python-version, or native-platform parity with the CI matrix.
 
 ## Test and runner notes
 
-The `hooks` job checks both pre-commit hooks in a temporary repository without building or
-downloading distributions. The required checks and hooks job run in either mode. Hosted jobs run on
-separate GitHub-hosted runners; local runners may share a workspace and need their own workspace
-isolation. Linux and hosted runners run the full suite; local macOS and Windows omit tests marked
-`slow` in quick runs. Test jobs allow 30 minutes on Linux and hosted macOS, and 45 minutes on
-hosted Windows. `make test` remains serial. The local and CI quality commands select the same
-checks; this does not establish tool-version, Python-version, or native-platform parity with the CI
-matrix.
+Hosted jobs run on separate GitHub-hosted runners; local runners may share a workspace and need
+their own workspace isolation. Linux and hosted runners run the full suite; local macOS and Windows
+omit tests marked `slow` in quick runs. `make test` remains serial.

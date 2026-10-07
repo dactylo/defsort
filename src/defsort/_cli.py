@@ -1,24 +1,21 @@
 """CLI for defsort."""
 
-# pyright: reportPrivateUsage=false
-
 import argparse
 import ast
-import contextlib
 import enum
 import os
 import sys
-import warnings
-from collections.abc import Generator, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TextIO
+from typing import override
 
+from defsort._arguments import add_ordering_arguments, overrides_from_args
 from defsort._color import should_color
 from defsort._config import (
-    DefsortConfigWarning,
     ResolvedConfig,
     effective_config,
+    render_config_warnings,
     resolve_config_sourced,
     resolve_runtime_config,
     warn_ineffective_policy,
@@ -44,14 +41,12 @@ from defsort._display import (
     print_preview,
     print_skipped,
 )
+from defsort._display._policy import format_policy_block
 from defsort._display._skipped import format_class_blocker
-from defsort._display._terminal import escape_terminal_text
 from defsort._display._types import CliMode, JsonFileRecord, SummaryRow
-from defsort._downstream import closable_stdout, stdout_closed
+from defsort._downstream import stdout_closed
 from defsort._files import (
     collect_files,
-    ensure_utf8_stdio,
-    read_file,
     read_file_result,
     write_source,
 )
@@ -61,30 +56,28 @@ from defsort._git import (
     require_batch_z_support,
     try_get_repo_root,
 )
+from defsort._main import main as entry_main
+from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import (
-    BANNER_MODE_VALUES,
-    EVALUATION_ORDER_VALUES,
+    COLOR_MODE_VALUES,
     EXIT_CHANGED,
     EXIT_ERROR,
     EXIT_OK,
-    MAIN_PLACEMENT_VALUES,
-    METHOD_BODIES_VALUES,
-    METHOD_DUNDERS_VALUES,
-    METHOD_VISIBILITY_VALUES,
-    SORT_SCOPE_ORDER_VALUES,
-    TIE_BREAK_VALUES,
     BlobReadResult,
     BlobReadStatus,
     ColorMode,
+    DetectResult,
     EngineOptions,
     OrderKind,
     SortOverrides,
     SortResult,
     sort_policy_from_config,
-    validate_banner_pattern,
 )
 
 _BASELINE_UNAVAILABLE = 'incremental: unable to read baseline from git'
+_COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ('commands', (('hook', 'run as a coding-agent hook (see defsort hook --help)'),)),
+)
 
 
 class _FileStatus(enum.Enum):
@@ -97,347 +90,29 @@ class _FileStatus(enum.Enum):
     UNCHANGED = 'unchanged'
 
 
-def _add_order_argument(parser: argparse.ArgumentParser) -> None:
-    """Register the shared ordering-policy shorthand on a parser."""
-    parser.add_argument(
-        '-o',
-        '--order',
-        choices=SORT_SCOPE_ORDER_VALUES,
-        help='Sort order for definitions and methods: dependency, alphabetical, none.',
-    )
+class _RootParser(argparse.ArgumentParser):
+    """Render the option groups, then the commands that have their own parsers."""
 
-
-def _collect_policy_paths(raw_paths: list[str]) -> tuple[list[Path], bool]:
-    """Expand policy paths while retaining empty directories."""
-    paths: list[Path] = []
-    seen: set[Path] = set()
-    error_seen = False
-    for raw in raw_paths:
-        path = Path(raw)
-        try:
-            path.stat()
-            if path.is_dir():
-                with os.scandir(path):
-                    pass
-                candidates = collect_files([raw])
-            else:
-                with path.open('rb'):
-                    pass
-                candidates = [path]
-        except OSError as exc:
-            safe_path = escape_terminal_text(str(path))
-            safe_detail = escape_terminal_text(str(exc))
-            print(f'error: {safe_path}: {safe_detail}', file=sys.stderr)
-            error_seen = True
-            continue
-        if not candidates:
-            candidates = [path]
-        for candidate in candidates:
-            resolved = candidate.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                paths.append(candidate)
-    return paths, error_seen
-
-
-def _compiled_regex_pattern(value: str) -> str:
-    """Validate a regular expression while preserving its source string."""
-    try:
-        validate_banner_pattern(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-    return value
-
-
-def _add_policy_arguments(
-    parser: argparse.ArgumentParser,
-    *,
-    group_title: str | None = None,
-) -> None:
-    """Register detailed ordering-policy arguments on a parser."""
-    arguments = parser if group_title is None else parser.add_argument_group(group_title)
-    arguments.add_argument(
-        '--definition-order',
-        choices=SORT_SCOPE_ORDER_VALUES,
-        help='Sort order for top-level definitions: dependency, alphabetical, none.',
-    )
-    arguments.add_argument(
-        '--method-order',
-        choices=SORT_SCOPE_ORDER_VALUES,
-        help='Sort order for class methods: dependency, alphabetical, none.',
-    )
-    arguments.add_argument(
-        '--evaluation-order',
-        choices=EVALUATION_ORDER_VALUES,
-        help='Preserve definition-time evaluation order or allow reordering.',
-    )
-    arguments.add_argument(
-        '--method-bodies',
-        choices=METHOD_BODIES_VALUES,
-        help=(
-            'Let method-body dependencies stay within categories, be ignored, or cross categories.'
-        ),
-    )
-    arguments.add_argument(
-        '--method-visibility',
-        choices=METHOD_VISIBILITY_VALUES,
-        help='Keep regular methods mixed or place public methods before private methods.',
-    )
-    arguments.add_argument(
-        '--method-dunders',
-        choices=METHOD_DUNDERS_VALUES,
-        help='Place non-lifecycle dunders before or after regular methods.',
-    )
-    arguments.add_argument(
-        '--main',
-        choices=MAIN_PLACEMENT_VALUES,
-        help='Anchor main() last or sort it normally.',
-    )
-    arguments.add_argument(
-        '--tie-break',
-        choices=TIE_BREAK_VALUES,
-        help='Break dependency ties alphabetically or by source order.',
-    )
-    arguments.add_argument(
-        '--banners',
-        choices=BANNER_MODE_VALUES,
-        help='Treat section banners as barriers (default), ignore them, or strip them.',
-    )
-    banner_pattern_group = arguments.add_mutually_exclusive_group()
-    banner_pattern_group.add_argument(
-        '--banner-pattern',
-        type=_compiled_regex_pattern,
-        help=('Add a safe full-match pattern to built-in banner recognition; overrides config.'),
-    )
-    banner_pattern_group.add_argument(
-        '--no-banner-pattern',
-        action='store_true',
-        dest='clear_banner_pattern',
-        help='Clear the configured custom banner pattern.',
-    )
-
-
-def _build_hook_parser() -> argparse.ArgumentParser:
-    """Build the argument parser for the hook subcommand."""
-    parser = argparse.ArgumentParser(
-        prog='defsort hook',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Agent hook entry point; reads the coding agent's payload as JSON from stdin.",
-        allow_abbrev=False,
-    )
-    parser.add_argument('-a', '--agent', required=True, metavar='NAME')
-    parser.add_argument('-e', '--event', metavar='NAME')
-    _add_order_argument(parser)
-    _add_policy_arguments(parser)
-    parser.add_argument(
-        '--allow-on-failure',
-        action='store_true',
-        help=(
-            'Warn and allow infrastructure failures after a command is accepted; '
-            'safety blockers still deny.'
-        ),
-    )
-    parser.add_argument(
-        '--incremental-fallback',
-        choices=['warn', 'full-sort'],
-        help='Fallback behavior when incremental sort is blocked.',
-    )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('-i', '--incremental', action='store_true')
-    group.add_argument(
-        '--no-incremental',
-        action='store_true',
-        help='Disable incremental mode, overriding configured incremental mode.',
-    )
-    return parser
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser."""
-    parser = argparse.ArgumentParser(
-        prog='defsort',
-        description='Sort Python definitions.',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=('subcommands:\n  hook    Agent hook entry point (see defsort hook --help)'),
-        allow_abbrev=False,
-    )
-    parser.add_argument('paths', nargs='*', default=['.'], help='Python files or directories.')
-    parser.add_argument('--version', action='store_true', help='Show the installed version.')
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument('-p', '--preview', action='store_true', help='Show movement tables.')
-    mode_group.add_argument('-d', '--diff', action='store_true', help='Show unified diff.')
-    mode_group.add_argument('-j', '--json', action='store_true', help='Output to JSON.')
-    mode_group.add_argument('-w', '--write', action='store_true', help='Modify files in place.')
-    _add_order_argument(parser)
-    incremental_group = parser.add_mutually_exclusive_group()
-    incremental_group.add_argument(
-        '-i',
-        '--incremental',
-        action='store_true',
-        help='Only sort new definitions (requires git).',
-    )
-    parser.add_argument(
-        '-f',
-        '--force',
-        action='store_true',
-        help='Bypass interstitial and reorder-guard blockers.',
-    )
-    parser.add_argument('-v', '--verbose', action='store_true', help='Include unchanged files.')
-    parser.add_argument(
-        '--color',
-        choices=['auto', 'always', 'never'],
-        help='Color output: auto (default), always, never.',
-    )
-    incremental_group.add_argument(
-        '--no-incremental',
-        action='store_true',
-        default=False,
-        help='Disable incremental mode (overrides config).',
-    )
-    skip_group = parser.add_mutually_exclusive_group()
-    skip_group.add_argument(
-        '--show-skips',
-        action='store_true',
-        default=None,
-        dest='show_skips',
-        help='Show skipped-file messages in compact modes.',
-    )
-    skip_group.add_argument(
-        '--hide-skips',
-        action='store_false',
-        dest='show_skips',
-        help='Hide skipped-file messages in compact modes.',
-    )
-    mode_group.add_argument(
-        '--show-policy',
-        action='store_true',
-        help='Show the resolved ordering policy.',
-    )
-    parser.add_argument('--detect', action='store_true', help='Detect definition order.')
-    parser.add_argument('--hoist', action='store_true', help='Hoist constants to preamble.')
-    parser.add_argument(
-        '--no-future', action='store_true', help="Don't add future annotations import."
-    )
-    _add_policy_arguments(parser, group_title='ordering policy options')
-    return parser
-
-
-def _format_policy_block(
-    cfg: ResolvedConfig,
-    source: Path | None,
-    *,
-    has_overrides: bool,
-) -> str:
-    """Format one resolved policy and its provenance."""
-    policy = sort_policy_from_config(cfg.transform)
-    header = (
-        'built-in defaults'
-        if source is None
-        else f'policy from {escape_terminal_text(str(source))}'
-    )
-    if has_overrides:
-        header += ' (with CLI overrides)'
-    if policy.method_dunders == 'before-regular':
-        categories = '__new__, __init__, dunders, regular'
-    else:
-        categories = '__new__, __init__, regular, dunders'
-    body_dependencies = {
-        'across-categories': 'body dependencies across categories',
-        'ignore': 'body dependencies ignored',
-        'within-categories': 'body dependencies within categories',
-    }[policy.method_bodies]
-    return (
-        f'{header}:\n'
-        f'  definitions: {policy.definition_order}; main {policy.main}; '
-        f'ties {policy.tie_break}\n'
-        f'  methods: {policy.method_order}; categories {categories} '
-        f'({policy.method_visibility});\n'
-        f'           {body_dependencies}; ties {policy.tie_break}\n'
-        f'  evaluation order: {policy.evaluation_order}\n'
-        f'  banners: {policy.banners}'
-    )
-
-
-def _guarded_skip(result: SortResult, warning: str) -> SortResult:
-    """Clone a SortResult as a guarded skip (new_source reset to original)."""
-    return SortResult(
-        original_source=result.original_source,
-        new_source=result.original_source,
-        original_order=result.original_order,
-        new_order=result.new_order,
-        warning=warning,
-        blocking_code=[],
-        guarded=True,
-        skipped=True,
-        method_sorts=result.method_sorts,
-        total_methods=result.total_methods,
-        banner_constraints=list(result.banner_constraints),
-        class_blockers=result.class_blockers,
-    )
-
-
-def _overrides_from_args(args: argparse.Namespace) -> SortOverrides:
-    """Build configuration overrides from parsed CLI arguments."""
-    incremental: bool | None = None
-    if args.no_incremental:
-        incremental = False
-    elif args.incremental:
-        incremental = True
-    return SortOverrides(
-        banners=args.banners,
-        banner_pattern=args.banner_pattern,
-        clear_banner_pattern=args.clear_banner_pattern,
-        definition_order=args.definition_order,
-        evaluation_order=args.evaluation_order,
-        incremental=incremental,
-        incremental_fallback=getattr(args, 'incremental_fallback', None),
-        main=args.main,
-        method_bodies=args.method_bodies,
-        method_dunders=args.method_dunders,
-        method_order=args.method_order,
-        method_visibility=args.method_visibility,
-        order=args.order,
-        show_skips=getattr(args, 'show_skips', None),
-        tie_break=args.tie_break,
-    )
-
-
-def _print_version() -> int:
-    """Print the installed distribution version without other work."""
-    import importlib.metadata  # noqa: PLC0415
-
-    try:
-        version = importlib.metadata.version('defsort')
-    except importlib.metadata.PackageNotFoundError:
-        print('error: installed distribution metadata for defsort is unavailable', file=sys.stderr)
-        return EXIT_ERROR
-    print(f'defsort {version}')
-    return EXIT_OK
-
-
-@contextlib.contextmanager
-def _render_safe_config_warnings() -> Generator[None]:
-    """Render configuration warnings with terminal-safe message text."""
-    with warnings.catch_warnings():
-        previous_showwarning = warnings.showwarning
-
-        def dispatch_warning(
-            message: Warning | str,
-            category: type[Warning],
-            location: tuple[str, int, TextIO | None, str | None],
-        ) -> None:
-            filename, lineno, file, line = location
-            if issubclass(category, DefsortConfigWarning):
-                detail = escape_terminal_text(str(message))
-                print(f'Warning: {detail}', file=sys.stderr)
-                return
-            previous_showwarning(message, category, filename, lineno, file=file, line=line)
-
-        warnings.showwarning = lambda message, category, filename, lineno, file=None, line=None: (
-            dispatch_warning(message, category, (filename, lineno, file, line))
-        )
-        warnings.simplefilter('always', DefsortConfigWarning)
-        yield
+    @override
+    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
+        if formatter is None:
+            formatter = self._get_formatter()
+        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
+        formatter.add_text(self.description)
+        for action_group in self._action_groups:
+            formatter.start_section(action_group.title)
+            formatter.add_text(action_group.description)
+            # argparse exposes no public accessor for a group's actions.
+            formatter.add_arguments(action_group._group_actions)  # noqa: SLF001
+            formatter.end_section()
+        for title, commands in _COMMAND_GROUPS:
+            formatter.start_section(title)
+            formatter.add_arguments(
+                [argparse.Action([], name, help=text) for name, text in commands]
+            )
+            formatter.end_section()
+        formatter.add_text(self.epilog)
+        return formatter.format_help()
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,19 +127,10 @@ class _FileSortResult:
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedConfig:
-    """Carry effective CLI settings for one file."""
+    """Pair one file's resolved configuration with its engine options."""
 
+    resolved: ResolvedConfig
     options: EngineOptions
-    incremental: bool
-    max_reorder_count: int | None
-    max_reorder_percent: int | None
-    show_skips: bool
-    color: ColorMode | None = None
-
-    @property
-    def _guard_enabled(self) -> bool:
-        """Return whether at least one reorder guard threshold is configured."""
-        return self.max_reorder_count is not None or self.max_reorder_percent is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,62 +157,145 @@ class _ConfigResolver:
         cached = self._cache.get(path)
         if cached is not None:
             return cached
-        with _render_safe_config_warnings():
+        with render_config_warnings():
             cfg = effective_config(resolve_runtime_config(path), self.overrides)
         if cfg not in self.warned_configs:
             warn_ineffective_policy(cfg.transform)
             self.warned_configs.add(cfg)
         resolved = _ResolvedConfig(
+            resolved=cfg,
             options=EngineOptions(
                 policy=sort_policy_from_config(cfg.transform),
                 force=self.force,
                 hoist=self.hoist,
                 add_future=self.add_future,
             ),
-            incremental=cfg.incremental if cfg.incremental is not None else False,
-            max_reorder_count=cfg.max_reorder_count,
-            max_reorder_percent=cfg.max_reorder_percent,
-            show_skips=cfg.show_skips,
-            color=cfg.color,
         )
         self._cache[path] = resolved
         return resolved
 
 
-def _apply_reorder_guard(  # noqa: PLR0911
-    result: SortResult,
-    baseline: BlobReadResult | None,
-    *,
-    config: _ResolvedConfig,
-) -> SortResult:
-    """Apply the large-reorder guard, returning a guarded SortResult if triggered."""
-    if result.skipped:
-        return result
-    if not config._guard_enabled:
-        return result
-    if result.original_source == result.new_source:
-        return result
-
-    if baseline is None or baseline.status is BlobReadStatus.MISSING:
-        return result
-
-    if baseline.status in (BlobReadStatus.INFRA_ERROR, BlobReadStatus.DECODE_FAILED):
-        return _guarded_skip(result, 'reorder guard: unable to read baseline from git')
-
-    # CONTENT: parse baseline into definitions for the guard
-    assert baseline.content is not None  # noqa: S101
-    params = build_guard_params(
-        baseline.content,
-        max_reorder_count=config.max_reorder_count,
-        max_reorder_percent=config.max_reorder_percent,
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser."""
+    parser = _RootParser(
+        prog='defsort',
+        usage='%(prog)s [options] [PATH ...]',
+        description='Sort Python functions, classes, and methods by a configurable policy.',
+        allow_abbrev=False,
     )
-    if params is None:
-        return result  # unparseable baseline -> skip guard
-    guard_result = evaluate_reorder_guard(params, result.new_order)
-    if not guard_result.triggered:
-        return result
+    parser.add_argument(
+        'paths',
+        nargs='*',
+        default=['.'],
+        metavar='PATH',
+        help='files or directories to check (default: current directory)',
+    )
+    parser.add_argument('--version', action='store_true', help='show the version and exit')
+    output = parser.add_argument_group('output (choose one)')
+    modes = output.add_mutually_exclusive_group()
+    modes.add_argument(
+        '-p', '--preview', action='store_true', help='show where definitions would move'
+    )
+    modes.add_argument('-d', '--diff', action='store_true', help='show a unified diff')
+    modes.add_argument('-w', '--write', action='store_true', help='rewrite files in place')
+    modes.add_argument('-j', '--json', action='store_true', help='print results as JSON')
+    modes.add_argument(
+        '--show-policy',
+        action='store_true',
+        help='show the ordering policy that applies to each path',
+    )
+    output.add_argument(
+        '--detect',
+        action='store_true',
+        help='report current order instead of sorting (JSON always detects order)',
+    )
+    add_ordering_arguments(parser)
+    other_changes = parser.add_argument_group('other changes')
+    other_changes.add_argument(
+        '--hoist',
+        action='store_true',
+        help='move simple constants from between definitions to the top of the module',
+    )
+    other_changes.add_argument(
+        '--no-future',
+        action='store_true',
+        help='do not add from __future__ import annotations; files that need it are skipped',
+    )
+    safety = parser.add_argument_group('safety')
+    safety.add_argument(
+        '-f',
+        '--force',
+        action='store_true',
+        help='sort files that have code between definitions or exceed a reorder limit',
+    )
+    selection = parser.add_argument_group('selection')
+    incremental = selection.add_mutually_exclusive_group()
+    incremental.add_argument(
+        '-i',
+        '--incremental',
+        action='store_true',
+        help='sort only definitions added since the last commit (requires Git)',
+    )
+    incremental.add_argument(
+        '--no-incremental',
+        action='store_true',
+        help='sort every definition, even when configuration enables incremental mode',
+    )
+    display = parser.add_argument_group('display')
+    display.add_argument('-v', '--verbose', action='store_true', help='also list unchanged files')
+    display.add_argument(
+        '--color',
+        choices=COLOR_MODE_VALUES,
+        help='when to use color (default: auto)',
+    )
+    skips = display.add_mutually_exclusive_group()
+    skips.add_argument(
+        '--show-skips',
+        action='store_true',
+        default=None,
+        dest='show_skips',
+        help='list skipped files in summary, diff, and write output (default: on)',
+    )
+    skips.add_argument(
+        '--hide-skips',
+        action='store_false',
+        dest='show_skips',
+        help='do not list skipped files in summary, diff, and write output',
+    )
+    return parser
 
-    return _guarded_skip(result, guard_result.message)
+
+def _collect_policy_paths(raw_paths: list[str]) -> tuple[list[Path], bool]:
+    """Expand policy paths while retaining empty directories."""
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    error_seen = False
+    for raw in raw_paths:
+        path = Path(raw)
+        try:
+            path.stat()
+            if path.is_dir():
+                with os.scandir(path):
+                    pass
+                candidates = collect_files([raw])
+            else:
+                with path.open('rb'):
+                    pass
+                candidates = [path]
+        except OSError as exc:
+            safe_path = escape_terminal_text(path_text(path))
+            safe_detail = escape_terminal_text(str(exc))
+            print(f'error: {safe_path}: {safe_detail}', file=sys.stderr)
+            error_seen = True
+            continue
+        if not candidates:
+            candidates = [path]
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                paths.append(candidate)
+    return paths, error_seen
 
 
 def _file_result_to_json(
@@ -563,7 +312,7 @@ def _file_result_to_json(
         )
 
     result = file_result.sort_result
-    detect_result: tuple[OrderKind, float, float] | None = None
+    detect_result: DetectResult | None = None
     if result is not None:
         detect_result = detect_definition_order(
             result.original_order,
@@ -583,6 +332,82 @@ def _file_result_to_json(
         result=result,
         detect_result=detect_result,
     )
+
+
+def _guarded_skip(result: SortResult, warning: str) -> SortResult:
+    """Clone a SortResult as a guarded skip (new_source reset to original)."""
+    return replace(
+        result,
+        new_source=result.original_source,
+        warning=warning,
+        blocker=None,
+        blocking_code=[],
+        guarded=True,
+        skipped=True,
+        banner_constraints=list(result.banner_constraints),
+    )
+
+
+def _apply_reorder_guard(  # noqa: PLR0911
+    result: SortResult,
+    baseline: BlobReadResult | None,
+    *,
+    config: _ResolvedConfig,
+) -> SortResult:
+    """Apply the large-reorder guard, returning a guarded SortResult if triggered."""
+    if result.skipped:
+        return result
+    if not config.resolved.guard_enabled:
+        return result
+    if result.original_source == result.new_source:
+        return result
+
+    if baseline is None or baseline.status is BlobReadStatus.MISSING:
+        return result
+
+    if baseline.status in (BlobReadStatus.INFRA_ERROR, BlobReadStatus.DECODE_FAILED):
+        return _guarded_skip(result, 'reorder guard: unable to read baseline from git')
+
+    # CONTENT: parse baseline into definitions for the guard
+    assert baseline.content is not None  # noqa: S101
+    params = build_guard_params(
+        baseline.content,
+        max_reorder_count=config.resolved.max_reorder_count,
+        max_reorder_percent=config.resolved.max_reorder_percent,
+    )
+    if params is None:
+        return result  # unparseable baseline -> skip guard
+    guard_result = evaluate_reorder_guard(params, result.new_order)
+    if not guard_result.triggered:
+        return result
+
+    return _guarded_skip(result, guard_result.message)
+
+
+def _print_class_blockers(result: SortResult) -> None:
+    """Print class blockers for a processed file."""
+    for class_blocker in result.class_blockers:
+        print(format_class_blocker(class_blocker), file=sys.stderr)
+
+
+def _print_path_error(path: Path, detail: str) -> None:
+    """Print one terminal-safe path error."""
+    safe_path = escape_terminal_text(path_text(path))
+    safe_detail = escape_terminal_text(detail)
+    print(f'error: {safe_path}: {safe_detail}', file=sys.stderr)
+
+
+def _print_version() -> int:
+    """Print the installed distribution version without other work."""
+    import importlib.metadata  # noqa: PLC0415
+
+    try:
+        version = importlib.metadata.version('defsort')
+    except importlib.metadata.PackageNotFoundError:
+        print('error: installed distribution metadata for defsort is unavailable', file=sys.stderr)
+        return EXIT_ERROR
+    print(f'defsort {version}')
+    return EXIT_OK
 
 
 def _repo_root_covers_parent(parent: Path, root: Path) -> bool:
@@ -679,26 +504,22 @@ def _run_detect(
     """Run --detect mode: classify file ordering."""
     counts: dict[OrderKind, int] = {}
     total = 0
-    entries: list[tuple[str, OrderKind | None, float, float]] = []
+    entries: list[tuple[str, DetectResult | None]] = []
     error_seen = False
 
     for path in sorted(paths):
-        options = resolver._for_path(path).options
+        options = resolver._for_path(path).options  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         try:
-            source, _enc = read_file(path)
+            source = read_file_result(path).source
         except (OSError, ValueError, SyntaxError, UnicodeDecodeError) as e:
-            safe_path = escape_terminal_text(str(path))
-            safe_detail = escape_terminal_text(str(e))
-            print(f'error: {safe_path}: {safe_detail}', file=sys.stderr)
+            _print_path_error(path, str(e))
             error_seen = True
             continue
         try:
             tree = ast.parse(source)
             compile(tree, str(path), 'exec')
         except SyntaxError as e:
-            safe_path = escape_terminal_text(str(path))
-            safe_detail = escape_terminal_text(str(e))
-            print(f'error: {safe_path}: {safe_detail}', file=sys.stderr)
+            _print_path_error(path, str(e))
             error_seen = True
             continue
         result = detect_order(
@@ -709,13 +530,12 @@ def _run_detect(
         )
 
         if result is None:
-            entries.append((str(path), None, 0.0, 0.0))
+            entries.append((str(path), None))
             continue
 
         total += 1
-        order, dep_score, alpha_score = result
-        counts[order] = counts.get(order, 0) + 1
-        entries.append((str(path), order, dep_score, alpha_score))
+        counts[result.order] = counts.get(result.order, 0) + 1
+        entries.append((str(path), result))
 
     print_detect(entries, (counts, total), verbose=verbose)
 
@@ -724,45 +544,16 @@ def _run_detect(
     return EXIT_OK
 
 
-def _run_hook(argv: list[str]) -> int:
-    """Handle the hook subcommand."""
-    hook_parser = _build_hook_parser()
-    args = hook_parser.parse_args(argv)
-
-    if sys.stdin.isatty():
-        print(
-            "defsort hook: reads the coding agent's hook payload as JSON from stdin",
-            file=sys.stderr,
-        )
-        print('See docs/hook.md for configuration.', file=sys.stderr)
-        return EXIT_OK
-
-    try:
-        stdin_data = sys.stdin.read()
-    except (ValueError, OSError):
-        return EXIT_OK
-
-    from defsort._hook import run_hook  # noqa: PLC0415
-
-    return run_hook(
-        stdin_data,
-        host=args.agent,
-        event=args.event,
-        overrides=_overrides_from_args(args),
-        allow_on_failure=args.allow_on_failure,
-    )
-
-
 def _run_show_policy(raw_paths: list[str], overrides: SortOverrides) -> int:
     """Print resolved policies grouped by configuration source."""
     paths, error_seen = _collect_policy_paths(raw_paths)
     policies: dict[Path | None, ResolvedConfig] = {}
     for path in paths:
-        with _render_safe_config_warnings():
+        with render_config_warnings():
             cfg, source = resolve_config_sourced(path)
         policies.setdefault(source, effective_config(cfg, overrides))
     blocks = [
-        _format_policy_block(
+        format_policy_block(
             cfg,
             source,
             has_overrides=overrides != SortOverrides(),
@@ -782,7 +573,7 @@ def _run_sort(
     tree: ast.Module,
 ) -> SortResult:
     """Run a sort against a pre-fetched baseline."""
-    if not config.incremental or baseline_raw is None:
+    if not config.resolved.incremental or baseline_raw is None:
         return sort_file(source, options=config.options, _tree=tree)
     match baseline_raw.status:
         case BlobReadStatus.MISSING:
@@ -825,7 +616,7 @@ def _sort_one_file(  # noqa: PLR0911
     # Check baseline availability for incremental mode (after parse so
     # syntax errors take precedence, matching pre-refactor behavior).
     if (
-        config.incremental
+        config.resolved.incremental
         and baseline is not None
         and baseline.status in (BlobReadStatus.INFRA_ERROR, BlobReadStatus.DECODE_FAILED)
     ):
@@ -897,7 +688,7 @@ def _run_json_mode(
     """Process files in JSON output mode."""
     records: list[JsonFileRecord] = []
     for path in paths:
-        config = resolver._for_path(path)
+        config = resolver._for_path(path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         baseline = baselines.get(path) if baselines else None
         file_result = _sort_one_file(path, config, baseline)
         record = _file_result_to_json(path, file_result, config.options)
@@ -934,15 +725,13 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
     for path in paths:
         if stdout_closed():
             break
-        config = resolver._for_path(path)
+        config = resolver._for_path(path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         ordering = config.options.policy.definition_order
         baseline = baselines.get(path) if baselines else None
         file_result = _sort_one_file(path, config, baseline)
 
         if file_result.status in (_FileStatus.ERROR, _FileStatus.INVALID):
-            safe_path = escape_terminal_text(str(path))
-            safe_detail = escape_terminal_text(file_result.error_message or '')
-            print(f'error: {safe_path}: {safe_detail}', file=sys.stderr)
+            _print_path_error(path, file_result.error_message or '')
             error_seen = True
             continue
 
@@ -964,12 +753,12 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 print(constraint_details, file=sys.stderr)
 
         if file_result.status is _FileStatus.SKIPPED:
-            skipped_results.append((str(path), result, config.show_skips))
+            skipped_results.append((str(path), result, config.resolved.show_skips))
             changes_seen = True
             continue
 
         if result.warning:
-            safe_path = escape_terminal_text(str(path))
+            safe_path = escape_terminal_text(path_text(path))
             safe_warning = escape_terminal_text(result.warning)
             print(f'{safe_path}: warning ({safe_warning})', file=sys.stderr)
 
@@ -983,12 +772,9 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     encoding=file_result.encoding,
                 )
             except OSError as e:
-                safe_path = escape_terminal_text(str(path))
-                safe_detail = escape_terminal_text(str(e))
-                print(f'error: {safe_path}: {safe_detail}', file=sys.stderr)
+                _print_path_error(path, str(e))
                 error_seen = True
-                for class_blocker in result.class_blockers:
-                    print(format_class_blocker(class_blocker), file=sys.stderr)
+                _print_class_blockers(result)
                 continue
 
         if mode is CliMode.PREVIEW:
@@ -1006,8 +792,7 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 had_output = True
             if file_result.status is _FileStatus.CHANGED:
                 changes_seen = True
-            for class_blocker in result.class_blockers:
-                print(format_class_blocker(class_blocker), file=sys.stderr)
+            _print_class_blockers(result)
 
         elif mode is CliMode.DIFF:
             if file_result.status is _FileStatus.CHANGED:
@@ -1020,21 +805,18 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 ordering=ordering,
                 color=stdout_color,
             )
-            for class_blocker in result.class_blockers:
-                print(format_class_blocker(class_blocker), file=sys.stderr)
+            _print_class_blockers(result)
 
         elif mode is CliMode.SUMMARY:
             if file_result.status is _FileStatus.CHANGED:
                 changes_seen = True
             summary_rows.append(build_summary_row(str(path), result))
-            for class_blocker in result.class_blockers:
-                print(format_class_blocker(class_blocker), file=sys.stderr)
+            _print_class_blockers(result)
 
         elif mode is CliMode.WRITE:
             # WRITE does not set changes_seen -- exit 0 after successful writes.
             summary_rows.append(build_summary_row(str(path), result))
-            for class_blocker in result.class_blockers:
-                print(format_class_blocker(class_blocker), file=sys.stderr)
+            _print_class_blockers(result)
 
     if summary_rows and mode in (CliMode.SUMMARY, CliMode.WRITE):
         output = format_summary_rows(summary_rows, verbose=verbose, color=stdout_color)
@@ -1062,69 +844,65 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 verbose=verbose,
             )
             if mode in (CliMode.SUMMARY, CliMode.PREVIEW):
-                for class_blocker in skip_result.class_blockers:
-                    print(format_class_blocker(class_blocker), file=sys.stderr)
+                _print_class_blockers(skip_result)
 
     return changes_seen, error_seen
 
 
-def _run_cli(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912
+def run_cli(args: list[str]) -> int:  # noqa: C901, PLR0912
     """Parse CLI arguments and dispatch the selected operation."""
-    ensure_utf8_stdio()
-    args_list = sys.argv[1:] if argv is None else list(argv)
-    if args_list and args_list[0] == 'hook':
-        return _run_hook(args_list[1:])
-
     parser = _build_parser()
-    args = parser.parse_args(args_list)
+    options = parser.parse_args(args)
 
-    if args.version:
+    if options.version:
         return _print_version()
 
-    if args.show_policy and args.detect:
+    if options.show_policy and options.detect:
         parser.error('--show-policy is not allowed with --detect')
-    overrides = _overrides_from_args(args)
-    if args.show_policy:
-        return _run_show_policy(args.paths, overrides)
+    overrides = overrides_from_args(options)
+    if options.show_policy:
+        return _run_show_policy(options.paths, overrides)
 
-    raw_paths: list[str] = args.paths
+    raw_paths: list[str] = options.paths
     paths = collect_files(raw_paths)
 
     resolver = _ConfigResolver(
         overrides=overrides,
-        force=args.force,
-        hoist=args.hoist,
-        add_future=not args.no_future,
+        force=options.force,
+        hoist=options.hoist,
+        add_future=not options.no_future,
     )
-    resolved_configs = [resolver._for_path(path) for path in paths]
-    config_colors: set[ColorMode | None] = {cfg.color for cfg in resolved_configs}
+    resolved_configs = [resolver._for_path(path) for path in paths]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    config_colors: set[ColorMode | None] = {cfg.resolved.color for cfg in resolved_configs}
     config_color: ColorMode | None = (
         next(iter(config_colors)) if len(config_colors) == 1 else 'auto'
     )
 
     stdout_color = should_color(
         sys.stdout,
-        cli_flag=args.color,
+        cli_flag=options.color,
         config_value=config_color,
     )
     stderr_color = should_color(
         sys.stderr,
-        cli_flag=args.color,
+        cli_flag=options.color,
         config_value=config_color,
     )
 
-    if args.detect:
-        if args.preview or args.diff or args.write:
+    if options.detect:
+        if options.preview or options.diff or options.write:
             parser.error('--detect is not allowed with -p/--preview, -d/--diff, or -w/--write')
-        if not args.json:
+        if not options.json:
             return _run_detect(
                 paths,
                 resolver=resolver,
-                verbose=args.verbose,
+                verbose=options.verbose,
             )
         # --detect with --json: silently ignored (detect fields always in JSON)
 
-    needs_baselines = any(cfg.incremental or cfg._guard_enabled for cfg in resolved_configs)
+    needs_baselines = any(
+        cfg.resolved.incremental or cfg.resolved.guard_enabled for cfg in resolved_configs
+    )
 
     cli_baselines: dict[Path, BlobReadResult] | None = None
     if needs_baselines:
@@ -1134,15 +912,15 @@ def _run_cli(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912
             print(str(error), file=sys.stderr)
             return EXIT_ERROR
 
-    if args.json:
+    if options.json:
         exit_code = _run_json_mode(paths, resolver, cli_baselines)
     else:
         multi = len(raw_paths) > 1 or any(Path(path).is_dir() for path in raw_paths)
-        if args.write:
+        if options.write:
             mode = CliMode.WRITE
-        elif args.preview:
+        elif options.preview:
             mode = CliMode.PREVIEW
-        elif args.diff:
+        elif options.diff:
             mode = CliMode.DIFF
         else:
             mode = CliMode.SUMMARY
@@ -1152,7 +930,7 @@ def _run_cli(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912
             mode,
             resolver,
             cli_baselines,
-            verbose=args.verbose,
+            verbose=options.verbose,
             stdout_color=stdout_color,
             stderr_color=stderr_color,
             multi=multi,
@@ -1167,10 +945,7 @@ def _run_cli(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the defsort command-line interface.
-
-    If a reader closes standard output early, the remaining output is discarded
-    and the exit status reflects the work completed before the closure.
+    """Run the command-line interface through the shared entry point.
 
     Args:
         argv: Arguments to parse, or `None` to use `sys.argv`.
@@ -1178,8 +953,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         The process exit status.
     """
-    with closable_stdout():
-        return _run_cli(argv)
+    return entry_main(argv)
 
 
 if __name__ == '__main__':

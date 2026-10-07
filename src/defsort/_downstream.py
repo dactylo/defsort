@@ -2,6 +2,7 @@
 
 import contextlib
 import errno
+import io
 import os
 import sys
 from collections.abc import Generator, Iterable
@@ -10,50 +11,13 @@ from typing import TextIO, cast
 _WINDOWS = sys.platform == 'win32'
 
 
-def _null_text_stream() -> TextIO:
-    """Open a text stream on the null device."""
-    sink = os.open(os.devnull, os.O_WRONLY)
-    try:
-        return os.fdopen(sink, 'w', encoding='utf-8')
-    except BaseException:
-        os.close(sink)
-        raise
+class _ClosableTextOutput:
+    """Discard writes after the downstream reader closes."""
 
-
-def is_downstream_closure(error: OSError, *, windows: bool | None = None) -> bool:
-    """Report whether a write or flush failed because the reader closed the stream.
-
-    Args:
-        error: Error raised by a write or flush of an output stream.
-        windows: Whether Windows error reporting applies, or `None` for the
-            running platform. CPython on Windows can report a write to a pipe
-            whose reader closed as `EINVAL`.
-
-    Returns:
-        Whether the error means the downstream reader is gone.
-    """
-    on_windows = _WINDOWS if windows is None else windows
-    return isinstance(error, BrokenPipeError) or (on_windows and error.errno == errno.EINVAL)
-
-
-class ClosableTextOutput:
-    """Text output that discards writes after its downstream reader closes.
-
-    Attributes other than writing and flushing come from the wrapped stream, so
-    encoding, terminal detection, and reconfiguration behave as on that stream.
-    """
-
-    def __init__(self, stream: TextIO, *, windows: bool | None = None) -> None:
-        """Wrap a text stream.
-
-        Args:
-            stream: Stream written through until its reader closes.
-            windows: Whether Windows closed-pipe reporting applies, or `None`
-                for the running platform.
-        """
+    def __init__(self, stream: TextIO) -> None:
+        """Wrap a text stream."""
         self._closed_downstream = False
         self._stream = stream
-        self._windows = windows
 
     def __getattr__(self, name: str) -> object:
         """Return an attribute of the wrapped stream."""
@@ -75,7 +39,7 @@ class ClosableTextOutput:
         try:
             self._stream.flush()
         except OSError as error:
-            if not is_downstream_closure(error, windows=self._windows):
+            if not _is_downstream_closure(error):
                 raise
             self._closed_downstream = True
 
@@ -96,7 +60,7 @@ class ClosableTextOutput:
         try:
             return self._stream.write(text)
         except OSError as error:
-            if not is_downstream_closure(error, windows=self._windows):
+            if not _is_downstream_closure(error):
                 raise
             self._closed_downstream = True
             return len(text)
@@ -118,45 +82,40 @@ class ClosableTextOutput:
                 return
 
 
-def silence_descriptor(stream: TextIO) -> bool:
-    """Point a stream's descriptor at the null device when it has one.
+def _is_downstream_closure(error: OSError) -> bool:
+    """Report whether the downstream reader closed the stream."""
+    # CPython on Windows can report a closed pipe as EINVAL.
+    return isinstance(error, BrokenPipeError) or (_WINDOWS and error.errno == errno.EINVAL)
 
-    Args:
-        stream: Stream whose descriptor the interpreter flushes at shutdown.
 
-    Returns:
-        Whether the stream had a descriptor to redirect.
-
-    Raises:
-        OSError: If redirecting an existing descriptor fails.
-    """
+def _silence_descriptor(stream: TextIO) -> None:
+    """Point a stream's descriptor at the null device when it has one."""
     try:
         target = stream.fileno()
     except (OSError, ValueError):
-        return False
+        return
     devnull = os.open(os.devnull, os.O_WRONLY)
     try:
         os.dup2(devnull, target)
     finally:
         os.close(devnull)
-    return True
 
 
 @contextlib.contextmanager
-def closable_stdout() -> Generator[ClosableTextOutput]:
+def closable_stdout() -> Generator[_ClosableTextOutput]:
     """Route standard output through a closure-absorbing wrapper.
 
     On every exit, including `SystemExit` from argument parsing, pending output
     is flushed through the wrapper and the original stream is restored. If the
-    reader closed, the original descriptor is pointed at the null device, or a
-    stream without a descriptor is replaced by a null-device stream, so the
-    interpreter's final flush cannot fail again.
+    reader closed and the original stream has a usable descriptor, that
+    descriptor is pointed at the null device so the interpreter's final flush
+    cannot fail again. Streams without a usable descriptor are left unchanged.
 
     Yields:
         The installed wrapper.
     """
     original = sys.stdout
-    output = ClosableTextOutput(original)
+    output = _ClosableTextOutput(original)
     sys.stdout = cast('TextIO', output)
     try:
         yield output
@@ -165,10 +124,36 @@ def closable_stdout() -> Generator[ClosableTextOutput]:
             output.flush()
         finally:
             sys.stdout = original
-            if output.closed_downstream and not silence_descriptor(original):
-                # The interpreter still flushes a stream without a descriptor
-                # at shutdown, so replace it with one that cannot fail.
-                sys.stdout = _null_text_stream()
+            if output.closed_downstream:
+                _silence_descriptor(original)
+
+
+def ensure_utf8_stdio() -> None:
+    """Reconfigure stdio: UTF-8 on Windows, escaped stdout everywhere.
+
+    Standard output renders unencodable characters (for example
+    surrogateescaped filesystem names) with `backslashreplace`, matching the
+    standard-error default, instead of raising `UnicodeEncodeError`. Windows
+    additionally forces UTF-8 for all three streams, preserving each existing
+    error handler where it is not overridden here.
+    """
+    # PEP 686 makes UTF-8 mode the default in Python 3.15; remove Windows
+    # forcing once requires-python is >=3.15. Keep stdout's backslashreplace
+    # because UTF-8 mode uses surrogateescape.
+    stdout = sys.stdout
+    if isinstance(stdout, io.TextIOWrapper):
+        if sys.platform == 'win32':
+            stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
+        else:
+            stdout.reconfigure(errors='backslashreplace')
+    if sys.platform != 'win32':
+        return
+    stdin = sys.stdin
+    if isinstance(stdin, io.TextIOWrapper):
+        stdin.reconfigure(encoding='utf-8', errors=stdin.errors)
+    stderr = sys.stderr
+    if isinstance(stderr, io.TextIOWrapper):
+        stderr.reconfigure(encoding='utf-8', errors=stderr.errors)
 
 
 def stdout_closed() -> bool:
@@ -178,4 +163,4 @@ def stdout_closed() -> bool:
         Whether the installed wrapper has observed closure.
     """
     output = sys.stdout
-    return isinstance(output, ClosableTextOutput) and output.closed_downstream
+    return isinstance(output, _ClosableTextOutput) and output.closed_downstream

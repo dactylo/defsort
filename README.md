@@ -1,8 +1,6 @@
 # defsort
 
-[![CI](https://github.com/dactylo/defsort/actions/workflows/ci.yml/badge.svg)](https://github.com/dactylo/defsort/actions/workflows/ci.yml)
-
-Defsort applies a configurable ordering policy to Python functions, classes, and methods. It makes
+defsort applies a configurable ordering policy to Python functions, classes, and methods. It makes
 definition order deterministic, so placement follows a project convention rather than accumulating
 from successive edits.
 
@@ -66,7 +64,7 @@ definitions, add:
 method-order = "none"
 ```
 
-Defsort checks for changes that could break definition-time references and preserves decorators,
+defsort checks for changes that could break definition-time references and preserves decorators,
 comments, and source layout. Its checks are bounded: classes whose behavior depends on method order
 should use `method-order = "none"`. Read the [safety model](docs/design.md#safety-model) before
 adopting it in order-sensitive code.
@@ -114,7 +112,7 @@ Use `check()` to inspect skipped or invalid source before deciding what to do. T
 
 See the [development guide](docs/development.md) for pinned CI dependencies and lock updates.
 
-Provide the tools in `[dependency-groups].dev` through your environment or package manager.
+Run `make setup` with uv 0.12.23 to create the pinned `.venv` before project commands.
 `make install` and `make reinstall` install only the CLI through uv.
 
 ```bash

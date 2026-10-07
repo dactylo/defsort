@@ -14,8 +14,9 @@ from typing import NamedTuple
 
 from defsort._files import encode_source
 from defsort._git_executable import resolve_git_executable
-from defsort._shell import normalize_msys_path
-from defsort._types import BlobReadResult, BlobReadStatus, PreCommitAdd
+from defsort._types import BlobReadResult, BlobReadStatus
+from defsort._vendor.hookshell._grammar import ADD_SELECTORS, PreCommitAdd
+from defsort._vendor.hookshell._shell import normalize_msys_path
 
 _CAT_FILE_HEADER_FIELD_COUNT = 3
 _GIT_RAW_DIFF_FIELD_COUNT = 5
@@ -35,7 +36,7 @@ class RepoDiscoveryStatus(enum.Enum):
     Attributes:
         WORKTREE: Git successfully discovered a worktree.
         NOT_WORKTREE: Repository inspection confirmed there is no worktree.
-        ERROR: Defsort could not establish repository state.
+        ERROR: defsort could not establish repository state.
     """
 
     WORKTREE = 'worktree'
@@ -222,11 +223,11 @@ def _parse_add_pathspecs(arguments: list[str]) -> tuple[bool, list[str]]:
         if not flags_done and argument == '--':
             flags_done = True
             continue
-        if not flags_done and argument in ('-A', '-u', '--all', '--update'):
+        if not flags_done and argument in ADD_SELECTORS:
             all_files = True
             continue
         pathspecs.append(normalize_msys_path(argument))
-    return all_files, pathspecs
+    return all_files and not pathspecs, pathspecs
 
 
 def _parse_cat_file_response(
@@ -355,7 +356,10 @@ def apply_index_entries(cwd: str, entries: Collection[tuple[str, str, str]]) -> 
         entries: File modes, blob hashes, and repository-relative paths.
 
     Returns:
-        `True` on success, or `False` on failure.
+        `True` on success, or `False` when Git exits unsuccessfully.
+
+    Raises:
+        OSError: Git could not be launched.
     """
     if not entries:
         return True
@@ -484,8 +488,10 @@ def get_modified_tracked_py_files(cwd: str) -> list[str] | None:
         cwd: Repository working directory.
 
     Returns:
-        Repository-relative paths, or `None` on failure, matching
-        `get_staged_py_info()`'s fail-closed contract.
+        Repository-relative paths, or `None` when Git exits unsuccessfully.
+
+    Raises:
+        OSError: Git could not be launched.
     """
     # Check if HEAD exists
     head_check = subprocess.run(
@@ -682,7 +688,11 @@ def prepare_index_entry(
         encoding: Encoding for the blob content.
 
     Returns:
-        The mode, new blob hash, and path, or `None` on failure.
+        The mode, new blob hash, and path, or `None` when Git exits
+        unsuccessfully.
+
+    Raises:
+        OSError: Git could not be launched.
     """
     hash_result = subprocess.run(
         ['git', 'hash-object', '-w', '--stdin'],  # noqa: S607
@@ -875,14 +885,18 @@ def resolve_pathspec_py_files(
 
     Args:
         cwd: Working directory for Git.
-        pathspecs: Pathspecs supplied directly to `git add`.
+        pathspecs: Pathspecs supplied directly to `git add` or `git commit`.
         repo_root: Repository root used to resolve matched files.
         pathspec_file_nul: Whether the pathspec file is NUL-delimited.
         pathspec_file_content: Validated file bytes; `None` supplies no file
             pathspecs.
 
     Returns:
-        Sorted repository-relative Python paths, or `None` on failure.
+        Sorted repository-relative Python paths, or `None` when Git exits
+            unsuccessfully.
+
+    Raises:
+        OSError: Git could not be launched.
     """
     all_pathspecs = list(pathspecs)
     if pathspec_file_content is not None:
@@ -965,27 +979,15 @@ def try_get_repo_root(cwd: str) -> str | None:
     return None
 
 
-def get_repo_root(cwd: str) -> str:
-    """Resolve the git repository root directory.
-
-    Args:
-        cwd: Directory from which Git should resolve the repository.
-
-    Returns:
-        The output of `git rev-parse --show-toplevel`, or `cwd` when the
-        command fails.
-    """
-    return try_get_repo_root(cwd) or cwd
-
-
 def resolve_sync_paths(adds: Iterable[PreCommitAdd], repo_root: str) -> frozenset[str]:
     """Determine which staged .py files will be re-staged by git add.
 
     Non-flag arguments are resolved with Git pathspec semantics through `git
     ls-files` in each add's Git CWD. Adds targeting another repository are
-    ignored. `-A`/`-u`/`--all`/`--update`, and any Git resolution failure after
-    confirming the current repository context, fall back to the currently
-    staged `.py` set.
+    ignored. `-A`/`-u`/`--all`/`--update` without pathspecs, and any Git
+    resolution failure after confirming the current repository context, fall
+    back to the currently staged `.py` set. Selectors with pathspecs remain
+    limited to those pathspecs.
 
     Args:
         adds: Literal pre-commit adds from an accepted commit plan.

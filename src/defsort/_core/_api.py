@@ -34,6 +34,7 @@ from defsort._core._safety import (
 from defsort._types import (
     BannerMode,
     Definition,
+    DetectResult,
     EngineOptions,
     MethodSortInfo,
     OrderKind,
@@ -173,7 +174,7 @@ def detect_definition_order(
     definitions: list[Definition],
     *,
     banners: BannerMode,
-) -> tuple[OrderKind, float, float] | None:
+) -> DetectResult | None:
     """Detect ordering from already parsed definitions.
 
     Args:
@@ -181,15 +182,19 @@ def detect_definition_order(
         banners: Treatment of recognized section banners.
 
     Returns:
-        `(order, dep_score, alpha_score)`, or `None` when there are too few
-        comparable definitions. Barrier mode compares within sections and
-        weights each section by its number of comparable pairs.
+        Detection result, or `None` when there are too few comparable
+        definitions. Barrier mode compares within sections and weights each
+        section by its number of comparable pairs.
     """
     if len(definitions) < MIN_DEFS_FOR_DETECTION:
         return None
-    if banners == 'barriers':
-        return _detect_sections(definitions)
-    return _detect_global(definitions)
+    result = (
+        _detect_sections(definitions) if banners == 'barriers' else _detect_global(definitions)
+    )
+    if result is None:
+        return None
+    order, dep_score, alpha_score = result
+    return DetectResult(order=order, dep_score=dep_score, alpha_score=alpha_score)
 
 
 def detect_order(
@@ -198,7 +203,7 @@ def detect_order(
     banners: BannerMode = 'barriers',
     banner_pattern: str | None = None,
     _tree: ast.Module | None = None,
-) -> tuple[OrderKind, float, float] | None:
+) -> DetectResult | None:
     """Detect what ordering a file's definitions follow.
 
     Args:
@@ -209,9 +214,8 @@ def detect_order(
         _tree: Optional pre-parsed AST that must correspond to `source`.
 
     Returns:
-        `(order, dep_score, alpha_score)`, or `None` when no comparable section
-        contains at least two definitions or source parsing raises
-        `SyntaxError`.
+        Detection result, or `None` when no comparable section contains at
+        least two definitions or source parsing raises `SyntaxError`.
 
     Raises:
         TypeError: If `banner_pattern` is neither a string nor `None`.

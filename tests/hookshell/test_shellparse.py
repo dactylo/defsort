@@ -1,6 +1,7 @@
 import pytest
 
-from defsort._shellparse import (
+from defsort._vendor.hookshell._shellparse import (
+    Command,
     ExpansionPart,
     GlobPart,
     Heredoc,
@@ -184,19 +185,6 @@ class TestTree:
         assert isinstance(part, ExpansionPart)
         assert not part.children[0].in_double_quotes
 
-    @pytest.mark.parametrize('terminator', ['&&', '||', ';', ';;', '|', '|&', '&'])
-    def test_terminators_end_segments(self, terminator: str) -> None:
-        command = parse_command(f'a {terminator} b')
-        assert [segment.terminator for segment in command.segments] == [terminator, None]
-
-    @pytest.mark.parametrize(
-        'operator', ['(', ')', '<', '>', '>>', '<<<', '<&', '>&', '&>', '&>>']
-    )
-    def test_non_terminating_operators_are_elements(self, operator: str) -> None:
-        command = parse_command(f'a {operator} b')
-        assert len(command.segments) == 1
-        assert Operator(operator) in command.segments[0].elements
-
     def test_heredoc_body_follows_the_operator_line(self) -> None:
         command = parse_command('cat <<EOF && echo after\nbody\nEOF\necho done')
         heredoc = command.segments[0].elements[2]
@@ -283,15 +271,16 @@ class TestTree:
             Word('b', (LiteralPart('b', quoted=False),)),
         ]
 
-    @pytest.mark.parametrize('text', ['$NAME', '$1', '$@', '${NAME}', '~', '{a,b}'])
-    def test_expansions(self, text: str) -> None:
-        assert any(isinstance(part, ExpansionPart) for part in _word(text).parts)
-
     def test_parentheses_inside_substitution_balance(self) -> None:
         part = _word('$((1+2))').parts[0]
         assert isinstance(part, SubstitutionPart)
         assert part.raw == '$((1+2))'
         assert part.command.segments[0].elements[0] == Operator('(')
+
+    def test_quoted_bare_dollar_delimiter_suppresses_body_expansion(self) -> None:
+        command = parse_command('cat <<"$"\n$(git commit)\n$')
+        heredoc = command.segments[0].elements[2]
+        assert heredoc == Heredoc('$', quoted=True, body='$(git commit)\n')
 
     def test_quoted_glob_characters_are_literal(self) -> None:
         assert _word("'*.py'").literal_text == '*.py'
@@ -323,9 +312,48 @@ class TestTree:
             '-1',
         ]
 
+    @pytest.mark.parametrize('terminator', ['&&', '||', ';', ';;', '|', '|&', '&'])
+    def test_terminators_end_segments(self, terminator: str) -> None:
+        command = parse_command(f'a {terminator} b')
+        assert [segment.terminator for segment in command.segments] == [terminator, None]
+
+    @pytest.mark.parametrize(
+        'operator', ['(', ')', '<', '>', '>>', '<<<', '<&', '>&', '&>', '&>>']
+    )
+    def test_non_terminating_operators_are_elements(self, operator: str) -> None:
+        command = parse_command(f'a {operator} b')
+        assert len(command.segments) == 1
+        assert Operator(operator) in command.segments[0].elements
+
+    @pytest.mark.parametrize('text', ['$NAME', '$1', '$@', '${NAME}', '~', '{a,b}'])
+    def test_expansions(self, text: str) -> None:
+        assert any(isinstance(part, ExpansionPart) for part in _word(text).parts)
+
     @pytest.mark.parametrize('text', ['*.py', 'a?', '[abc]'])
     def test_globs(self, text: str) -> None:
         assert any(isinstance(part, GlobPart) for part in _word(text).parts)
+
+    @pytest.mark.parametrize(
+        ('syntax', 'delimiter', 'quoted'),
+        [
+            ("'EOF'", 'EOF', True),
+            ('"$"', '$', True),
+            ('"$EOF"', '$EOF', True),
+            ('"$(name)"', '$(name)', True),
+            ('EOF', 'EOF', False),
+        ],
+    )
+    def test_heredoc_delimiter_quote_removal(
+        self,
+        syntax: str,
+        delimiter: str,
+        *,
+        quoted: bool,
+    ) -> None:
+        command = parse_command(f'cat <<{syntax}\nbody\n{delimiter}')
+        heredoc = command.segments[0].elements[2]
+        assert heredoc == Heredoc(delimiter, quoted, body='body\n')
+        assert not command.recovery
 
     def test_unquoted_substitution_records_no_quote_context(self) -> None:
         part = _word('$(x)').parts[0]
@@ -334,6 +362,68 @@ class TestTree:
 
 
 class TestRecovery:
+    def test_ansi_c_opener_inside_double_quotes_is_literal(self) -> None:
+        text = '"$\'commit\'"'
+        assert not parse_command(text).recovery
+        assert _word(text).literal_text == "$'commit'"
+
+    @pytest.mark.parametrize(
+        ('text', 'expected'),
+        [("$'git'", 'git'), ("com$'mit'", 'commit'), ("$'-a'", '-a')],
+    )
+    def test_ansi_c_quotes_recover_known_literal_text(self, text: str, expected: str) -> None:
+        command = parse_command(text)
+        assert command.recovery == ('unsupported ANSI-C quoting',)
+        assert _word(text).literal_text == expected
+
+    def test_detector_heredoc_recovery_shares_overlapping_tail_scans(self) -> None:
+        body = "cat <<'SECOND'\ncat <<THIRD\n'$(true)'\n"
+        command = parse_command(f"cat <<'FIRST'\n{body}", recover_heredocs=True)
+        heredocs = [
+            element
+            for segment in command.segments
+            for element in segment.elements
+            if isinstance(element, Heredoc)
+        ]
+        assert [heredoc.body_inlined for heredoc in heredocs] == [True, True, True]
+        assert [heredoc.body for heredoc in heredocs] == [body, '', '']
+        assert [len(heredoc.expansions) for heredoc in heredocs] == [0, 0, 1]
+        assert command.recovery == ('unterminated heredoc',) * 3
+
+    def test_detector_recovery_does_not_use_an_earlier_delimiter(self) -> None:
+        command = parse_command('EOF\ncat <<EOF\ntrue\n', recover_heredocs=True)
+        heredoc = command.segments[1].elements[2]
+        assert isinstance(heredoc, Heredoc)
+        assert heredoc.body_inlined
+        assert command.segments[2].elements == (
+            Word('true', (LiteralPart('true', quoted=False),)),
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            "cat <<'EOF'\nbody\nEOF\n",
+            'cat <<-EOF\n\tbody\n\tEOF\n',
+            'cat <<FIRST <<SECOND\none\nFIRST\ntwo\nSECOND\n',
+            'cat <<EOF; true\nbody\nEOF\n',
+            "cat <<''\nbody\n\n",
+        ],
+    )
+    def test_detector_recovery_preserves_terminated_heredocs(self, text: str) -> None:
+        assert parse_command(text, recover_heredocs=True) == parse_command(text)
+
+    @pytest.mark.parametrize(
+        'text', [r"$'com\x6dit'", r"$'a\'b'", r"$'a\\'", r"$'$(git commit)\n'"]
+    )
+    def test_escaped_ansi_c_quotes_remain_one_opaque_word(self, text: str) -> None:
+        command = parse_command(text + ' after')
+        assert command.recovery == ('unsupported ANSI-C quoting',)
+        words = command.segments[0].elements
+        assert len(words) == 2
+        assert words[0] == Word(text, (ExpansionPart(text),))
+        assert isinstance(words[1], Word)
+        assert words[1].literal_text == 'after'
+
     def test_nesting_limit_marks_the_deepest_substitution_truncated(self) -> None:
         text = 'echo ' + '$(echo ' * 9 + 'deep' + ')' * 9
         command = parse_command(text)
@@ -350,7 +440,8 @@ class TestRecovery:
 
     def test_parser_is_total_on_arbitrary_input(self) -> None:
         for text in ['', '"', "'", '$(', '`', '<<', '${', ')', '&&&', '\\']:
-            parse_command(text)
+            command = parse_command(text)
+            assert isinstance(command, Command)
 
     def test_recovery_keeps_words_distinct(self) -> None:
         command = parse_command('g""it com""mit -m "x\ry')
@@ -376,6 +467,20 @@ class TestRecovery:
         command = parse_command(text)
         assert command.recovery
         assert command.recovery[0] == reason
+
+    def test_substitution_command_keeps_its_own_recovery(self) -> None:
+        command = parse_command("echo $(echo 'x)")
+        part = command.segments[0].elements[1]
+        assert isinstance(part, Word)
+        substitution = part.parts[0]
+        assert isinstance(substitution, SubstitutionPart)
+        assert substitution.command.recovery == ('unbalanced quotes',)
+        assert substitution.command.recovery
+        assert command.recovery == ('unbalanced quotes', 'unterminated substitution')
+
+    def test_unterminated_ansi_c_quotes_record_both_reasons(self) -> None:
+        command = parse_command("git $'commit")
+        assert command.recovery == ('unsupported ANSI-C quoting', 'unbalanced quotes')
 
     def test_unterminated_quote_takes_the_rest_as_literal(self) -> None:
         command = parse_command("git commit -m 'x; git push")

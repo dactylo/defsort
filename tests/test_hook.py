@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 import defsort._hook as hook_mod
-from defsort._classify import _REASON_PREFIX
+import defsort._hook_front as front_mod
 from defsort._config import ResolvedConfig
 from defsort._core._guard import ReorderGuardParams
 from defsort._core._parse import parse_definitions
@@ -23,22 +23,19 @@ from defsort._git import (
     _StagedFileInfo,
     prepare_index_entry,
 )
-from defsort._grammar import _ELEMENT_UNKNOWN_CWD, _HINT_ROUTE
 from defsort._hook import (
     _BLOCKER_MSGS,
     _Disposition,
     _file_config,
     _is_fallback_blocker,
-    _is_warn_only_blocker,
-    _Outcome,
     _plan_file_sort,
     _resolve_and_sort,
     _resolve_edited_paths,
     _resolve_hook_context,
     _sort_worktree_files,
     _try_sort,
-    run_hook,
 )
+from defsort._hook_front import _REASON_PREFIX, Outcome, run_hook
 from defsort._hosts import load_adapter
 from defsort._types import (
     BANNER_MODE_VALUES,
@@ -54,12 +51,14 @@ from defsort._types import (
     SortScopeOrder,
     is_soft_blocker,
 )
+from defsort._vendor.hookshell._grammar import _ELEMENT_UNKNOWN_CWD, _HINT_ROUTE
 from defsort.hooks import HookAdapter, HookResult, HostInput, HostResponse
 from tests._helpers import (
     DETECTOR_REGRESSION_TIMEOUT_SECONDS,
     _init_empty_git_repo,
     _init_git_repo,
     decode_text,
+    execute_source,
     invoke_cli,
     json_stdout,
     process_transcript,
@@ -68,22 +67,55 @@ from tests._helpers import (
     run_setup,
     shell_path,
 )
-from tests.core.test_full import _execute_source
 
 pytestmark = pytest.mark.usefixtures('registered_hosts')
 
-_SRC_ALREADY_ORDERED = 'def alpha():\n    pass\n\n\ndef bravo():\n    return alpha()\n'
-_SRC_DUPLICATES = (
-    'def bravo():\n    return alpha()\n\n\ndef alpha():\n    pass\n\n\ndef bravo():\n    pass\n'
+_EAGER_AND_FORWARD_CASES = (
+    (
+        (
+            'def zeta_default():\n'
+            '    return 1\n'
+            '\n\n'
+            'def alpha(value=zeta_default()):\n'
+            '    return value\n'
+        ),
+        'alphabetical',
+        'none',
+        'eager_order',
+    ),
+    (
+        (
+            'class Example:\n'
+            '    def zeta_default():\n'
+            '        return 1\n'
+            '\n'
+            '    def alpha(self, value=zeta_default()):\n'
+            '        return value\n'
+        ),
+        'none',
+        'alphabetical',
+        'eager_order',
+    ),
+    (
+        'class ZetaType:\n    pass\n\n\nclass Alpha:\n    value: ZetaType\n',
+        'alphabetical',
+        'none',
+        'forward_refs',
+    ),
+    (
+        (
+            'class Example:\n'
+            '    def zeta_type(self):\n'
+            '        return None\n'
+            '\n'
+            '    def alpha(self, value: zeta_type):\n'
+            '        return value\n'
+        ),
+        'none',
+        'alphabetical',
+        'forward_refs',
+    ),
 )
-_SRC_FORWARD_REF = (
-    'class Bravo:\n    def method(self, x: Alpha) -> None:\n        pass\n\n\n'
-    'class Alpha:\n    def method(self, x: Bravo) -> None:\n        pass\n'
-)
-_SRC_INTERSTITIAL = 'def bravo():\n    pass\n\nregistry = {}\n\ndef alpha():\n    pass\n'
-_SRC_NEEDS_SORT = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    pass\n'
-_RECEIPT_ONE = {'systemMessage': 'defsort: sorted 1 staged Python file for this commit'}
-_SRC_SYNTAX_ERROR = 'def foo(\n'
 _GUARD_BASELINE_SOURCE = (
     'def delta():\n    pass\n\n\ndef charlie():\n    pass\n\n\n'
     'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
@@ -109,6 +141,15 @@ _INCREMENTAL_PRECEDENCE_FULL_SORTED = (
     'def charlie():\n'
     '    pass\n'
 )
+_RECEIPT_ONE = {'systemMessage': 'defsort: sorted 1 staged Python file for this commit'}
+_SRC_ALREADY_ORDERED = 'def alpha():\n    pass\n\n\ndef bravo():\n    return alpha()\n'
+_SRC_DUPLICATES = (
+    'def bravo():\n    return alpha()\n\n\ndef alpha():\n    pass\n\n\ndef bravo():\n    pass\n'
+)
+_SRC_FORWARD_REF = (
+    'class Bravo:\n    def method(self, x: Alpha) -> None:\n        pass\n\n\n'
+    'class Alpha:\n    def method(self, x: Bravo) -> None:\n        pass\n'
+)
 _SRC_INIT_BODY_CLI = """class C:
     def __init__(self):
         self.load()
@@ -116,7 +157,9 @@ _SRC_INIT_BODY_CLI = """class C:
     def load(self):
         return 1
 """
-
+_SRC_INTERSTITIAL = 'def bravo():\n    pass\n\nregistry = {}\n\ndef alpha():\n    pass\n'
+_SRC_NEEDS_SORT = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    pass\n'
+_SRC_SYNTAX_ERROR = 'def foo(\n'
 _UNKNOWN_CWD_REASON = f'{_REASON_PREFIX}: {_ELEMENT_UNKNOWN_CWD}; {_HINT_ROUTE}'
 
 
@@ -425,19 +468,13 @@ class TestAntigravityPreToolUse:
 
 
 class TestBlockerClassification:
-    def test_fallback_and_warn_only_sets(self) -> None:
-        all_blockers = set(get_args(Blocker))
+    def test_blocker_dispositions_partition_every_blocker(self) -> None:
         fallback = {b for b in get_args(Blocker) if _is_fallback_blocker(b)}
-        warn_only = {b for b in get_args(Blocker) if _is_warn_only_blocker(b)}
-        has_msg = set(_BLOCKER_MSGS)
-        classified = fallback | warn_only | has_msg
+        soft = {b for b in get_args(Blocker) if is_soft_blocker(b)}
         assert fallback == {'non_conforming', 'target_incompatible'}
-        assert warn_only == {'user_reordered'}
-        assert fallback | warn_only == {b for b in get_args(Blocker) if is_soft_blocker(b)}
-        assert classified == all_blockers, f'Unclassified: {all_blockers - classified}'
-        assert not (fallback & warn_only)
-        assert not (fallback & has_msg)
-        assert not (warn_only & has_msg)
+        assert fallback < soft
+        assert soft.isdisjoint(_BLOCKER_MSGS)
+        assert soft | set(_BLOCKER_MSGS) == set(get_args(Blocker))
 
 
 class TestCodexPostToolUse:
@@ -641,6 +678,64 @@ class TestEnableDisableConfig:
         )
         assert result_status == 0
         assert result_stdout == ''
+
+
+class TestEngineImportFailure:
+    def test_commit_denies_when_engine_import_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setitem(sys.modules, 'defsort._hook', None)
+        outcome = front_mod._run_pre_tool_use(
+            'git commit -m message', str(tmp_path), overrides=None, allow_on_failure=False
+        )
+        assert (outcome.decision, outcome.reason) == (
+            'deny',
+            'defsort: unexpected error during sort',
+        )
+
+    def test_commit_engine_call_import_error_escapes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def fail_after_import(*_args: object, **_kwargs: object) -> None:
+            raise ImportError('engine call failed')
+
+        monkeypatch.setattr(hook_mod, 'run_commit', fail_after_import)
+        with pytest.raises(ImportError, match='engine call failed'):
+            front_mod._run_pre_tool_use('git commit -m message', str(tmp_path))
+
+    def test_commit_warns_and_allows_with_allow_on_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setitem(sys.modules, 'defsort._hook', None)
+        outcome = front_mod._run_pre_tool_use(
+            'git commit -m message', str(tmp_path), overrides=None, allow_on_failure=True
+        )
+        assert outcome.decision == 'allow'
+        assert 'WARNING: defsort: unexpected error during sort' in capsys.readouterr().err
+
+    def test_post_tool_allows_with_diagnostic_when_engine_import_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setitem(sys.modules, 'defsort._hook', None)
+        outcome = front_mod._run_post_tool((), str(tmp_path), overrides=None)
+        assert outcome.decision == 'allow'
+        assert 'defsort: unexpected error during PostToolUse' in capsys.readouterr().err
+
+    def test_post_tool_engine_call_import_error_escapes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def fail_after_import(*_args: object, **_kwargs: object) -> None:
+            raise ImportError('engine call failed')
+
+        monkeypatch.setattr(hook_mod, 'run_post_tool', fail_after_import)
+        with pytest.raises(ImportError, match='engine call failed'):
+            front_mod._run_post_tool((), str(tmp_path))
 
 
 @pytest.mark.parametrize('enabled', [False, True])
@@ -960,7 +1055,7 @@ class TestPathspecPreflight:
                 'cwd': str(tmp_path),
             },
         )
-        assert result == _Outcome('allow')
+        assert result == Outcome('allow')
         assert (tmp_path / '.git' / 'index').read_bytes() == index
 
     @pytest.mark.parametrize('allow_on_failure', [False, True])
@@ -1648,11 +1743,12 @@ class TestHookSurfaceContracts:
 
     @staticmethod
     def _pretooluse_payload(provider: str, cwd: Path) -> str:
-        if provider == 'claude':
-            return _pretooluse_payload('git commit -m "test"', cwd)
-        if provider == 'codex':
-            return _codex_pretooluse_payload(f'git -C {shell_path(cwd)} commit -m "test"', cwd)
-        return _antigravity_pretooluse_payload('git commit -m "test"', cwd)
+        return _provider_pretooluse_payload(
+            provider,
+            'git commit -m "test"',
+            cwd,
+            codex_command=f'git -C {shell_path(cwd)} commit -m "test"',
+        )
 
     @staticmethod
     def _staged_source(cwd: Path, path: str = 'test.py') -> str:
@@ -1667,7 +1763,7 @@ class TestHookSurfaceContracts:
             'def feature():\n    return annotations.compiler_flag\n'
         )
         _init_git_repo(tmp_path, source)
-        original = _execute_source(source)['feature']
+        original = execute_source(source)['feature']
         assert isinstance(original, FunctionType)
         assert original() == 16777216
         run_setup(['git', '-C', str(tmp_path), 'add', 'test.py'])
@@ -1686,20 +1782,19 @@ class TestHookSurfaceContracts:
         assert result_status == EXIT_OK
         assert result_stdout == ''
         staged = self._staged_source(tmp_path)
-        transformed = _execute_source(staged)['feature']
+        transformed = execute_source(staged)['feature']
         assert isinstance(transformed, FunctionType)
         assert transformed() == 16777216
         assert staged == source
         assert (tmp_path / 'test.py').read_text(encoding='utf-8') == source
 
-    @pytest.mark.parametrize('provider', ['claude', 'codex', 'antigravity'])
+    # Adapter boundaries have per-host coverage; exercise shared engine policy once.
     @pytest.mark.parametrize('event', ['pretooluse', 'posttooluse'])
     @pytest.mark.parametrize('incremental', [False, True], ids=['full', 'incremental'])
     @pytest.mark.parametrize('annotated', [False, True], ids=['future-free', 'future-annotated'])
     def test_future_import_mutation_contract(
         self,
         tmp_path: Path,
-        provider: str,
         event: str,
         *,
         incremental: bool,
@@ -1715,9 +1810,9 @@ class TestHookSurfaceContracts:
         path = tmp_path / 'test.py'
         if event == 'pretooluse':
             run_setup(['git', '-C', str(tmp_path), 'add', 'test.py'])
-            payload = self._pretooluse_payload(provider, tmp_path)
+            payload = self._pretooluse_payload('claude', tmp_path)
         else:
-            payload = self._posttooluse_payload(provider, path, tmp_path)
+            payload = self._posttooluse_payload('claude', path, tmp_path)
         args = self._hook_args(
             'alphabetical',
             'none',
@@ -1725,17 +1820,7 @@ class TestHookSurfaceContracts:
         )
 
         result_status, result_stdout, _ = invoke_cli(
-            [
-                'hook',
-                '--agent',
-                ('agy' if provider == 'antigravity' else provider),
-                *(
-                    ['--event', 'PostToolUse' if event == 'posttooluse' else 'PreToolUse']
-                    if provider == 'antigravity'
-                    else []
-                ),
-                *(args),
-            ],
+            ['hook', '--agent', 'claude', *args],
             stdin=payload,
             cwd=tmp_path,
         )
@@ -1757,62 +1842,15 @@ class TestHookSurfaceContracts:
             assert transformed.index('def alpha') < transformed.index('def zeta')
             assert 'from __future__ import annotations' not in transformed
 
-    @pytest.mark.parametrize('provider', ['claude', 'codex', 'antigravity'])
     @pytest.mark.parametrize('incremental', [False, True], ids=['full', 'incremental'])
     @pytest.mark.parametrize(
         'case',
-        [
-            (
-                (
-                    'def zeta_default():\n'
-                    '    return 1\n'
-                    '\n\n'
-                    'def alpha(value=zeta_default()):\n'
-                    '    return value\n'
-                ),
-                'alphabetical',
-                'none',
-                'eager_order',
-            ),
-            (
-                (
-                    'class Example:\n'
-                    '    def zeta_default():\n'
-                    '        return 1\n'
-                    '\n'
-                    '    def alpha(self, value=zeta_default()):\n'
-                    '        return value\n'
-                ),
-                'none',
-                'alphabetical',
-                'eager_order',
-            ),
-            (
-                'class ZetaType:\n    pass\n\n\nclass Alpha:\n    value: ZetaType\n',
-                'alphabetical',
-                'none',
-                'forward_refs',
-            ),
-            (
-                (
-                    'class Example:\n'
-                    '    def zeta_type(self):\n'
-                    '        return None\n'
-                    '\n'
-                    '    def alpha(self, value: zeta_type):\n'
-                    '        return value\n'
-                ),
-                'none',
-                'alphabetical',
-                'forward_refs',
-            ),
-        ],
+        _EAGER_AND_FORWARD_CASES,
         ids=['eager-top-level', 'eager-method', 'future-top-level', 'future-method'],
     )
     def test_posttooluse_eager_and_future_blockers_do_not_write(
         self,
         tmp_path: Path,
-        provider: str,
         case: tuple[str, SortScopeOrder, SortScopeOrder, Blocker],
         *,
         incremental: bool,
@@ -1827,14 +1865,8 @@ class TestHookSurfaceContracts:
         )
 
         result_status, _, result_stderr = invoke_cli(
-            [
-                'hook',
-                '--agent',
-                ('agy' if provider == 'antigravity' else provider),
-                *(['--event', 'PostToolUse'] if provider == 'antigravity' else []),
-                *(args),
-            ],
-            stdin=self._posttooluse_payload(provider, path, tmp_path),
+            ['hook', '--agent', 'claude', *args],
+            stdin=self._posttooluse_payload('claude', path, tmp_path),
             cwd=tmp_path,
         )
 
@@ -1842,7 +1874,8 @@ class TestHookSurfaceContracts:
         assert path.read_text(encoding='utf-8') == source
         if blocker == 'eager_order':
             assert result_stderr == (
-                f'ERROR: {path} would move a definition-time reference before the definition '
+                f'ERROR: {path.as_posix()} would move a definition-time reference before the '
+                'definition '
                 'it uses. Restructure that reference or choose an order that keeps the referenced '
                 'definition before the reader.\n'
             )
@@ -1850,62 +1883,15 @@ class TestHookSurfaceContracts:
         else:
             assert 'needs sort with forward annotation references' in result_stderr
 
-    @pytest.mark.parametrize('provider', ['claude', 'codex', 'antigravity'])
     @pytest.mark.parametrize('incremental', [False, True], ids=['full', 'incremental'])
     @pytest.mark.parametrize(
         'case',
-        [
-            (
-                (
-                    'def zeta_default():\n'
-                    '    return 1\n'
-                    '\n\n'
-                    'def alpha(value=zeta_default()):\n'
-                    '    return value\n'
-                ),
-                'alphabetical',
-                'none',
-                'eager_order',
-            ),
-            (
-                (
-                    'class Example:\n'
-                    '    def zeta_default():\n'
-                    '        return 1\n'
-                    '\n'
-                    '    def alpha(self, value=zeta_default()):\n'
-                    '        return value\n'
-                ),
-                'none',
-                'alphabetical',
-                'eager_order',
-            ),
-            (
-                'class ZetaType:\n    pass\n\n\nclass Alpha:\n    value: ZetaType\n',
-                'alphabetical',
-                'none',
-                'forward_refs',
-            ),
-            (
-                (
-                    'class Example:\n'
-                    '    def zeta_type(self):\n'
-                    '        return None\n'
-                    '\n'
-                    '    def alpha(self, value: zeta_type):\n'
-                    '        return value\n'
-                ),
-                'none',
-                'alphabetical',
-                'forward_refs',
-            ),
-        ],
+        _EAGER_AND_FORWARD_CASES,
         ids=['eager-top-level', 'eager-method', 'future-top-level', 'future-method'],
     )
     def test_pretooluse_eager_and_future_blockers_are_atomic(
         self,
         tmp_path: Path,
-        provider: str,
         case: tuple[str, SortScopeOrder, SortScopeOrder, Blocker],
         *,
         incremental: bool,
@@ -1938,19 +1924,13 @@ class TestHookSurfaceContracts:
         )
 
         result_status, result_stdout, result_stderr = invoke_cli(
-            [
-                'hook',
-                '--agent',
-                ('agy' if provider == 'antigravity' else provider),
-                *(['--event', 'PreToolUse'] if provider == 'antigravity' else []),
-                *(args),
-            ],
-            stdin=self._pretooluse_payload(provider, tmp_path),
+            ['hook', '--agent', 'claude', *args],
+            stdin=self._pretooluse_payload('claude', tmp_path),
             cwd=tmp_path,
         )
 
         reason = _assert_denied(
-            (result_status, result_stdout, result_stderr), provider, prefix='ERROR:'
+            (result_status, result_stdout, result_stderr), 'claude', prefix='ERROR:'
         )
         assert self._staged_source(tmp_path, 'safe.py') == safe_source
         assert self._staged_source(tmp_path) == source
@@ -2008,38 +1988,21 @@ class TestPostToolUse:
         for path in paths:
             path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
 
-        events: list[tuple[object, ...]] = []
+        baseline_calls: list[tuple[str, tuple[str, ...]]] = []
         processed: list[Path] = []
-        original_discover_repo_root = hook_mod.discover_repo_root
         original_read_file = hook_mod.read_file_result
-        original_resolve_config = hook_mod.resolve_config_at_root
-
-        def record_repo_root(cwd: str) -> _RepoDiscoveryResult:
-            events.append(('root', cwd))
-            return original_discover_repo_root(cwd)
-
-        def record_enabled(cwd: str | None = None) -> bool:
-            events.append(('enabled', cwd))
-            return True
-
-        def record_config(repo_root: str) -> ResolvedConfig:
-            events.append(('config', repo_root))
-            return original_resolve_config(repo_root)
 
         def record_baselines(
             cwd: str,
             rel_paths: list[str],
         ) -> dict[str, BlobReadResult]:
-            events.append(('baselines', cwd, tuple(rel_paths)))
+            baseline_calls.append((cwd, tuple(rel_paths)))
             return {path: BlobReadResult(status=BlobReadStatus.MISSING) for path in rel_paths}
 
         def record_read(path: Path) -> object:
             processed.append(path)
             return original_read_file(path)
 
-        monkeypatch.setattr(hook_mod, 'discover_repo_root', record_repo_root)
-        monkeypatch.setattr(hook_mod, 'is_hook_enabled', record_enabled)
-        monkeypatch.setattr(hook_mod, 'resolve_config_at_root', record_config)
         monkeypatch.setattr(hook_mod, 'batch_fetch_worktree_baselines', record_baselines)
         monkeypatch.setattr(hook_mod, 'read_file_result', record_read)
         payload: dict[str, object] = {
@@ -2060,16 +2023,9 @@ class TestPostToolUse:
         result = _post_tool(payload)
 
         assert result == EXIT_OK
-        assert events == [
-            ('root', str(nested)),
-            ('root', str(second_repo)),
-            ('root', str(first_repo)),
-            ('enabled', first_repo.as_posix()),
-            ('config', first_repo.as_posix()),
-            ('enabled', second_repo.as_posix()),
-            ('config', second_repo.as_posix()),
-            ('baselines', first_repo.as_posix(), ('nested/nested.py', 'root.py')),
-            ('baselines', second_repo.as_posix(), ('first.py', 'last.py')),
+        assert baseline_calls == [
+            (first_repo.as_posix(), ('nested/nested.py', 'root.py')),
+            (second_repo.as_posix(), ('first.py', 'last.py')),
         ]
         assert processed == list(paths)
         assert nested_file.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
@@ -2091,32 +2047,15 @@ class TestPostToolUse:
         second = tmp_path / 'second.py'
         first.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
         second.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        events: list[tuple[object, ...]] = []
-        original_discover_repo_root = hook_mod.discover_repo_root
-        original_resolve_config = hook_mod.resolve_config_at_root
-
-        def record_repo_root(cwd: str) -> _RepoDiscoveryResult:
-            events.append(('root', cwd))
-            return original_discover_repo_root(cwd)
-
-        def record_enabled(cwd: str | None = None) -> bool:
-            events.append(('enabled', cwd))
-            return True
-
-        def record_config(repo_root: str) -> ResolvedConfig:
-            events.append(('config', repo_root))
-            return original_resolve_config(repo_root)
+        baseline_calls: list[tuple[str, tuple[str, ...]]] = []
 
         def record_baselines(
             cwd: str,
-            paths: list[str],
+            rel_paths: list[str],
         ) -> dict[str, BlobReadResult]:
-            events.append(('baselines', cwd, tuple(paths)))
-            return {path: BlobReadResult(status=BlobReadStatus.MISSING) for path in paths}
+            baseline_calls.append((cwd, tuple(rel_paths)))
+            return {path: BlobReadResult(status=BlobReadStatus.MISSING) for path in rel_paths}
 
-        monkeypatch.setattr(hook_mod, 'discover_repo_root', record_repo_root)
-        monkeypatch.setattr(hook_mod, 'is_hook_enabled', record_enabled)
-        monkeypatch.setattr(hook_mod, 'resolve_config_at_root', record_config)
         monkeypatch.setattr(hook_mod, 'batch_fetch_worktree_baselines', record_baselines)
         payload: dict[str, object] = {
             'tool_name': 'apply_patch',
@@ -2134,12 +2073,7 @@ class TestPostToolUse:
         result = _post_tool(payload)
 
         assert result == EXIT_OK
-        assert events == [
-            ('root', str(tmp_path)),
-            ('enabled', tmp_path.as_posix()),
-            ('config', tmp_path.as_posix()),
-            ('baselines', tmp_path.as_posix(), ('first.py', 'second.py')),
-        ]
+        assert baseline_calls == [(tmp_path.as_posix(), ('first.py', 'second.py'))]
         for path in (first, second):
             content = path.read_text(encoding='utf-8')
             assert content.index('alpha') < content.index('bravo')
@@ -2183,7 +2117,9 @@ class TestPostToolUse:
         assert json.loads(capsys.readouterr().out) == {
             'hookSpecificOutput': {
                 'hookEventName': 'PostToolUse',
-                'additionalContext': f"Cannot sort {payload_path}: '(' was never closed (line 1).",
+                'additionalContext': (
+                    f"Cannot sort {payload_path.as_posix()}: '(' was never closed (line 1)."
+                ),
             }
         }
 
@@ -2305,19 +2241,23 @@ class TestPostToolUse:
         captured = capsys.readouterr()
         output = json.loads(captured.out)
         assert output['hookSpecificOutput']['hookEventName'] == 'PostToolUse'
-        assert str(f) in output['hookSpecificOutput']['additionalContext']
+        assert f.as_posix() in output['hookSpecificOutput']['additionalContext']
 
 
 class TestPostToolUseHardening:
-    def test_non_utf8_file_no_crash(self, tmp_path: Path) -> None:
+    def test_non_utf8_file_is_unchanged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         f = tmp_path / 'binary.py'
-        f.write_bytes(b'\x80\x81\x82')
+        source = b'\x80\x81\x82'
+        f.write_bytes(source)
         payload: dict[str, object] = {
             'tool_name': 'Write',
             'tool_input': {'file_path': str(f)},
         }
-        # Should not raise
-        _post_tool(payload)
+        assert _post_tool(payload) == EXIT_OK
+        assert f.read_bytes() == source
+        assert capsys.readouterr() == ('', '')
 
     def test_undecodable_repo_root_skips_without_guessing(
         self,
@@ -2366,19 +2306,6 @@ class TestPostToolUseHardening:
         captured = capsys.readouterr()
         assert 'defsort: PostToolUse error' in captured.err
 
-    def test_unwritable_file_no_crash(self, tmp_path: Path) -> None:
-        f = tmp_path / 'readonly.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        f.chmod(0o444)
-        payload: dict[str, object] = {
-            'tool_name': 'Write',
-            'tool_input': {'file_path': str(f)},
-        }
-        try:
-            _post_tool(payload)
-        finally:
-            f.chmod(0o644)  # cleanup
-
 
 class TestPostToolCwdNormalization:
     @pytest.mark.parametrize(
@@ -2404,7 +2331,7 @@ class TestPostToolCwdNormalization:
         payload: dict[str, object],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr('defsort._shell.sys.platform', 'win32')
+        monkeypatch.setattr('defsort._vendor.hookshell._shell.sys.platform', 'win32')
         host = 'codex' if payload['tool_name'] == 'apply_patch' else 'claude'
         adapter = load_adapter(host)
         parsed = adapter.parse({'hook_event_name': 'PostToolUse', **payload}, None)
@@ -2657,7 +2584,10 @@ class TestPostToolUseIncremental:
             f.chmod(0o644)
         assert rc == 0
         assert f.read_bytes() == original
-        assert capsys.readouterr().err == f'defsort: cannot write {f}; file left unsorted\n'
+        assert (
+            capsys.readouterr().err
+            == f'defsort: cannot write {f.as_posix()}; file left unsorted\n'
+        )
 
     def test_unsupported_git_warns_without_writing(
         self,
@@ -2765,6 +2695,41 @@ class TestPreToolUse:
         # Working tree must be left alone (non-UTF-8, not overwritten)
         assert f.read_bytes().startswith(b'\x80\x81\x82')
 
+    @pytest.mark.skipif(os.name == 'nt', reason='Windows paths cannot contain control characters')
+    def test_bare_commit_sync_note_escapes_filename(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _init_empty_git_repo(tmp_path)
+        name = 'escape\x1b\n.py'
+        f = tmp_path / name
+        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        run_setup(['git', '-C', str(tmp_path), 'add', name])
+        original_read_file = hook_mod.read_file_result
+
+        def deny_worktree_read(path: Path) -> object:
+            if path.name == name:
+                raise OSError('denied')
+            return original_read_file(path)
+
+        monkeypatch.setattr(hook_mod, 'read_file_result', deny_worktree_read)
+        _pre_tool(
+            {
+                'hook_event_name': 'PreToolUse',
+                'tool_name': 'Bash',
+                'tool_input': {'command': 'git commit -m "test"'},
+                'cwd': str(tmp_path),
+            }
+        )
+        captured = capsys.readouterr()
+        assert json.loads(captured.out) == _RECEIPT_ONE
+        assert captured.err == (
+            'defsort: cannot sync escape\\x1b\\x0a.py; worktree copy left unsorted\n'
+        )
+        assert f.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+
     def test_bare_commit_syncs_clean_working_tree(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -2800,6 +2765,39 @@ class TestPreToolUse:
         reason = _assert_denied((result_status, result_stdout, result_stderr))
         assert 'comment' in reason
         assert staged == _SRC_NEEDS_SORT
+
+    def test_bare_commit_unreadable_working_tree_sorts_with_a_note(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _init_git_repo(tmp_path, '# placeholder\n')
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        run_setup(['git', '-C', str(tmp_path), 'add', 'test.py'])
+        original_read_file = hook_mod.read_file_result
+
+        def deny_worktree_read(path: Path) -> object:
+            if path.name == 'test.py':
+                raise OSError('denied')
+            return original_read_file(path)
+
+        monkeypatch.setattr(hook_mod, 'read_file_result', deny_worktree_read)
+        _pre_tool(
+            {
+                'hook_event_name': 'PreToolUse',
+                'tool_name': 'Bash',
+                'tool_input': {'command': 'git commit -m "test"'},
+                'cwd': str(tmp_path),
+            }
+        )
+        captured = capsys.readouterr()
+        staged = decode_text(run_setup(['git', '-C', str(tmp_path), 'show', ':test.py']).stdout)
+        assert json.loads(captured.out) == _RECEIPT_ONE
+        assert captured.err == 'defsort: cannot sync test.py; worktree copy left unsorted\n'
+        assert f.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+        assert staged.index('alpha') < staged.index('bravo')
 
     def test_bare_commit_unwritable_working_tree_sorts_with_a_receipt(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -3053,7 +3051,7 @@ class TestPreToolUse:
             allow_on_failure=policy_source == 'cli',
         )
 
-        assert decision == _Outcome('allow')
+        assert decision == Outcome('allow')
         captured = capsys.readouterr()
         assert captured.out == ''
         assert captured.err == 'WARNING: defsort: failed to discover git work tree\n'
@@ -3091,7 +3089,7 @@ class TestPreToolUse:
             }
         )
 
-        assert decision == _Outcome('allow')
+        assert decision == Outcome('allow')
         assert observed == [str(target_directory)]
 
     def test_failed_index_update_preserves_working_tree(
@@ -3149,14 +3147,12 @@ class TestPreToolUse:
 
         monkeypatch.setattr(hook_mod, 'prepare_index_entry', prepare_without_git)
         command = 'git commit -m test'
-        if provider == 'codex':
-            payload = _codex_pretooluse_payload(
-                f'git -C {shell_path(tmp_path)} commit -m test', tmp_path
-            )
-        elif provider == 'antigravity':
-            payload = _antigravity_pretooluse_payload(command, tmp_path)
-        else:
-            payload = _pretooluse_payload(command, tmp_path)
+        payload = _provider_pretooluse_payload(
+            provider,
+            command,
+            tmp_path,
+            codex_command=f'git -C {shell_path(tmp_path)} commit -m test',
+        )
 
         result = _run_in_process(payload, provider, allow_on_failure=allow_on_failure)
 
@@ -3281,7 +3277,7 @@ class TestPreToolUse:
             }
         )
 
-        assert decision == _Outcome('allow')
+        assert decision == Outcome('allow')
         captured = capsys.readouterr()
         assert captured.out == ''
         assert captured.err == ''
@@ -3424,14 +3420,12 @@ class TestPreToolUse:
 
         monkeypatch.setattr(hook_mod, 'discover_repo_root', fail_discovery)
         missing = tmp_path / 'missing'
-        if provider == 'codex':
-            payload = _codex_pretooluse_payload(
-                f'git -C {shell_path(tmp_path)} commit -m "test"', missing
-            )
-        elif provider == 'antigravity':
-            payload = _antigravity_pretooluse_payload('git commit -m "test"', missing)
-        else:
-            payload = _pretooluse_payload('git commit -m "test"', missing)
+        payload = _provider_pretooluse_payload(
+            provider,
+            'git commit -m "test"',
+            missing,
+            codex_command=f'git -C {shell_path(tmp_path)} commit -m "test"',
+        )
 
         result = _run_in_process(payload, provider)
 
@@ -3452,14 +3446,12 @@ class TestPreToolUse:
 
         monkeypatch.setattr(hook_mod, 'discover_repo_root', fail_discovery)
         missing = tmp_path / 'missing'
-        if provider == 'codex':
-            payload = _codex_pretooluse_payload(
-                f'git -C {shell_path(tmp_path)} commit -m "test"', missing
-            )
-        elif provider == 'antigravity':
-            payload = _antigravity_pretooluse_payload('git commit -m "test"', missing)
-        else:
-            payload = _pretooluse_payload('git commit -m "test"', missing)
+        payload = _provider_pretooluse_payload(
+            provider,
+            'git commit -m "test"',
+            missing,
+            codex_command=f'git -C {shell_path(tmp_path)} commit -m "test"',
+        )
 
         result = _run_in_process(payload, provider, allow_on_failure=True)
 
@@ -3503,9 +3495,7 @@ class TestPreToolUse:
             overrides=SortOverrides(definition_order='alphabetical'),
         )
 
-        assert decision == _Outcome(
-            'allow', 'defsort: sorted 1 staged Python file for this commit'
-        )
+        assert decision == Outcome('allow', 'defsort: sorted 1 staged Python file for this commit')
         assert json.loads(capsys.readouterr().out) == _RECEIPT_ONE
         assert calls == ['test.py']
 
@@ -3536,7 +3526,7 @@ class TestPreToolUse:
         assert captured.out == ''  # No deny JSON
         assert 'WARNING' in captured.err
         assert 'failed to read' in captured.err
-        assert rc == _Outcome('allow')  # allow, not deny (C1 fix)
+        assert rc == Outcome('allow')  # allow, not deny (C1 fix)
 
     def test_read_failure_denies_by_default(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -3698,7 +3688,7 @@ class TestPreToolUse:
         f = tmp_path / 'test.py'
         f.write_text(_SRC_SYNTAX_ERROR, encoding='utf-8')
         run_setup(['git', '-C', str(tmp_path), 'add', 'test.py'])
-        _pre_tool(
+        outcome = _pre_tool(
             {
                 'hook_event_name': 'PreToolUse',
                 'tool_name': 'Bash',
@@ -3707,8 +3697,8 @@ class TestPreToolUse:
             }
         )
         captured = capsys.readouterr()
-        # No deny output means commit proceeds
-        assert 'deny' not in captured.out
+        assert outcome.decision == 'allow'
+        assert captured.out == captured.err == ''
 
     def test_unexpected_exception_denies(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -3798,12 +3788,7 @@ class TestPreToolUse:
         tmp_path: Path,
     ) -> None:
         command = 'git --definitely-not-real commit -m "test"'
-        if provider == 'codex':
-            payload = _codex_pretooluse_payload(command, tmp_path)
-        elif provider == 'antigravity':
-            payload = _antigravity_pretooluse_payload(command, tmp_path)
-        else:
-            payload = _pretooluse_payload(command, tmp_path)
+        payload = _provider_pretooluse_payload(provider, command, tmp_path)
 
         result = _run_in_process(payload, provider)
 
@@ -3905,7 +3890,7 @@ class TestPreToolUse:
         )
 
         captured = capsys.readouterr()
-        assert decision == _Outcome('allow')
+        assert decision == Outcome('allow')
         assert captured.out == ''
         assert captured.err == (
             'WARNING: defsort: Git 2.42 or newer is required for Git-backed sorting '
@@ -3987,22 +3972,6 @@ class TestPreToolUseCommitModes:
         # Sibling file still sorted despite deleted file
         content = other.read_text(encoding='utf-8')
         assert content.index('alpha') < content.index('bravo')
-
-    def test_commit_a_initial_commit(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
-        f = tmp_path / 'new.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        run_setup(['git', 'add', 'new.py'], cwd=tmp_path)
-        payload = json.dumps(
-            {
-                'hook_event_name': 'PreToolUse',
-                'tool_name': 'Bash',
-                'tool_input': {'command': 'git commit -a -m "initial"'},
-                'cwd': str(tmp_path),
-            }
-        )
-        result_status, _, _ = invoke_cli(['hook', '--agent', 'claude'], stdin=payload)
-        assert result_status == 0
 
     def test_commit_a_sorts_working_tree(self, tmp_path: Path) -> None:
         _init_git_repo(tmp_path, _SRC_NEEDS_SORT)
@@ -4096,53 +4065,12 @@ class TestPreToolUseCommitModes:
         )
 
         captured = capsys.readouterr()
-        assert decision == _Outcome('allow')
+        assert decision == Outcome('allow')
         assert captured.out == ''
         assert captured.err == 'WARNING: defsort: failed to read staged contents\n'
         assert pathspec.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
         staged_after = run_setup(['git', '-C', str(tmp_path), 'show', ':staged.py']).stdout
         assert staged_after == staged_before
-
-    @pytest.mark.parametrize(
-        'staged_source',
-        [
-            pytest.param(_SRC_NEEDS_SORT, id='sortable'),
-            pytest.param(_SRC_INTERSTITIAL, id='blocked'),
-        ],
-    )
-    def test_commit_only_without_paths_denies_and_preserves_staged_changes(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-        staged_source: str,
-    ) -> None:
-        _init_git_repo(tmp_path, staged_source)
-        run_setup(['git', '-C', str(tmp_path), 'add', 'test.py'])
-        baseline_tree = run_setup(['git', '-C', str(tmp_path), 'rev-parse', 'HEAD^{tree}']).stdout
-        index_before = run_setup(['git', '-C', str(tmp_path), 'show', ':test.py']).stdout
-        worktree_before = (tmp_path / 'test.py').read_bytes()
-
-        decision = _pre_tool(
-            {
-                'hook_event_name': 'PreToolUse',
-                'tool_name': 'Bash',
-                'tool_input': {'command': 'git commit --only --amend --no-edit'},
-                'cwd': str(tmp_path),
-            }
-        )
-
-        reason = _assert_classification_denied(decision)
-        assert '--only without pathspec' in reason
-        assert _assert_denied_output(capsys) == reason
-        assert _staged_bytes(tmp_path) == index_before
-        assert (tmp_path / 'test.py').read_bytes() == worktree_before
-
-        run_setup(['git', '-C', str(tmp_path), 'commit', '--only', '--amend', '--no-edit'])
-
-        amended_tree = run_setup(['git', '-C', str(tmp_path), 'rev-parse', 'HEAD^{tree}']).stdout
-        assert amended_tree == baseline_tree
-        assert _staged_bytes(tmp_path) == index_before
-        assert (tmp_path / 'test.py').read_bytes() == worktree_before
 
     def test_commit_include_overlap(self, tmp_path: Path) -> None:
         _init_git_repo(tmp_path, _SRC_NEEDS_SORT)
@@ -4285,7 +4213,7 @@ class TestPreToolUseCommitModes:
         )
 
         captured = capsys.readouterr()
-        assert decision == _Outcome('allow')
+        assert decision == Outcome('allow')
         assert captured.out == ''
         assert captured.err == (
             'WARNING: defsort: Git 2.42 or newer is required for Git-backed sorting '
@@ -4294,6 +4222,80 @@ class TestPreToolUseCommitModes:
         assert pathspec.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
         staged_after = run_setup(['git', '-C', str(tmp_path), 'show', ':staged.py']).stdout
         assert staged_after == staged_before
+
+    def test_commit_only_with_empty_pathspec_file_preserves_staged_changes(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _init_git_repo(tmp_path, _SRC_NEEDS_SORT)
+        run_setup(['git', '-C', str(tmp_path), 'add', 'test.py'])
+        index_before = _staged_bytes(tmp_path)
+        worktree_before = (tmp_path / 'test.py').read_bytes()
+        pathspec_file = tmp_path / 'empty.txt'
+        pathspec_file.write_bytes(b'')
+
+        decision = _pre_tool(
+            {
+                'hook_event_name': 'PreToolUse',
+                'tool_name': 'Bash',
+                'tool_input': {
+                    'command': (
+                        f'git commit --only --pathspec-from-file={shell_path(pathspec_file)}'
+                        ' --amend --no-edit'
+                    )
+                },
+                'cwd': str(tmp_path),
+            }
+        )
+
+        captured = capsys.readouterr()
+        assert decision == Outcome('allow')
+        assert captured.out == ''
+        assert captured.err == ''
+        assert _staged_bytes(tmp_path) == index_before
+        assert (tmp_path / 'test.py').read_bytes() == worktree_before
+
+    @pytest.mark.parametrize(
+        'staged_source',
+        [
+            pytest.param(_SRC_NEEDS_SORT, id='sortable'),
+            pytest.param(_SRC_INTERSTITIAL, id='blocked'),
+        ],
+    )
+    def test_commit_only_without_paths_denies_and_preserves_staged_changes(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        staged_source: str,
+    ) -> None:
+        _init_git_repo(tmp_path, staged_source)
+        run_setup(['git', '-C', str(tmp_path), 'add', 'test.py'])
+        baseline_tree = run_setup(['git', '-C', str(tmp_path), 'rev-parse', 'HEAD^{tree}']).stdout
+        index_before = run_setup(['git', '-C', str(tmp_path), 'show', ':test.py']).stdout
+        worktree_before = (tmp_path / 'test.py').read_bytes()
+
+        decision = _pre_tool(
+            {
+                'hook_event_name': 'PreToolUse',
+                'tool_name': 'Bash',
+                'tool_input': {'command': 'git commit --only --amend --no-edit'},
+                'cwd': str(tmp_path),
+            }
+        )
+
+        reason = _assert_classification_denied(decision)
+        assert '--only without pathspec' in reason
+        assert _assert_denied_output(capsys) == reason
+        assert _staged_bytes(tmp_path) == index_before
+        assert (tmp_path / 'test.py').read_bytes() == worktree_before
+
+        run_setup(['git', '-C', str(tmp_path), 'commit', '--only', '--amend', '--no-edit'])
+
+        amended_tree = run_setup(['git', '-C', str(tmp_path), 'rev-parse', 'HEAD^{tree}']).stdout
+        assert amended_tree == baseline_tree
+        assert _staged_bytes(tmp_path) == index_before
+        assert (tmp_path / 'test.py').read_bytes() == worktree_before
 
     @pytest.mark.parametrize(
         'case',
@@ -4333,7 +4335,7 @@ class TestPreToolUseCommitModes:
         expected_reason = (
             'defsort: sorted 1 staged Python file for this commit' if rewritten else None
         )
-        assert decision == _Outcome('allow', expected_reason)
+        assert decision == Outcome('allow', expected_reason)
         stdout = capsys.readouterr().out
         if rewritten:
             assert json.loads(stdout) == _RECEIPT_ONE
@@ -4375,39 +4377,6 @@ class TestPreToolUseCommitModes:
         assert result_stdout == ''
         assert result_stderr == ''
         assert target.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
-
-    def test_commit_only_with_empty_pathspec_file_preserves_staged_changes(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        _init_git_repo(tmp_path, _SRC_NEEDS_SORT)
-        run_setup(['git', '-C', str(tmp_path), 'add', 'test.py'])
-        index_before = _staged_bytes(tmp_path)
-        worktree_before = (tmp_path / 'test.py').read_bytes()
-        pathspec_file = tmp_path / 'empty.txt'
-        pathspec_file.write_bytes(b'')
-
-        decision = _pre_tool(
-            {
-                'hook_event_name': 'PreToolUse',
-                'tool_name': 'Bash',
-                'tool_input': {
-                    'command': (
-                        f'git commit --only --pathspec-from-file={shell_path(pathspec_file)}'
-                        ' --amend --no-edit'
-                    )
-                },
-                'cwd': str(tmp_path),
-            }
-        )
-
-        captured = capsys.readouterr()
-        assert decision == _Outcome('allow')
-        assert captured.out == ''
-        assert captured.err == ''
-        assert _staged_bytes(tmp_path) == index_before
-        assert (tmp_path / 'test.py').read_bytes() == worktree_before
 
     @pytest.mark.parametrize(
         'case',
@@ -4456,7 +4425,7 @@ class TestPreToolUseCommitModes:
         expected_reason = (
             'defsort: sorted 1 staged Python file for this commit' if rewritten else None
         )
-        assert decision == _Outcome('allow', expected_reason)
+        assert decision == Outcome('allow', expected_reason)
         stdout = capsys.readouterr().out
         if rewritten:
             assert json.loads(stdout) == _RECEIPT_ONE
@@ -4887,7 +4856,7 @@ class TestPreToolUseCommitModes:
         expected_reason = (
             'defsort: sorted 1 staged Python file for this commit' if rewritten else None
         )
-        assert decision == _Outcome('allow', expected_reason)
+        assert decision == Outcome('allow', expected_reason)
         stdout = capsys.readouterr().out
         if rewritten:
             assert json.loads(stdout) == _RECEIPT_ONE
@@ -4999,13 +4968,7 @@ class TestReadOnlyCommitModes:
 
 class TestResolveAndSort:
     def test_already_sorted_skips(self) -> None:
-        ctx = HookContext(
-            cwd='/tmp',  # noqa: S108
-            repo_root='/tmp',  # noqa: S108
-            allow_on_failure=False,
-            incremental=False,
-            overrides=SortOverrides(),
-        )
+        ctx = _hook_ctx(Path('repo'), incremental=False)
         outcome = _resolve_and_sort(
             ctx,
             _SRC_ALREADY_ORDERED,
@@ -5018,13 +4981,7 @@ class TestResolveAndSort:
         assert outcome.disposition is _Disposition.SKIP
 
     def test_blocker_returns_block(self) -> None:
-        ctx = HookContext(
-            cwd='/tmp',  # noqa: S108
-            repo_root='/tmp',  # noqa: S108
-            allow_on_failure=False,
-            incremental=False,
-            overrides=SortOverrides(),
-        )
+        ctx = _hook_ctx(Path('repo'), incremental=False)
         outcome = _resolve_and_sort(
             ctx,
             _SRC_INTERSTITIAL,
@@ -5039,13 +4996,7 @@ class TestResolveAndSort:
         assert 'code between definitions' in outcome.blocker_message
 
     def test_decode_failed_with_guard_skips(self, capsys: pytest.CaptureFixture[str]) -> None:
-        ctx = HookContext(
-            cwd='/tmp',  # noqa: S108
-            repo_root='/tmp',  # noqa: S108
-            allow_on_failure=False,
-            incremental=False,
-            overrides=SortOverrides(),
-        )
+        ctx = _hook_ctx(Path('repo'), incremental=False)
         bl_entry = BlobReadResult(status=BlobReadStatus.DECODE_FAILED)
         outcome = _resolve_and_sort(
             ctx,
@@ -5064,13 +5015,7 @@ class TestResolveAndSort:
     def test_guard_triggered_skips(self, capsys: pytest.CaptureFixture[str]) -> None:
         baseline = 'def c():\n    pass\n\n\ndef b():\n    pass\n\n\ndef a():\n    pass\n'
         bl_entry = BlobReadResult(status=BlobReadStatus.CONTENT, content=baseline)
-        ctx = HookContext(
-            cwd='/tmp',  # noqa: S108
-            repo_root='/tmp',  # noqa: S108
-            allow_on_failure=False,
-            incremental=False,
-            overrides=SortOverrides(),
-        )
+        ctx = _hook_ctx(Path('repo'), incremental=False)
         outcome = _resolve_and_sort(
             ctx,
             baseline,
@@ -5084,13 +5029,7 @@ class TestResolveAndSort:
         assert 'would move' in capsys.readouterr().err
 
     def test_infra_error_with_incremental_skips(self) -> None:
-        ctx = HookContext(
-            cwd='/tmp',  # noqa: S108
-            repo_root='/tmp',  # noqa: S108
-            allow_on_failure=False,
-            incremental=True,
-            overrides=SortOverrides(),
-        )
+        ctx = _hook_ctx(Path('repo'), incremental=True)
         bl_entry = BlobReadResult(status=BlobReadStatus.INFRA_ERROR)
         outcome = _resolve_and_sort(
             ctx,
@@ -5104,13 +5043,7 @@ class TestResolveAndSort:
         assert outcome.disposition is _Disposition.SKIP
 
     def test_new_file_full_sort(self) -> None:
-        ctx = HookContext(
-            cwd='/tmp',  # noqa: S108
-            repo_root='/tmp',  # noqa: S108
-            allow_on_failure=False,
-            incremental=False,
-            overrides=SortOverrides(),
-        )
+        ctx = _hook_ctx(Path('repo'), incremental=False)
         outcome = _resolve_and_sort(
             ctx,
             _SRC_NEEDS_SORT,
@@ -5125,13 +5058,7 @@ class TestResolveAndSort:
         assert outcome.new_source.index('alpha') < outcome.new_source.index('bravo')
 
     def test_renamed_incremental_skips(self) -> None:
-        ctx = HookContext(
-            cwd='/tmp',  # noqa: S108
-            repo_root='/tmp',  # noqa: S108
-            allow_on_failure=False,
-            incremental=True,
-            overrides=SortOverrides(),
-        )
+        ctx = _hook_ctx(Path('repo'), incremental=True)
         outcome = _resolve_and_sort(
             ctx,
             _SRC_NEEDS_SORT,
@@ -5144,13 +5071,7 @@ class TestResolveAndSort:
         assert outcome.disposition is _Disposition.SKIP
 
     def test_syntax_error_skips(self) -> None:
-        ctx = HookContext(
-            cwd='/tmp',  # noqa: S108
-            repo_root='/tmp',  # noqa: S108
-            allow_on_failure=False,
-            incremental=False,
-            overrides=SortOverrides(),
-        )
+        ctx = _hook_ctx(Path('repo'), incremental=False)
         outcome = _resolve_and_sort(
             ctx,
             _SRC_SYNTAX_ERROR,
@@ -5617,6 +5538,34 @@ class TestRunHook:
         assert captured.err.startswith("defsort: host 'probe\\x0aname'")
         assert 'Traceback' not in captured.err
 
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [('event', 'PostToolUse'), ('event', 42), ('command', 42)],
+    )
+    def test_invalid_adapter_values_fail_closed(
+        self,
+        field: str,
+        value: object,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        fields: dict[str, object] = {
+            'event': 'pre_tool',
+            'command': 'ls',
+            'command_cwd': None,
+            'cwd': '.',
+            'edited_paths': (),
+        }
+        fields[field] = value
+        _install_adapter_probe(
+            monkeypatch, _AdapterProbe(_AdapterFields(fields), HostResponse('', '', 0))
+        )
+
+        assert run_hook('{}', host='probe') == 2
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert captured.err.startswith("defsort: host 'probe' failed to parse the payload:")
+
     @pytest.mark.parametrize(('field', 'value'), [('cwd', 42), ('edited_paths', (42,))])
     def test_malformed_post_tool_paths_fail_before_repository_work(
         self,
@@ -5733,12 +5682,7 @@ class TestRunHook:
             'is_hook_enabled',
         ):
             monkeypatch.setattr(hook_mod, name, fail_if_called)
-        if provider == 'codex':
-            payload = _codex_pretooluse_payload(command, tmp_path)
-        elif provider == 'antigravity':
-            payload = _antigravity_pretooluse_payload(command, tmp_path)
-        else:
-            payload = _pretooluse_payload(command, tmp_path)
+        payload = _provider_pretooluse_payload(provider, command, tmp_path)
 
         result = _run_in_process(payload, provider)
 
@@ -5798,7 +5742,7 @@ class TestSortWorktreeFiles:
         f.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
         mtime_before = f.stat().st_mtime
         result = _sort_worktree_files(_hook_ctx(tmp_path), ['test.py'])
-        assert result == _Outcome('allow')
+        assert result == Outcome('allow')
         # File should not be rewritten (mtime unchanged)
         assert f.stat().st_mtime == mtime_before
         assert f.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
@@ -5855,7 +5799,7 @@ class TestSortWorktreeFiles:
             ),
             ['test.py'],
         )
-        assert result == _Outcome('allow')
+        assert result == Outcome('allow')
         raw = f.read_bytes()
         without_crlf = raw.replace(b'\r\n', b'<NL>')
         assert b'\n' not in without_crlf
@@ -5864,7 +5808,7 @@ class TestSortWorktreeFiles:
 
     def test_empty_list_succeeds(self, tmp_path: Path) -> None:
         result = _sort_worktree_files(_hook_ctx(tmp_path), [])
-        assert result == _Outcome('allow')
+        assert result == Outcome('allow')
 
     def test_multi_file_write_failure_best_effort(self, tmp_path: Path) -> None:
         a = tmp_path / 'a.py'
@@ -5877,7 +5821,7 @@ class TestSortWorktreeFiles:
             result = _sort_worktree_files(
                 _hook_ctx(tmp_path, allow_on_failure=True), ['a.py', 'b.py']
             )
-            assert result == _Outcome('allow')
+            assert result == Outcome('allow')
             # a.py stays sorted (no rollback in best-effort mode)
             assert a.read_text(encoding='utf-8') != _SRC_NEEDS_SORT
             assert b.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
@@ -5946,7 +5890,7 @@ class TestSortWorktreeFiles:
         f = tmp_path / 'test.py'
         f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
         result = _sort_worktree_files(_hook_ctx(tmp_path), ['test.py'])
-        assert result == _Outcome('allow')
+        assert result == Outcome('allow')
         content = f.read_text(encoding='utf-8')
         assert content.index('alpha') < content.index('bravo')
 
@@ -5956,7 +5900,7 @@ class TestSortWorktreeFiles:
         link = tmp_path / 'link.py'
         link.symlink_to(f)
         result = _sort_worktree_files(_hook_ctx(tmp_path), ['link.py'])
-        assert result == _Outcome('allow')
+        assert result == Outcome('allow')
         assert link.is_symlink()
         assert f.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
 
@@ -5964,7 +5908,7 @@ class TestSortWorktreeFiles:
         f = tmp_path / 'test.py'
         f.write_text(_SRC_SYNTAX_ERROR, encoding='utf-8')
         result = _sort_worktree_files(_hook_ctx(tmp_path), ['test.py'])
-        assert result == _Outcome('allow')
+        assert result == Outcome('allow')
         assert f.read_text(encoding='utf-8') == _SRC_SYNTAX_ERROR
 
     def test_unreadable_file_denies_by_default(self, tmp_path: Path) -> None:
@@ -5972,7 +5916,7 @@ class TestSortWorktreeFiles:
         f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
         with patch.object(Path, 'read_bytes', side_effect=PermissionError('read denied')):
             result = _sort_worktree_files(_hook_ctx(tmp_path), ['test.py'])
-        assert result == _Outcome('deny', 'defsort: cannot read test.py')
+        assert result == Outcome('deny', 'defsort: cannot read test.py')
         assert f.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
 
     def test_unreadable_file_skips_with_failure_override(
@@ -5982,7 +5926,7 @@ class TestSortWorktreeFiles:
         f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
         with patch.object(Path, 'read_bytes', side_effect=PermissionError('read denied')):
             result = _sort_worktree_files(_hook_ctx(tmp_path, allow_on_failure=True), ['test.py'])
-        assert result == _Outcome('allow')
+        assert result == Outcome('allow')
         assert capsys.readouterr().err == 'WARNING: defsort: cannot read test.py\n'
         assert f.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
 
@@ -6004,7 +5948,7 @@ class TestSortWorktreeFiles:
         f.chmod(0o444)
         try:
             result = _sort_worktree_files(_hook_ctx(tmp_path, allow_on_failure=True), ['test.py'])
-            assert result == _Outcome('allow')
+            assert result == Outcome('allow')
         finally:
             f.chmod(0o644)
         assert f.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
@@ -6158,11 +6102,40 @@ def _antigravity_pretooluse_payload(cmd: str, cwd: Path) -> str:
     )
 
 
-def _assert_classification_denied(decision: _Outcome) -> str:
+def _assert_classification_denied(decision: Outcome) -> str:
     assert decision.decision == 'deny'
     assert decision.reason is not None
     assert decision.reason.startswith(_REASON_PREFIX)
     return decision.reason
+
+
+def _codex_pretooluse_payload(cmd: str, cwd: Path) -> str:
+    return json.dumps(
+        {
+            'hook_event_name': 'PreToolUse',
+            'turn_id': 'turn-test',
+            'tool_name': 'Bash',
+            'tool_use_id': 'tool-test',
+            'tool_input': {'command': cmd},
+            'cwd': str(cwd),
+            'model': 'codex-test',
+            'permission_mode': 'workspace-write',
+        }
+    )
+
+
+def _deny_reason(stdout: str, stderr: str, provider: str, prefix: str) -> str:
+    data = json.loads(stdout)
+    if provider == 'antigravity':
+        assert data['decision'] == 'deny'
+        reason = str(data['reason'])
+    else:
+        hook = data['hookSpecificOutput']
+        assert hook['permissionDecision'] == 'deny'
+        reason = str(hook['permissionDecisionReason'])
+    assert reason.startswith(prefix)
+    assert stderr == f'{reason}\n'
+    return reason
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='Windows paths cannot contain non-UTF-8 bytes')
@@ -6218,21 +6191,6 @@ def _hook_ctx(
         allow_on_failure=allow_on_failure,
         incremental=incremental,
         overrides=SortOverrides() if overrides is None else overrides,
-    )
-
-
-def _codex_pretooluse_payload(cmd: str, cwd: Path) -> str:
-    return json.dumps(
-        {
-            'hook_event_name': 'PreToolUse',
-            'turn_id': 'turn-test',
-            'tool_name': 'Bash',
-            'tool_use_id': 'tool-test',
-            'tool_input': {'command': cmd},
-            'cwd': str(cwd),
-            'model': 'codex-test',
-            'permission_mode': 'workspace-write',
-        }
     )
 
 
@@ -6300,7 +6258,7 @@ def _install_adapter_probe(monkeypatch: pytest.MonkeyPatch, adapter: object) -> 
         # Deliberately cross the third-party protocol boundary in one place.
         return cast('HookAdapter', adapter)
 
-    monkeypatch.setattr(hook_mod, 'load_adapter', load_probe)
+    monkeypatch.setattr(front_mod, 'load_adapter', load_probe)
 
 
 @pytest.mark.parametrize('provider', ['claude', 'codex'])
@@ -6402,6 +6360,21 @@ def _pretooluse_payload(cmd: str, cwd: Path) -> str:
     )
 
 
+def _provider_pretooluse_payload(
+    provider: str,
+    command: str,
+    cwd: Path,
+    *,
+    codex_command: str | None = None,
+) -> str:
+    if provider == 'codex':
+        return _codex_pretooluse_payload(command if codex_command is None else codex_command, cwd)
+    if provider == 'antigravity':
+        return _antigravity_pretooluse_payload(command, cwd)
+    assert provider == 'claude'
+    return _pretooluse_payload(command, cwd)
+
+
 def _repo_state(repo: Path) -> tuple[bytes, bytes]:
     index = run_setup(['git', '-C', str(repo), 'ls-files', '-s']).stdout
     return index, (repo / 'test.py').read_bytes()
@@ -6412,15 +6385,15 @@ def _pre_tool(
     *,
     overrides: SortOverrides | None = None,
     allow_on_failure: bool = False,
-) -> _Outcome:
+) -> Outcome:
     adapter = load_adapter('claude')
     parsed = adapter.parse(payload, None)
     assert parsed is not None
     if parsed.command is None:
-        return _Outcome('allow')
-    outcome = hook_mod._run_pre_tool_use(
+        return Outcome('allow')
+    outcome = front_mod._run_pre_tool_use(
         parsed.command,
-        parsed.cwd,
+        parsed.command_cwd,
         overrides=overrides,
         allow_on_failure=allow_on_failure,
     )
@@ -6491,17 +6464,7 @@ def _assert_denied_output(
     prefix: str = _REASON_PREFIX,
 ) -> str:
     captured = capsys.readouterr()
-    data = json.loads(captured.out)
-    if provider == 'antigravity':
-        assert data['decision'] == 'deny'
-        reason = str(data['reason'])
-    else:
-        hook = data['hookSpecificOutput']
-        assert hook['permissionDecision'] == 'deny'
-        reason = str(hook['permissionDecisionReason'])
-    assert reason.startswith(prefix)
-    assert captured.err == f'{reason}\n'
-    return reason
+    return _deny_reason(captured.out, captured.err, provider, prefix)
 
 
 def test_adapter_flow_requires_explicit_agent() -> None:
@@ -6536,7 +6499,9 @@ def test_adapter_flow_third_party_combines_two_syntax_errors(
     assert json.loads(captured.out) == {
         'example': {
             'decision': 'allow',
-            'reason': '\n'.join(f'Cannot sort {path}: invalid syntax (line 1).' for path in paths),
+            'reason': '\n'.join(
+                f'Cannot sort {path.as_posix()}: invalid syntax (line 1).' for path in paths
+            ),
         },
     }
     assert captured.err == ''
@@ -6591,17 +6556,7 @@ def _assert_denied(
 ) -> str:
     status, stdout, stderr = result
     assert status == EXIT_OK
-    data = json.loads(stdout)
-    if provider == 'antigravity':
-        assert data['decision'] == 'deny'
-        reason = str(data['reason'])
-    else:
-        hook = data['hookSpecificOutput']
-        assert hook['permissionDecision'] == 'deny'
-        reason = str(hook['permissionDecisionReason'])
-    assert reason.startswith(prefix)
-    assert stderr == f'{reason}\n'
-    return reason
+    return _deny_reason(stdout, stderr, provider, prefix)
 
 
 def _staged_text(repo: Path, path: str = 'mod.py') -> str:
@@ -6624,12 +6579,7 @@ def test_nested_bootstrap_denies_and_does_not_touch_outer_repo(
     path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
     command = 'git init child && git -C child add example.py && git -C child commit -m "initial"'
 
-    if provider == 'claude':
-        payload = _pretooluse_payload(command, tmp_path)
-    elif provider == 'codex':
-        payload = _codex_pretooluse_payload(command, tmp_path)
-    else:
-        payload = _antigravity_pretooluse_payload(command, tmp_path)
+    payload = _provider_pretooluse_payload(provider, command, tmp_path)
 
     result_status, result_stdout, result_stderr = invoke_cli(
         [
@@ -6685,6 +6635,46 @@ def test_adapter_flow_denies_unsupported_before_repository_work(
     assert decision['permissionDecisionReason'].startswith('defsort: unsupported commit command')
 
 
+@pytest.mark.parametrize(
+    ('command', 'decision'),
+    [
+        ("$'git' commit", 'deny'),
+        ('git commit -m "$(cat <<\'MESSAGE\'\nsubject\nMESSAGE\n)"', 'allow'),
+        ("cat > notes.md <<'EOF'\ngit log then commit\nEOF\n", 'allow'),
+        ("cat > notes.md <<'EOF' && git commit -m x\nbody\nEOF\n", 'deny'),
+    ],
+)
+def test_adapter_flow_applies_vendored_classifier_fixes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    decision: str,
+) -> None:
+    def hook_disabled(_root: str | None = None) -> bool:
+        return False
+
+    def repository_work_forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail('classification reached repository work')
+
+    monkeypatch.setattr(hook_mod, 'is_hook_enabled', hook_disabled)
+    for name in ('discover_repo_root', 'run_pre_commit_adds'):
+        monkeypatch.setattr(hook_mod, name, repository_work_forbidden)
+    result = run_hook(
+        _pretooluse_payload(command, tmp_path), host='claude', allow_on_failure=False
+    )
+    captured = capsys.readouterr()
+    assert result == 0
+    if decision == 'deny':
+        output = json.loads(captured.out)['hookSpecificOutput']
+        assert output['permissionDecision'] == 'deny'
+        assert output['permissionDecisionReason'].startswith(
+            'defsort: unsupported commit command: '
+        )
+    else:
+        assert captured.out == ''
+
+
 @pytest.mark.parametrize('allow_on_failure', [False, True])
 def test_adapter_flow_classifier_exception_always_denies(
     tmp_path: Path,
@@ -6692,13 +6682,14 @@ def test_adapter_flow_classifier_exception_always_denies(
     capsys: pytest.CaptureFixture[str],
     allow_on_failure: bool,
 ) -> None:
-    def classification_failed(_command: str, _cwd: str) -> None:
+    def classification_failed(_command: str, _cwd: str, *, reason_prefix: str) -> None:
+        assert reason_prefix == _REASON_PREFIX
         raise RuntimeError('classifier exploded')
 
     def repository_work_forbidden(*_args: object, **_kwargs: object) -> None:
         pytest.fail('failed classification reached repository work')
 
-    monkeypatch.setattr(hook_mod, 'classify_command', classification_failed)
+    monkeypatch.setattr(front_mod, 'classify_command', classification_failed)
     for name in ('is_hook_enabled', 'discover_repo_root', 'run_pre_commit_adds'):
         monkeypatch.setattr(hook_mod, name, repository_work_forbidden)
     result = run_hook(
@@ -6731,7 +6722,7 @@ def test_adapter_flow_builtin_preserves_syntax_feedback(
         == 0
     )
     captured = capsys.readouterr()
-    message = f'Cannot sort {path}: invalid syntax (line 1).'
+    message = f'Cannot sort {path.as_posix()}: invalid syntax (line 1).'
     expected = (
         {'systemMessage': message}
         if provider == 'antigravity'
@@ -6971,6 +6962,6 @@ class TestUnknownInvocationDirectory:
             monkeypatch.setattr(hook_mod, name, explode)
         monkeypatch.setattr(hook_mod, 'resolve_config_at_root', explode)
 
-        outcome = hook_mod._run_pre_tool_use('git commit -m x', None, allow_on_failure=True)
+        outcome = front_mod._run_pre_tool_use('git commit -m x', None, allow_on_failure=True)
 
-        assert outcome == _Outcome('deny', _UNKNOWN_CWD_REASON)
+        assert outcome == Outcome('deny', _UNKNOWN_CWD_REASON)

@@ -17,7 +17,7 @@ registration belongs in the [hook guide](hook.md).
 ## Synopsis
 
 ```text
-defsort [options] [PATH...]
+defsort [options] [PATH ...]
 ```
 
 `defsort` accepts `.py` files or directories (recursively expanded to `**/*.py`). Non-`.py` files
@@ -34,15 +34,15 @@ the adapter handles (see the [agent hook guide](hook.md)).
 
 ### Output modes
 
-| Flag            | Short | Description                          |
-| --------------- | ----- | ------------------------------------ |
-| `--detect`      |       | Detect definition order              |
-| `--preview`     | `-p`  | Show movement tables                 |
-| `--diff`        | `-d`  | Show unified diff                    |
-| `--json`        | `-j`  | Output to JSON                       |
-| `--write`       | `-w`  | Modify files in place                |
-| `--show-policy` |       | Show resolved policy and provenance  |
-| `--version`     |       | Print the installed version and exit |
+| Flag            | Short | Description                                         |
+| --------------- | ----- | --------------------------------------------------- |
+| `--preview`     | `-p`  | Show where definitions would move                   |
+| `--diff`        | `-d`  | Show a unified diff                                 |
+| `--write`       | `-w`  | Rewrite files in place                              |
+| `--json`        | `-j`  | Print results as JSON                               |
+| `--show-policy` |       | Show the ordering policy that applies to each path  |
+| `--detect`      |       | Report each file's current order instead of sorting |
+| `--version`     |       | Show the version and exit                           |
 
 `--version` prints `defsort <version>` from installed distribution metadata and exits 0. If
 metadata is unavailable, it reports an error and exits 2. Other arguments are ignored only after
@@ -50,7 +50,8 @@ successful parsing.
 
 Without a mode flag, `defsort` shows a columnar summary table of files that would change. Preview,
 diff, JSON, write, and policy display are mutually exclusive. Detect mode cannot be combined with
-preview, diff, write, or policy display; `--json` can be combined with `--detect`.
+preview, diff, write, or policy display. `--json` accepts `--detect` but ignores it; JSON records
+already contain detection fields.
 
 ### Ordering policy
 
@@ -93,27 +94,29 @@ order. Definition-time requirements remain safety constraints under every strate
 methods. `__new__` and `__init__` remain the first two categories.
 
 `main = last` anchors a top-level function named `main` last unless another definition reads it at
-definition time. `main = sorted` removes the anchor. `tie-break` affects dependency order:
-`alphabetical` breaks ties by name, while `source` preserves the original order among ready items.
-An unconnected method appended at the end therefore stays there under `source`.
+definition time. Under `evaluation-order = preserve`, an eager `main()` also keeps its source order
+relative to other eager groups, so it can remain earlier. `main = sorted` removes the anchor.
+`tie-break` affects dependency order: `alphabetical` breaks ties by name, while `source` preserves
+the original order among ready items. An unconnected method appended at the end therefore stays
+there under `source`.
 
 `evaluation-order = preserve` keeps the relative source order of groups with decorators, defaults,
 or other covered definition-time evaluation. `allow-reordering` removes only that conservative pin
 for top-level definitions and methods whose scopes are enabled. It explicitly accepts that their
-relative execution effects may change. Defsort does not infer purity or maintain a decorator list;
+relative execution effects may change. defsort does not infer purity or maintain a decorator list;
 binding dependencies and the safety checks below still apply.
 
 ### Other modifiers
 
-| Flag           | Short | Description                                                           |
-| -------------- | ----- | --------------------------------------------------------------------- |
-| `--show-skips` |       | Show skipped-file messages in compact modes                           |
-| `--hide-skips` |       | Hide skipped-file messages in compact modes                           |
-| `--force`      | `-f`  | Bypass interstitial and reorder-guard blockers                        |
-| `--verbose`    | `-v`  | Include unchanged files in output                                     |
-| `--color`      |       | Color output: `auto` (default), `always`, `never`                     |
-| `--hoist`      |       | Hoist safe `UPPER_SNAKE_CASE` constants from between defs to preamble |
-| `--no-future`  |       | Don't auto-add `from __future__ import annotations` for forward refs  |
+| Flag           | Short | Description                                                             |
+| -------------- | ----- | ----------------------------------------------------------------------- |
+| `--show-skips` |       | List skipped files in summary, diff, and write output (default: on)     |
+| `--hide-skips` |       | Do not list skipped files in summary, diff, and write output            |
+| `--force`      | `-f`  | Sort files that have code between definitions or exceed a reorder limit |
+| `--verbose`    | `-v`  | Also list unchanged files                                               |
+| `--color`      |       | When to use color: `auto` (default), `always`, or `never`               |
+| `--hoist`      |       | Hoist safe `UPPER_SNAKE_CASE` constants from between defs to preamble   |
+| `--no-future`  |       | Don't auto-add `from __future__ import annotations` for forward refs    |
 
 ### Banner handling
 
@@ -129,8 +132,9 @@ subset consists of literals, escaped atoms other than decimal backreferences, ch
 `.`, an optional leading `^`, an optional trailing `$`, and at most one `*` or `+` attached to an
 atom in the entire expression. For example, `^# Section: .+$` is supported. Grouping, alternation,
 lookaround, counted repetition, `?`, backreferences, misplaced anchors, unattached repetition, and
-multiple repetitions are rejected. An invalid or unsupported CLI expression is a usage error with
-exit code 2.
+multiple repetitions are rejected. A literal `{` or `}` must be written as `\{` or `\}`, or placed
+inside a character class, even though `re` alone would read a lone brace literally. An invalid or
+unsupported CLI expression is a usage error with exit code 2.
 
 `--no-banner-pattern` clears a custom pattern inherited from configuration and restores built-in
 recognition for the invocation. It conflicts with `--banner-pattern`.
@@ -150,10 +154,10 @@ comments, and preamble or postamble blocks remain protected, but inspect a diff 
 
 ### Incremental mode
 
-| Flag               | Short | Description                                    |
-| ------------------ | ----- | ---------------------------------------------- |
-| `--incremental`    | `-i`  | Only sort new definitions added since git HEAD |
-| `--no-incremental` |       | Disable incremental mode (overrides config)    |
+| Flag               | Short | Description                                                             |
+| ------------------ | ----- | ----------------------------------------------------------------------- |
+| `--incremental`    | `-i`  | Sort only definitions added since the last commit (requires Git)        |
+| `--no-incremental` |       | Sort every definition, even when configuration enables incremental mode |
 
 `-i` / `--incremental` and `--no-incremental` are mutually exclusive.
 
@@ -213,14 +217,14 @@ Printed to stderr:
 - Non-default policy values that have no effect under the resolved strategies.
 
 Ineffective-policy warnings depend on the resolved value, not on whether it came from config or a
-CLI flag. Default values never warn. Defsort warns for:
+CLI flag. Default values never warn. defsort warns for:
 
 - non-default `method-bodies` when method order is not `dependency`;
 - `tie-break = source` when neither scope uses dependency order;
 - non-default `method-visibility` or `method-dunders` when method order is `none`; and
 - `main = sorted` when definition order is `none`.
 
-These warnings do not reject the invocation. Defsort ignores the ineffective value.
+These warnings do not reject the invocation. defsort ignores the ineffective value.
 
 In `barriers` mode, a constrained file also prints
 `defsort: <path>: sort constrained by <n> banner(s)` to stderr. Preview and verbose output add one
@@ -239,9 +243,10 @@ python -m defsort --diff .
 ## Detect mode (`--detect`)
 
 `--detect` classifies each file's current definition order without modifying anything. It uses the
-same effective banner mode and custom pattern as sorting and JSON detection fields. Use
-`--json --detect` for machine-readable results. Detection cannot be combined with `--preview`,
-`--diff`, `--write`, or `--show-policy`.
+same effective banner mode and custom pattern as sorting and JSON detection fields. Use `--json`
+for machine-readable records containing `order`, `dep_score`, and `alpha_score`; adding `--detect`
+does not change JSON output, exit status, or Git baseline requirements. Detection cannot be
+combined with `--preview`, `--diff`, `--write`, or `--show-policy`.
 
 Default output (one line per file):
 
@@ -273,7 +278,7 @@ with fewer than 2 definitions are skipped (shown only with `-v`).
 
 In `barriers` mode, each section is classified independently and sections with fewer than two
 definitions are neutral. Cross-section pairs do not affect the classification or tau scores.
-Defsort sums discordant and total pair counts across comparable sections, so each section is
+defsort sums discordant and total pair counts across comparable sections, so each section is
 weighted by its number of pairs. If every section is neutral, the file is skipped. `ignore` and
 `strip` detect global order; detection never changes the file.
 
@@ -281,7 +286,7 @@ Detection classifies top-level definitions against canonical dependency and alph
 It does not test conformance with non-default policy axes. A file that conforms under
 `tie-break = source`, `main = sorted`, or `evaluation-order = allow-reordering` can classify as
 `unordered`; with `definition-order = none`, the result is informational. To test the effective
-policy, run defsort normally and check that it proposes no changes.
+policy, run `defsort` normally and check that it proposes no changes.
 
 ## Incremental mode (`-i`)
 
@@ -309,7 +314,7 @@ Use this to sort code as you write it without disturbing definitions already com
 
 ## Source preservation
 
-Ordinary sorting is a lossless positional block permutation. Defsort moves complete definition or
+Ordinary sorting is a lossless positional block permutation. defsort moves complete definition or
 method blocks, including their decorators and owned comments, into the existing source slots. It
 preserves every character outside those blocks, including blank lines, whitespace-filled lines,
 line-ending sequences, preambles, postambles, class headers and footers, final-newline state, and
@@ -326,7 +331,7 @@ change the suffix or final-newline state. At the sole ambiguous mixed-ending sea
 adjacent lone CR and LF as LF then CR so they remain two physical endings instead of one CRLF
 ending. Every authored byte remains present; this is not general line-ending normalization.
 
-Defsort does not implement top-level or method blank-line style. Run a formatter separately when
+defsort does not implement top-level or method blank-line style. Run a formatter separately when
 you want it to enforce a style convention.
 
 Three requested transformations have narrow authority to change more than block position:
@@ -343,15 +348,15 @@ line-ending normalization.
 
 ## Ordering safety and future annotations
 
-Defsort rejects an actual full or incremental candidate that changes the binding seen by a covered
+defsort rejects an actual full or incremental candidate that changes the binding seen by a covered
 definition-time read. These reads include decorators, defaults, class bases and keywords, and
-executable class-suite expressions. With `evaluation-order = preserve`, `EAGER_ORDER` also rejects
+executable class-suite expressions. With `evaluation-order = preserve`, `eager_order` also rejects
 a candidate that changes the relative source order of eager groups. With `allow-reordering`, only
 that relative-order check is removed; binding-identity checks remain. A future import cannot repair
-an `EAGER_ORDER` blocker.
+an `eager_order` blocker.
 
 `--force` bypasses interstitial-code and large-reorder-guard blockers. It does not select
-`allow-reordering` and never bypasses duplicate-name, applicable `EAGER_ORDER`, or unresolved
+`allow-reordering` and never bypasses duplicate-name, applicable `eager_order`, or unresolved
 forward-annotation blockers. A skipped preview for a non-bypassable blocker therefore does not
 suggest `--force`; duplicate-name blockers recommend removing the duplicate definition.
 
@@ -367,7 +372,7 @@ or return annotation at any depth. Removal also preserves the import whenever th
 `annotations` occurs as a load, store, or deletion, including in a local scope. This protects live
 uses such as `annotations.compiler_flag`; reflective uses through string names are not detected.
 `--no-future` disables automatic addition, so a covered annotation hazard without an existing
-import is blocked as `FORWARD_REFS`; it does not weaken `EAGER_ORDER`.
+import is blocked as `forward_refs`; it does not weaken `eager_order`.
 
 When policy authorizes removal, automatic cleanup removes every eligible unused duplicate in one
 sort. Each deletion uses a direct top-level, unaliased, annotations-only import's exclusively owned
@@ -377,7 +382,7 @@ comments or peer statements on the candidate lines remain unchanged. Cleanup rem
 duplicates so another sort produces the same result.
 
 On Python 3.14 and later, automatic addition intentionally selects the future import's stringized
-annotation representation instead of Python 3.14's default deferred annotation values. Defsort uses
+annotation representation instead of Python 3.14's default deferred annotation values. defsort uses
 this conservative cross-version policy without project-version inference.
 
 ## Configuration (`[tool.defsort]`)
@@ -472,7 +477,7 @@ Color precedence is explicit `--color always` or `--color never`, then `NO_COLOR
 
 ## Resolved policy (`--show-policy`)
 
-`--show-policy [PATH...]` resolves configuration, prints the policy, and exits without sorting.
+`--show-policy [PATH ...]` resolves configuration, prints the policy, and exits without sorting.
 With no path, it resolves the current directory. Output contains one block for each distinct
 configuration source in first-encountered path order, even when two sources produce identical
 values:
@@ -494,7 +499,9 @@ and explicitly rejects `--detect`. Unreadable paths report an error and produce 
 ## Exit codes
 
 Closing stdout early preserves the status of completed work, as described under
-[output behavior](#write-mode---write).
+[output behavior](#write-mode---write). Starting defsort with stdout already closed is an error: it
+prints `error: standard output is unavailable` to stderr and exits 2 before reading or writing any
+file, in every mode including `--help`, `--version`, and `hook`.
 
 | Code | Meaning                                                                   |
 | ---- | ------------------------------------------------------------------------- |

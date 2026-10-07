@@ -13,7 +13,7 @@ post-tool handling. `command_cwd` is the directory the command executes in, or
 `None` when the host contract does not establish it; the core then denies a
 committing command unless it names an absolute route.
 
-Defsort selects the adapter named by `defsort hook --agent NAME`, refuses an
+defsort selects the adapter named by `defsort hook --agent NAME`, refuses an
 adapter whose `api_version` differs from `API_VERSION`, and never infers the
 host from the payload. Classification, Git operations, and the allow or deny
 decision never depend on the adapter.
@@ -137,7 +137,7 @@ class HookAdapter(Protocol):
     """Translator between one host's hook protocol and defsort's neutral types.
 
     Registered implementations must be constructible without arguments.
-    Defsort creates an instance for each hook invocation and, for applicable
+    defsort creates an instance for each hook invocation and, for applicable
     input, calls `parse()` before `render()` on that same instance. Rendering
     may therefore use context recorded during parsing. If normal rendering
     fails, defsort calls the instance's `render_failure()` method.

@@ -12,6 +12,7 @@ import tempfile
 import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import FunctionType
 from typing import Literal, Protocol
 from unittest import mock
 
@@ -33,6 +34,13 @@ PROCESS_GROUP_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'wi
 _TRANSCRIPT_FIELD_CHARACTERS = 2048
 _TRANSCRIPT_HEAD_BYTES = 2048
 _TRANSCRIPT_TAIL_BYTES = 6144
+_CLI = [sys.executable, '-m', 'defsort._cli']
+_HOSTS_DIRECTORY = tempfile.TemporaryDirectory(prefix='defsort-hosts-')
+_HOSTS = Path(_HOSTS_DIRECTORY.name)
+_ENV = {
+    **os.environ,
+    'PYTHONPATH': os.pathsep.join([str(_ROOT), str(_ROOT / 'src'), str(_HOSTS)]),
+}
 
 
 class _Outcome(Protocol):
@@ -121,6 +129,12 @@ def _transcript_stream(label: str, data: str | bytes | None) -> list[str]:
 
 def decode_text(data: bytes) -> str:
     return data.decode('utf-8').replace('\r\n', '\n').replace('\r', '\n')
+
+
+def execute_source(source: str) -> dict[str, object]:
+    namespace: dict[str, object] = {}
+    FunctionType(compile(source, '<test>', 'exec'), namespace)()
+    return namespace
 
 
 def invoke_cli(
@@ -370,12 +384,5 @@ def shell_path(path: Path) -> str:
     return shlex.quote(path.as_posix())
 
 
-_CLI = [sys.executable, '-m', 'defsort._cli']
-_HOSTS_DIRECTORY = tempfile.TemporaryDirectory(prefix='defsort-hosts-')
-_HOSTS = Path(_HOSTS_DIRECTORY.name)
 register_distribution(_HOSTS, 'defsort', BUILTIN_ENTRY_POINTS)
 atexit.register(_HOSTS_DIRECTORY.cleanup)
-_ENV = {
-    **os.environ,
-    'PYTHONPATH': os.pathsep.join([str(_ROOT), str(_ROOT / 'src'), str(_HOSTS)]),
-}

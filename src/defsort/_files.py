@@ -6,7 +6,6 @@ import io
 import os
 import stat
 import subprocess
-import sys
 import tempfile
 import tokenize
 from collections.abc import Iterable
@@ -153,28 +152,6 @@ def encode_source(source: str, encoding: str) -> bytes:
     return source.encode(encoding)
 
 
-def ensure_utf8_stdio() -> None:
-    """Reconfigure stdio: UTF-8 on Windows, escaped stdout everywhere.
-
-    Standard output renders unencodable characters (for example
-    surrogateescaped filesystem names) with `backslashreplace`, matching the
-    standard-error default, instead of raising `UnicodeEncodeError`. Windows
-    additionally forces UTF-8 for all three streams, preserving each existing
-    error handler where it is not overridden here.
-    """
-    if hasattr(sys.stdout, 'reconfigure'):
-        if sys.platform == 'win32':
-            sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
-        else:
-            sys.stdout.reconfigure(errors='backslashreplace')  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
-    if sys.platform != 'win32':
-        return
-    if hasattr(sys.stdin, 'reconfigure'):
-        sys.stdin.reconfigure(encoding='utf-8', errors=sys.stdin.errors)  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
-    if hasattr(sys.stderr, 'reconfigure'):
-        sys.stderr.reconfigure(encoding='utf-8', errors=sys.stderr.errors)  # pyright: ignore[reportUnknownMemberType,reportAttributeAccessIssue]
-
-
 def read_file_result(path: Path) -> _ReadResult:
     """Read exact file contents with encoding detection.
 
@@ -199,28 +176,6 @@ def read_file_result(path: Path) -> _ReadResult:
     source = raw.decode(encoding)
     source = source.removeprefix('\ufeff')
     return _ReadResult(source=source, encoding=encoding)
-
-
-def read_file(path: Path) -> tuple[str, str]:
-    """Read file contents, auto-detecting encoding via PEP 263.
-
-    Uses the exact binary decode boundary from `read_file_result()`, which
-    handles UTF-8 BOM, encoding cookies, and the UTF-8 default.
-
-    Args:
-        path: Path to the Python source file.
-
-    Returns:
-        Tuple of (source_text, encoding_name).
-
-    Raises:
-        OSError: If the file cannot be read.
-        SyntaxError: If the encoding cookie is malformed or unknown.
-        UnicodeDecodeError: If the file bytes are invalid for the declared
-            encoding.
-    """
-    r = read_file_result(path)
-    return r.source, r.encoding
 
 
 def write_source(

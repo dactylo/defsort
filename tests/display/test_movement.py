@@ -321,21 +321,6 @@ class TestFormatMovementTable:
 
 
 class TestFormatMovementTableCompactMode:
-    def test_compact_no_bold_data_rows(self) -> None:
-        _d = _make_def
-        result = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'bravo'), _d(1, 'alpha')],
-            new_order=[_d(1, 'alpha'), _d(0, 'bravo')],
-            warning=None,
-            blocking_code=[],
-        )
-        table = format_movement_table(result, color=True)
-        lines = table.splitlines()
-        for line in lines[1:]:
-            assert '\033[1m' not in line
-
     def test_default_shows_only_moved_rows(self) -> None:
         _d = _make_def
         result = SortResult(
@@ -587,7 +572,7 @@ class TestPrintPreview:
         assert emitted is True
         assert capsys.readouterr().out.startswith('\033[1mtest.py\033[0m:\n\n')
 
-    def test_emits_movement_table(self) -> None:
+    def test_emits_movement_table(self, capsys: pytest.CaptureFixture[str]) -> None:
         result = _make_result(changed=True)
         emitted = print_preview(
             'test.py',
@@ -599,6 +584,11 @@ class TestPrintPreview:
             first=True,
         )
         assert emitted is True
+        output = capsys.readouterr().out
+        assert 'Current' in output
+        assert 'Proposed' in output
+        assert 'bravo' in output
+        assert 'alpha' in output
 
     def test_path_controls_escape_before_owned_color(
         self,

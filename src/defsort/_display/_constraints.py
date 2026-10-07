@@ -3,8 +3,8 @@
 import re
 from collections.abc import Collection, Iterable
 
-from defsort._display._terminal import escape_terminal_text
 from defsort._source import BANNER_RULE_CHARS, split_physical_lines
+from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import BannerConstraint
 
 _RULE_LABEL_PATTERN = re.compile(rf'([{re.escape(BANNER_RULE_CHARS)}])\1{{3,}}')
@@ -56,5 +56,5 @@ def format_banner_constraint_summary(
     if not count:
         return ''
     noun = 'banner' if count == 1 else 'banners'
-    safe_path = escape_terminal_text(path)
+    safe_path = escape_terminal_text(path_text(path))
     return f'defsort: {safe_path}: sort constrained by {count} {noun}'

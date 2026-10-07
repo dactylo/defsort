@@ -9,12 +9,12 @@ endif
 DEV_PYTHON := $(VENV_BIN)/python
 export PATH := $(abspath $(VENV_BIN)):$(PATH)
 export UV_SYSTEM_PYTHON := 0
-UV_VERSION := 0.12.13
+UV_VERSION := 0.12.23
 CI_BUILD_REQUIREMENTS = $(DEV_PYTHON) -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]))'
 CI_COMPILE = uv pip compile pyproject.toml - --universal --python-version $(CI_PYTHON) --no-python-downloads --no-sources --no-build --generate-hashes --no-annotate --custom-compile-command 'make lock-update'
 
 MARKDOWN_FILES := CHANGELOG.md README.md docs/cli.md docs/design.md docs/development.md docs/hook.md docs/incremental.md docs/library.md docs/platform.md
-PYTHON_FILES := src plugins tests _build.py conftest.py
+PYTHON_INPUTS := src plugins tests _build.py conftest.py
 PUBLIC_PATHS := ':(top,glob)*' ':(top,glob).*' ':(top,glob).agents/**' ':(top,glob).claude-plugin/**' ':(top,glob).github/**' ':(top,glob)docs/*.md' examples images plugins src tests
 
 .PHONY: all check dead-code-check env-check format format-check install lock-check lock-update manifest-check quality reinstall setup test type-check uv-check venv-check whitespace-check
@@ -46,15 +46,15 @@ reinstall:
 	uv tool install --reinstall .
 
 format: env-check
-	$(DEV_PYTHON) -m ruff format $(PYTHON_FILES)
-	$(DEV_PYTHON) -m ruff check --fix $(PYTHON_FILES)
+	$(DEV_PYTHON) -m ruff format $(PYTHON_INPUTS)
+	$(DEV_PYTHON) -m ruff check --fix $(PYTHON_INPUTS)
 	biome format --write .
 	$(DEV_PYTHON) -m mdformat $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt pyproject.toml
 
 format-check: env-check
-	$(DEV_PYTHON) -m ruff format --check $(PYTHON_FILES)
-	$(DEV_PYTHON) -m ruff check $(PYTHON_FILES)
+	$(DEV_PYTHON) -m ruff format --check $(PYTHON_INPUTS)
+	$(DEV_PYTHON) -m ruff check $(PYTHON_INPUTS)
 	biome format .
 	$(DEV_PYTHON) -m mdformat --check $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt --check pyproject.toml
@@ -73,6 +73,7 @@ lock-update: venv-check uv-check
 
 type-check: env-check
 	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonplatform Linux --pythonpath "$(DEV_PYTHON)"
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonversion 3.15 --pythonplatform Linux --pythonpath "$(DEV_PYTHON)"
 	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonplatform Darwin --pythonpath "$(DEV_PYTHON)"
 	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonplatform Windows --pythonpath "$(DEV_PYTHON)"
 
@@ -80,7 +81,7 @@ test: env-check
 	$(DEV_PYTHON) -m pytest -q $(TEST_FLAGS)
 
 dead-code-check: env-check
-	$(DEV_PYTHON) -m vulture $(PYTHON_FILES)
+	$(DEV_PYTHON) -m vulture $(PYTHON_INPUTS)
 
 manifest-check: env-check
 	$(DEV_PYTHON) -m pre_commit validate-manifest .pre-commit-hooks.yaml

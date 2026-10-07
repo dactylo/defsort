@@ -24,7 +24,6 @@ from defsort._git import (
     detect_renames,
     discover_repo_root,
     get_modified_tracked_py_files,
-    get_repo_root,
     get_staged_py_info,
     is_hook_enabled,
     is_null_hash,
@@ -36,7 +35,8 @@ from defsort._git import (
     resolve_sync_paths,
     try_get_repo_root,
 )
-from defsort._types import BlobReadStatus, PreCommitAdd
+from defsort._types import BlobReadStatus
+from defsort._vendor.hookshell._grammar import PreCommitAdd
 from tests._helpers import (
     _ENV,
     _init_empty_git_repo,
@@ -711,42 +711,6 @@ class TestGetModifiedTrackedPyFiles:
         assert 'test.py' in result
 
 
-class TestGetRepoRoot:
-    def test_fallback_on_non_repo(self, tmp_path: Path) -> None:
-        result = get_repo_root(str(tmp_path))
-        assert Path(result).resolve() == tmp_path.resolve()
-
-    def test_normalizes_msys_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sys, 'platform', 'win32')
-        mock_result = subprocess.CompletedProcess(args=[], returncode=0, stdout='/c/repo\n')
-
-        def mock_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            return mock_result
-
-        monkeypatch.setattr(subprocess, 'run', mock_run)
-        result = get_repo_root(str(tmp_path))
-        assert result == 'C:/repo'
-
-    def test_returns_repo_root(self, tmp_path: Path) -> None:
-        _init_git_repo(tmp_path, '# placeholder\n')
-        sub = tmp_path / 'sub'
-        sub.mkdir()
-        result = get_repo_root(str(sub))
-        # Use resolve() to handle macOS /tmp -> /private/tmp symlink
-        assert Path(result).resolve() == tmp_path.resolve()
-
-    def test_undecodable_repo_root_returns_none(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def fail_decode(command: list[str], *_args: object, **_kwargs: object) -> None:
-            assert command == ['git', 'rev-parse', '--show-toplevel']
-            raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
-
-        monkeypatch.setattr(subprocess, 'run', fail_decode)
-
-        assert try_get_repo_root(str(tmp_path)) is None
-
-
 class TestGetStagedPyInfo:
     def test_filters_non_py_files(self, tmp_path: Path) -> None:
         _init_git_repo(tmp_path, '# placeholder\n')
@@ -1271,7 +1235,6 @@ class TestReadBaselineBlobs:
         assert result['test.py'].content == 'def foo():\n    pass\n'
 
     def test_skips_new_files(self, tmp_path: Path) -> None:
-        _init_git_repo(tmp_path, '# placeholder\n')
         null_hash = '0' * 40
         info = [_StagedFileInfo('new.py', '100644', 'some_hash', null_hash, 'A')]
         result = read_baseline_blobs(str(tmp_path), info)
@@ -1394,7 +1357,6 @@ class TestReadPathspecFile:
 
 class TestReadStagedBlobs:
     def test_empty_list_returns_empty(self, tmp_path: Path) -> None:
-        _init_git_repo(tmp_path, '# placeholder\n')
         result = read_staged_blobs(str(tmp_path), [])
         assert result is not None
         assert result == {}
@@ -1835,6 +1797,37 @@ class TestResolveSyncPathspecs:
         )
         assert resolve_sync_paths(adds, _discovered_root(tmp_path)) == expected
 
+    def test_other_repository_same_name_is_not_safe_to_sync(self, tmp_path: Path) -> None:
+        current_repo = tmp_path / 'current'
+        other_repo = tmp_path / 'other'
+        current_repo.mkdir()
+        other_repo.mkdir()
+        self._repo(current_repo)
+        self._repo(other_repo)
+        (current_repo / 'same.py').write_text('current = 1\n')
+        (other_repo / 'same.py').write_text('other = 1\n')
+        run_setup(['git', '-C', str(current_repo), 'add', 'same.py'])
+        run_setup(['git', '-C', str(other_repo), 'add', 'same.py'])
+        adds = (
+            PreCommitAdd(
+                tokens=('git', '-C', str(other_repo), 'add', 'same.py'),
+                exec_cwd=str(current_repo),
+                git_cwd=str(other_repo),
+            ),
+        )
+
+        assert 'same.py' not in resolve_sync_paths(adds, _discovered_root(current_repo))
+
+    @pytest.mark.parametrize('selector', ['-u', '--update', '-A', '--all'])
+    def test_selector_with_pathspec_limits_sync(self, tmp_path: Path, selector: str) -> None:
+        self._repo(tmp_path)
+        add = PreCommitAdd(
+            tokens=('git', 'add', selector, 'sub/'),
+            exec_cwd=str(tmp_path),
+            git_cwd=str(tmp_path),
+        )
+        assert resolve_sync_paths((add,), _discovered_root(tmp_path)) == frozenset({'sub/deep.py'})
+
     @pytest.mark.parametrize('path', ['-x.py', '-A', '--pathspec-from-file'])
     def test_dash_leading_pathspec_after_double_dash(self, tmp_path: Path, path: str) -> None:
         self._repo(tmp_path)
@@ -1866,27 +1859,6 @@ class TestResolveSyncPathspecs:
         assert resolve_sync_paths(adds, _discovered_root(tmp_path)) == frozenset(
             {'top.py', 'sub/deep.py'}
         )
-
-    def test_other_repository_same_name_is_not_safe_to_sync(self, tmp_path: Path) -> None:
-        current_repo = tmp_path / 'current'
-        other_repo = tmp_path / 'other'
-        current_repo.mkdir()
-        other_repo.mkdir()
-        self._repo(current_repo)
-        self._repo(other_repo)
-        (current_repo / 'same.py').write_text('current = 1\n')
-        (other_repo / 'same.py').write_text('other = 1\n')
-        run_setup(['git', '-C', str(current_repo), 'add', 'same.py'])
-        run_setup(['git', '-C', str(other_repo), 'add', 'same.py'])
-        adds = (
-            PreCommitAdd(
-                tokens=('git', '-C', str(other_repo), 'add', 'same.py'),
-                exec_cwd=str(current_repo),
-                git_cwd=str(other_repo),
-            ),
-        )
-
-        assert 'same.py' not in resolve_sync_paths(adds, _discovered_root(current_repo))
 
     def test_wildcard_pathspec_resolves_through_git(self, tmp_path: Path) -> None:
         self._repo(tmp_path)
@@ -1985,15 +1957,46 @@ class TestSurrogatePathProtocols:
 
 
 class TestTryGetRepoRoot:
-    def test_returns_none_outside_repo(self, tmp_path: Path) -> None:
+    def test_non_repo_returns_none(self, tmp_path: Path) -> None:
         result = try_get_repo_root(str(tmp_path))
         assert result is None
+
+    def test_normalizes_msys_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sys, 'platform', 'win32')
+        mock_result = subprocess.CompletedProcess(args=[], returncode=0, stdout='/c/repo\n')
+
+        def mock_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return mock_result
+
+        monkeypatch.setattr(subprocess, 'run', mock_run)
+        result = try_get_repo_root(str(tmp_path))
+        assert result == 'C:/repo'
+
+    def test_returns_repo_root(self, tmp_path: Path) -> None:
+        _init_git_repo(tmp_path, '# placeholder\n')
+        sub = tmp_path / 'sub'
+        sub.mkdir()
+        result = try_get_repo_root(str(sub))
+        # Use resolve() to handle macOS /tmp -> /private/tmp symlink
+        assert result is not None
+        assert Path(result).resolve() == tmp_path.resolve()
 
     def test_returns_root_in_git_repo(self, tmp_path: Path) -> None:
         _init_empty_git_repo(tmp_path)
         result = try_get_repo_root(str(tmp_path))
         assert result is not None
         assert Path(result) == tmp_path
+
+    def test_undecodable_repo_root_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail_decode(command: list[str], *_args: object, **_kwargs: object) -> None:
+            assert command == ['git', 'rev-parse', '--show-toplevel']
+            raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
+
+        monkeypatch.setattr(subprocess, 'run', fail_decode)
+
+        assert try_get_repo_root(str(tmp_path)) is None
 
 
 def _cat_file_request(key: str, object_name: bytes | None = None) -> _CatFileRequest:

@@ -63,7 +63,7 @@ redundantly re-process them at commit time.
 ### Plugin packages
 
 Use this checkout as the marketplace source. The native plugin directories register host hook
-configuration, so install the defsort distribution first and confirm that `defsort` is on `PATH`.
+configuration, so install the `defsort` distribution first and confirm that `defsort` is on `PATH`.
 That one distribution includes every bundled adapter runtime; no host-specific Python package or
 second adapter installation is required.
 
@@ -247,8 +247,8 @@ edit tools are `write_to_file` and `replace_file_content`.
 }
 ```
 
-Antigravity PostToolUse should be treated as edit-time normalization and failure reporting, not as
-a dependable block, until local verification shows `decision: "deny"` blocks or surfaces reliably.
+Antigravity PostToolUse normalizes edits and reports failures; it never blocks. Whether Antigravity
+surfaces that feedback reliably requires local verification.
 
 ### Per-repo enable/disable
 
@@ -323,7 +323,7 @@ outcomes still report the constraint. Other banner modes and unconstrained files
 Full and incremental hook sorting never add `from __future__ import annotations`. They preserve the
 import in every annotated module and remove it only when the module has no annotated assignment and
 no function or async-function parameter or return annotation at any depth. A covered annotation
-hazard without an existing import is reported as `FORWARD_REFS` before any write.
+hazard without an existing import is reported as `forward_refs` before any write.
 
 ## Agent selection
 
@@ -341,11 +341,8 @@ cannot change a decision.
   `replace_file_content` supply the edited path.
 - Any other event or tool is nothing defsort acts on: silent exit 0.
 
-An unknown host, a host registered twice, an adapter that fails to import or reports a different
-`defsort.hooks.API_VERSION`, a missing or unexpected `--event`, an adapter that raises while
-parsing, or an adapter whose `render` and `render_failure` both raise is the last resort: one
-`defsort:` line on stderr, nothing on stdout, exit 2. See Agent adapters below for what exit 2
-means on each host.
+Adapter failures and mismatched `--event` values use the [last resort](#exit-codes). See
+[Agent adapters](#agent-adapters) for how hosts handle exit 2.
 
 ### Adding a bundled agent
 
@@ -369,15 +366,15 @@ separate Python distribution.
 Every pre-tool shell command receives exactly one of three outcomes:
 
 1. **Unrelated.** No commit invocation is detected. Silent allow, no repository work.
-2. **Supported commit.** The complete command belongs to the closed grammar below. Defsort sorts
+2. **Supported commit.** The complete command belongs to the closed grammar below. defsort sorts
    the content the commit will consume, then allows. A grammar-accepted command that is proven not
    to commit, a status-only commit or a literal route whose target does not exist, allows with no
    repository work.
 3. **Unsupported commit.** A commit invocation is detected and the command is outside the grammar.
-   Defsort denies before any repository discovery, add replay, index read, index write, or
+   defsort denies before any repository discovery, add replay, index read, index write, or
    working-tree write, with a reason that names the first unsupported element and the nearest
    accepted form, for example
-   `defsort: unsupported commit command: segment 'git push'; supported form: [cd DIR &&] [git add ...;] git commit ...; run checks in an earlier tool call`.
+   `defsort: unsupported commit command: segment 'git push'; supported form: [cd DIR &&] [git add ...;] git commit ...`.
 
 An accepted committing shape whose execution directory is unknown and whose route is absent or
 relative is an unsupported commit. That denial runs before hook enablement, configuration reads,
@@ -412,7 +409,8 @@ When processing proceeds:
 5. Sorts definitions in each file.
 6. Writes results back to the index or working tree (depending on mode).
 7. Syncs working-tree copies when appropriate.
-8. Exits 0 with no output after a successful rewrite. The provider's normal permission prompt and
+8. Exits 0 after a successful rewrite. Working-tree rewrites are silent; staged-index rewrites
+   return an [allow receipt](#command-detection). The provider's normal permission prompt and
    allowlist evaluation still apply. Safety skips emit informational `defsort:` lines on stderr.
 
 ### Command detection
@@ -438,21 +436,26 @@ The grammar accepts this sequence, where `SEP` is `&&`, `;`, or a line feed:
   messages, `-C` routes, and add operands, even when quoted. Native Windows spelling such as
   `C:/repo` is outside this exclusion; the other grammar rules still apply. The hook does not
   reproduce Git Bash's native argument conversion for replay.
-- Run checks such as `git diff --check` in an earlier tool call and wait for success before
-  submitting `git add sample.py && git commit -m 'fix: update sample'` in another call. Read-only
-  segments before an actual commit are rejected, including checks after `git add`, so the hook
-  cannot sort or stage files before the check runs. Standalone read-only commands pass through
-  without sorting.
-- For status-only commits (such as `git commit --dry-run`), read-only segments may precede them
-  with no pathspecs or positional arguments and only these options: `status` accepts `--short`,
-  `--porcelain`, `--porcelain=v1`, `--branch`, and `--untracked-files=all`; `diff` accepts
-  `--cached`, `--check`, `--stat`, `--name-only`, and `--name-status`; `log` accepts `--oneline`,
-  `--stat`, `--format=LITERAL`, `-N`, and `-n N`. `--output` and `--no-index` are excluded because
-  a later add could stage what they produce.
+- Standalone `git status`, `git diff`, and `git log` segments before a real commit are denied,
+  whether they precede or follow an optional add: hook staging and sorting would run before those
+  observations and could change their results. The denial names the overtaken command, such as
+  `read-only git diff before git commit`. Run the check or observation in a separate tool call,
+  then submit the add/commit command only after success. For a check after staging, run the add and
+  check without a real commit, then submit the commit separately. Standalone read-only commands
+  pass through without sorting.
+- For proven no-commit forms, such as status-only `git commit --dry-run` or a literal route whose
+  target does not exist, read-only segments may precede the final commit. These segments take no
+  pathspecs or positional arguments. `status` accepts `-s`, `-b`, any nonempty short-option cluster
+  containing only `s` and `b`, `--short`, `--porcelain`, `--porcelain=v1`, `--branch`, and
+  `--untracked-files=all`; `diff` accepts `--cached`, `--staged`, `--check`, `--stat`,
+  `--name-only`, and `--name-status`; `log` accepts `--oneline`, `--stat`, `--format=LITERAL`,
+  `-N`, and `-n N`. `--output` and `--no-index` are excluded because a later add could stage what
+  they produce.
 - At most one `git add [--] PATHSPEC...` or
   `git add (-A | --all | -u | --update) [--] [PATHSPEC...]`.
 - Exactly one final `git commit`. Its first word may be `GIT_COMMITTER_DATE=VALUE` with an unquoted
-  name, where `VALUE` is literal text in any quoting or exactly `"$(git log -1 --format=%aI)"`.
+  name, where `VALUE` is literal text in any quoting or the substitution
+  `$(git log -1 --format=%aI)` with or without double quotes.
 - The `-m` or `--message` value may be the heredoc message idiom, at most once:
 
 ```text
@@ -464,8 +467,10 @@ EOF
 )"
 ```
 
-The double quotes and the quoted `EOF` delimiter are part of the idiom. An unquoted `$(cat ...)` is
-word-split by the shell and could add selection options to Git's argv, so it is unsupported.
+The outer double quotes and a quoted heredoc delimiter are part of the idiom. The delimiter name is
+arbitrary: after quote removal it must exactly match the closing line; `EOF` is only a familiar
+example. An unquoted delimiter is unsupported because it could expand shell syntax in the body. An
+unquoted `$(cat ...)` is also unsupported because the shell word-splits it.
 
 The commit option inventory is closed. Selection options: `-a`, `--all`, `--no-all`, `-i`,
 `--include`, `--no-include`, `-o`, `--only`, `--no-only`, `--`, `--pathspec-from-file FILE`,
@@ -502,6 +507,13 @@ and is always classified by the detector. Only the bare spelling `git` can be ac
 path-qualified or `.exe` spelling denies with the element `executable '<spelling>'` and the hint
 `use the bare executable name git; PATH resolves the installed git`.
 
+One heredoc is treated as data rather than scanned when the whole command is a single segment whose
+command is plain `cat` or `tee` writing a quoted heredoc to a file: `cat > FILE`, `cat >> FILE`,
+`tee FILE`, or `tee -a FILE`, including `<<-`. Its body remains scanned if the command has a pipe,
+process substitution, descriptor duplication, another input redirection, a wrapper such as `sudo`,
+an assignment prefix, a path-qualified `cat`, an unquoted delimiter, or any command chained before
+or after it.
+
 Listed shells and interpreters are recognized by basename, ignoring letter case, using either `/`
 or `\` as path separators, and allowing a trailing `.exe`. For example, `bash.exe` and
 `C:\tools\BASH.EXE` receive the same detector checks as `bash`. These spellings do not make a
@@ -533,8 +545,8 @@ sh -c 'git commit -m "message"'
 ```
 
 Commands where commit text is only data to another program, such as `grep 'git commit' file` or
-`python -c "print('git commit')"`, are unrelated and allowed. A wrapper script that commits without
-commit text in the outer command is outside the guarantee.
+`echo "git commit"`, are unrelated and allowed. A wrapper script that commits without commit text
+in the outer command is outside the guarantee.
 
 ### Cross-repo commands
 
@@ -635,13 +647,14 @@ permission rules. A sequencer has its own response contract; see
 | Failure, `allow-on-failure`               | Warning on stderr, exit 0                         | Warning on stderr, exit 0                         | Warning on stderr, exit 0                                        |
 | PostToolUse diagnostic                    | `additionalContext`, exit 0; notes also on stderr | `additionalContext`, exit 0; notes also on stderr | Existing stderr / `systemMessage`, exit 0; visibility unverified |
 | Last resort (no functioning adapter)      | One line on stderr, exit 2: blocks                | One line on stderr, exit 2: blocks                | One line on stderr, exit 2: does not block                       |
+| Standard output closed at start           | One line on stderr, exit 2: blocks                | One line on stderr, exit 2: blocks                | One line on stderr, exit 2: does not block                       |
 
 Opting out with `git config defsort.hook false` disables sorting and its mutations for supported
 commits in that repository. It does not suppress the deny outcome for unsupported commands, which
 are denied before any repository is consulted.
 
 A successful hook rewrite can remain in the index or working tree if the provider later rejects the
-commit. Defsort cannot observe that later permission decision. For compound commands such as
+commit. defsort cannot observe that later permission decision. For compound commands such as
 `git add file.py && git commit`, the hook replays the parsed `git add` before sorting. Replayed
 content therefore remains staged if either the provider or defsort's own later safety decision
 denies the commit. A broad replay such as `git add -A` or `git add .` can also stage unrelated
@@ -684,6 +697,9 @@ After updating the index (normal commits), the hook syncs the working tree to ke
   untouched, preserving partial staging.
 - **Compound commands** (`git add && git commit`): files in the `git add` arguments are always
   synced regardless of unstaged changes, so the subsequent `git add` stages the sorted content.
+- **Sync failure**: if the working-tree copy cannot be read, re-sorted, or written, the commit
+  proceeds with the sorted index and stderr notes `defsort: cannot sync NAME` or
+  `defsort: cannot write NAME`, followed by `; worktree copy left unsorted`.
 
 ### Blocked sort
 
@@ -706,7 +722,7 @@ that prevents an actual candidate remains authoritative; once actual top-level a
 candidates exist, eager order precedes forward annotation refs across both scopes.
 
 With `evaluation-order = preserve`, eager top-level and method groups retain their relative source
-order after ordinary ordering. `allow-reordering` removes only that pin. `EAGER_ORDER` still blocks
+order after ordinary ordering. `allow-reordering` removes only that pin. `eager_order` still blocks
 a candidate that changes the binding seen by a covered decorator, default value, base class, class
 keyword, or class-suite read. A future import cannot repair it.
 
@@ -814,26 +830,21 @@ If the file is already in order, the hook exits 0 silently.
 ## Composing with other hooks
 
 Agent runtimes may run matching hooks concurrently. When two formatters modify the same files,
-register one sequencer command and make each formatter an ordered step. For Codex, use this command
-with the manual setup's event and matcher:
-
-```bash
-sequential-hooks --agent codex --step-timeout 30 defsort hook --agent codex -- docwrap hook --agent codex
-```
-
-For Claude Code, use `claude` in all three agent selections. Each process needs its own `--agent`;
-children do not inherit the sequencer's selection. Remove their separate standalone registrations
-so the same formatters do not also run concurrently.
+register one sequencing hook for the event and matcher and make each formatter an ordered step.
+Each step runs its own formatter command with its own agent selection, for example
+`defsort hook --agent codex` under Codex or `defsort hook --agent claude` under Claude Code; steps
+do not inherit the sequencer's selection. Remove the formatters' separate standalone registrations
+so they do not also run concurrently.
 
 The sequencer must honor a formatter's deny JSON even though that response exits 0. Exit 2 without
 stdout is a separate adapter failure. A later hook failure cannot roll back source or index changes
 already made by defsort.
 
-**Antigravity limitation:** The current sequential-hooks Antigravity adapter rejects the
-`systemMessage` receipt emitted by defsort and docwrap after staged rewrites. It stops with a deny
-by default. Do not use these formatters as Antigravity sequencer children until their response
-contracts are compatible. Registering both standalone formatters is not a serialization workaround;
-they can still run concurrently.
+**Antigravity limitation:** After a staged rewrite, defsort's Antigravity response carries a
+`systemMessage` receipt. A sequencer whose Antigravity adapter rejects that field stops with a
+deny. Do not run defsort as an Antigravity sequencer step until the sequencer accepts its response.
+Registering several standalone formatters is not a serialization workaround; they can still run
+concurrently.
 
 ## pre-commit
 
@@ -862,16 +873,31 @@ not agent-hook response JSON.
 
 ## Exit codes
 
-| Code | Meaning                                                            |
-| ---- | ------------------------------------------------------------------ |
-| 0    | Every rendered response: allow, deny, warning, PostToolUse         |
-| 2    | Last resort: no functioning host adapter, one diagnostic on stderr |
+| Code | Meaning                                                             |
+| ---- | ------------------------------------------------------------------- |
+| 0    | Every rendered response: allow, deny, warning, PostToolUse          |
+| 2    | Hook usage error or last resort; stderr only, no host response JSON |
 
 A deny is carried by the host's JSON on stdout, not by the exit status. Exit 2 blocks on Claude
-Code and Codex, which document exit 2 as blocking; Antigravity has no exit-code tier, so the last
-resort does not block there. When defsort runs under a wrapper, the wrapper's own host adapter
-decides what a child's nonzero exit means; that protection is the wrapper's contract, not
-defsort's.
+Code and Codex, which document exit 2 as blocking; Antigravity has no exit-code tier, so exit 2
+does not block there. When defsort runs under a wrapper, the wrapper's own host adapter decides
+what a child's nonzero exit means; that protection is the wrapper's contract, not defsort's.
+
+Hook usage errors, such as a missing `--agent`, an unknown flag, or an invalid explicit
+`--banner-pattern`, print argparse usage on stderr and exit 2 before loading an adapter. Check the
+registered hook command. The last resort also exits 2 with no host response JSON when:
+
+- stdout is already closed at start;
+- the selected adapter is unknown, registered twice, fails to import, or reports a different
+  `defsort.hooks.API_VERSION`;
+- `--event` is missing when required or supplied when unsupported;
+- the adapter raises while parsing or supplies an invalid event, command, `command_cwd`, or
+  post-tool path data; or
+- both `render` and `render_failure` raise.
+
+The last resort writes one diagnostic line to stderr. When stdout is already closed, that line is
+`error: standard output is unavailable`; defsort exits before reading the payload or loading an
+adapter. Nothing is sorted, and `--allow-on-failure` does not apply.
 
 ## Error handling
 
@@ -890,7 +916,7 @@ defsort's.
 
 ## Agent adapters
 
-Defsort reaches each host through an adapter that implements the public `defsort.hooks` contract
+defsort reaches each host through an adapter that implements the public `defsort.hooks` contract
 (see the [library reference](library.md)). Adapters are discovered through the
 `defsort.hook_adapters` entry-point group; the built-in `claude`, `codex`, and `agy` adapters are
 registered in that group like any other. An adapter translates: it turns the host payload into
@@ -915,7 +941,7 @@ myhost = "defsort_host_myhost.adapter:MyHostAdapter"
 
 Install the adapter package in the same Python environment as defsort, then register
 `defsort hook --agent myhost`. A host whose payload carries no event name sets `requires_event` and
-receives `--event`. Defsort refuses an adapter whose `api_version` differs from its own and a name
+receives `--event`. defsort refuses an adapter whose `api_version` differs from its own and a name
 registered by two distributions.
 
 Failure tiers:
@@ -923,11 +949,9 @@ Failure tiers:
 1. Every deny, including safety blockers and infrastructure failures under fail-closed
    configuration, is rendered by the selected adapter's `render` or `render_failure`. The adapter
    encodes the host's real enforcement protocol; the core never chooses an exit code.
-2. When no functioning adapter exists (unknown or duplicate name, import failure, wrong
-   `api_version`, `parse` raising, or both `render` and `render_failure` raising), defsort writes
-   one diagnostic line to stderr and exits 2 with nothing on stdout. Exit 2 blocks on Claude Code
-   and Codex and does not block on Antigravity. Defsort cannot protect a chain from the failure of
-   its own adapter.
+2. [Usage errors and last-resort failures](#exit-codes) exit 2 before a host response can be
+   rendered. Exit 2 blocks on Claude Code and Codex and does not block on Antigravity. defsort
+   cannot protect a chain from the failure of its own adapter.
 
 ## Differences from the CLI
 

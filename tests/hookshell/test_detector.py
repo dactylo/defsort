@@ -1,31 +1,110 @@
-import json
-import sys
-from time import perf_counter
-from unittest.mock import patch
-
 import pytest
 
-import defsort._detector as detector
-from defsort._detector import _tokens_commit, detect_commit, is_git_executable
-from defsort._shellparse import Command, parse_command
-from tests._helpers import (
-    _ENV,
-    DETECTOR_REGRESSION_TIMEOUT_SECONDS,
-    decode_text,
-    process_transcript,
-    run_setup,
+from defsort._vendor.hookshell import (
+    _detector,
+)
+from defsort._vendor.hookshell._detector import (
+    _tokens_commit,
+    detect_commit,
+    is_git_executable,
+)
+from defsort._vendor.hookshell._shellparse import (
+    Command,
+    parse_command,
 )
 
 
+class TestDataSinkRule:
+    @pytest.mark.parametrize(
+        'text',
+        [
+            "cat > notes.md <<'EOF'\ngit log then commit\nEOF\n",
+            "cat >> notes.md <<'EOF'\ngit commit -m x\nEOF\n",
+            "cat <<'EOF' > notes.md\ngit commit -m x\nEOF\n",
+            "cat <<-'EOF' > notes.md\n\tgit commit -m x\n\tEOF\n",
+            "tee notes.md <<'EOF'\ngit commit -m x\nEOF\n",
+            "tee -a notes.md <<'EOF'\ngit commit -m x\nEOF\n",
+        ],
+    )
+    def test_quoted_heredoc_written_to_a_file_is_data(self, text: str) -> None:
+        assert not _detected(text)
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            "cat <<'EOF'\ngit commit -m x\nEOF\n",
+            "cat > a.md <<'EOF' && echo done\ngit commit -m x\nEOF\n",
+            "cat > s.sh <<'EOF' && sh s.sh\ngit commit -m x\nEOF\n",
+            "cat > s.sh <<'EOF'\ngit commit -m x\nEOF\nsh s.sh\n",
+            'eval "$(tee s.sh <<\'EOF\'\ngit commit -m x\nEOF\n)"\n',
+            "cat > f <<'EOF' | sh\ngit commit -m x\nEOF\n",
+            "tee f <<'EOF' | sh\ngit commit -m x\nEOF\n",
+            "tee f <<'EOF' |& sh\ngit commit -m x\nEOF\n",
+            "cat <<'EOF' > >(sh)\ngit commit -m x\nEOF\n",
+            "tee >(sh) <<'EOF'\ngit commit -m x\nEOF\n",
+            "cat <<'EOF' >&2\ngit commit -m x\nEOF\n",
+            "tee <<'EOF'\ngit commit -m x\nEOF\n",
+            "tee -a <<'EOF'\ngit commit -m x\nEOF\n",
+            "sudo tee f <<'EOF'\ngit commit -m x\nEOF\n",
+            "FOO=1 cat > f <<'EOF'\ngit commit -m x\nEOF\n",
+            "/bin/cat > f <<'EOF'\ngit commit -m x\nEOF\n",
+            "cat > f < in <<'EOF'\ngit commit -m x\nEOF\n",
+            'cat > f <<EOF\n$(git commit -m x)\nEOF\n',
+        ],
+    )
+    def test_consumed_or_unquoted_heredocs_are_scanned(self, text: str) -> None:
+        assert _detected(text)
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'cat > "$(git commit -m x)" <<\'EOF\'\nbody\nEOF\n',
+            "cat > f <<'EOF' && git commit -m x\nbody\nEOF\n",
+        ],
+    )
+    def test_sink_words_and_later_segments_are_still_scanned(self, text: str) -> None:
+        assert _detected(text)
+
+
 class TestHeredocRules:
+    def test_evaluator_recovered_heredoc_retains_token_scan(self) -> None:
+        assert _detected("eval \"cat <<MISSING\nsubprocess.run(['git','commit'])\n\"")
+
     def test_expansion_scan_ignores_quotes_in_an_unquoted_body(self) -> None:
         assert _detected("cat <<EOF\n'$(git commit -m x)'\nEOF")
 
     def test_heredoc_without_commit(self) -> None:
         assert not _detected("cat <<'EOF'\nplain text about commits\nEOF")
 
+    def test_long_unmatched_heredoc_chain_is_detected(self) -> None:
+        command = parse_command(
+            "python - <<'PY'\n" + 'value = 1 << 2\n' * 2000 + "$GIT com''mit\nPY\n"
+        )
+        assert detect_commit(command)
+
     def test_nested_heredoc_scans_quoted_fragments(self) -> None:
         assert _detected('cat <<\'OUTER\'\nsh <<\'INNER\'\ng""it com""mit -m x\nINNER\nOUTER\n')
+
+    @pytest.mark.parametrize(
+        'body',
+        [
+            "cat <<MISSING\n$GIT com''mit\n",
+            "cat <<'MISSING'\n$GIT com''mit\n",
+            "cat <<-MISSING\n\t$GIT com''mit\n",
+            'cat <<-MISSING\n$GIT com\\\n\tmit\n',
+            "cat <<FIRST\ncat <<-SECOND\n'$( $GIT com\\\n\tmit )'\n",
+            "cat <<MISSING; true\n$GIT com''mit\n",
+            "cat <<MISSING <<OTHER\n$GIT com''mit\n",
+            'cat <<MISSING\n\'$( $GIT com""mit )\'\n',
+            "cat <<'FIRST'\ncat <<SECOND\n'$( $GIT com\"\"mit )'\n",
+            'cat <<MISSING\npython -c \'os.system("git commit")\'\n',
+            'cat <<MISSING\nsh -c \'$GIT com""mit\'\n',
+            "cat <<MISSING\nsubprocess.run(['git','commit'])\n",
+            "cat <<'INNER'\n$GIT com''mit\nINNER\n",
+        ],
+    )
+    def test_nested_script_detection_survives_heredoc_recovery(self, body: str) -> None:
+        assert _detected(f"cat <<'OUTER'\n{body}OUTER\n")
 
     def test_prose_about_commits_in_a_heredoc_body(self) -> None:
         assert not _detected("cat <<'EOF'\nplain text about commits and git history\nEOF")
@@ -33,6 +112,33 @@ class TestHeredocRules:
     def test_script_scan_applies_to_every_delimiter(self) -> None:
         assert _detected("sh <<'EOF'\ngit commit -m x\nEOF")
         assert _detected("cat <<'EOF'\n$(git commit -m x)\nEOF")
+
+    @pytest.mark.parametrize(
+        ('prefix', 'delimiter'),
+        [("python - <<'PY'\n", 'PY'), ("cat <<'CPP'\n", 'CPP')],
+    )
+    @pytest.mark.parametrize('suffix', ['', "$GIT com''mit\n"])
+    @pytest.mark.parametrize('operand', ['"hello"', '""'])
+    def test_shift_operators_do_not_reparse_successive_body_suffixes(
+        self,
+        prefix: str,
+        delimiter: str,
+        suffix: str,
+        operand: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        body = f'std::cout << {operand};\n' * 400 + suffix
+        command = parse_command(f'{prefix}{body}{delimiter}\n')
+        parsed_characters = 0
+
+        def counted_parse(text: str, **kwargs: bool) -> Command:
+            nonlocal parsed_characters
+            parsed_characters += len(text)
+            assert parsed_characters <= 2 * len(body), 'reparsed overlapping heredoc suffixes'
+            return parse_command(text, **kwargs)
+
+        monkeypatch.setattr(_detector, 'parse_command', counted_parse)
+        assert detect_commit(command) is bool(suffix)
 
     def test_subprocess_commit_in_a_heredoc_body(self) -> None:
         body = (
@@ -245,6 +351,24 @@ class TestSubstitutionRule:
 
 
 class TestEvaluatorRule:
+    @pytest.mark.parametrize('suffix', ['', '; git commit --interactive'])
+    def test_eval_chain_reparses_only_distinct_suffixes(
+        self, suffix: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        command = parse_command('eval ' * 24 + 'true' + suffix)
+        reparsed: list[str] = []
+
+        def counted_parse(text: str, **kwargs: bool) -> Command:
+            assert text not in reparsed, 'repeated evaluator script parse'
+            reparsed.append(text)
+            return parse_command(text, **kwargs)
+
+        monkeypatch.setattr(_detector, 'parse_command', counted_parse)
+        for _ in range(2):
+            reparsed.clear()
+            assert detect_commit(command) is bool(suffix)
+            assert len(reparsed) == 24
+
     @pytest.mark.parametrize(
         'text',
         [
@@ -287,6 +411,29 @@ class TestEvaluatorRule:
         assert not _detected(text)
 
 
+class TestEvaluatorSpellings:
+    @pytest.mark.parametrize(
+        'name', ['bash', 'dash', 'ksh', 'sh', 'zsh', 'node', 'perl', 'ruby', 'python3.14']
+    )
+    @pytest.mark.parametrize(
+        'spelling', ['{name}', '{name}.exe', '/usr/bin/{name}', 'C:\\tools\\{name}.EXE']
+    )
+    def test_listed_evaluators_match_path_case_and_exe_variants(
+        self, name: str, spelling: str
+    ) -> None:
+        executable = spelling.format(name=name.upper())
+        option = '-e' if name in {'node', 'perl', 'ruby'} else '-c'
+        assert _detected(f"'{executable}' {option} 'git commit -m x'")
+
+    @pytest.mark.parametrize('name', ['bash.exe', 'perl.exe', 'C:\\tools\\SH.EXE'])
+    def test_listed_evaluator_without_commit_is_not_detected(self, name: str) -> None:
+        assert not _detected(f"'{name}' -c 'git status'")
+
+    @pytest.mark.parametrize('name', ['bash.exe.bak', 'mybash.exe', 'perl.exe.bak', 'myperl.exe'])
+    def test_unlisted_executables_are_not_evaluators(self, name: str) -> None:
+        assert not _detected(f"'{name}' -c 'git commit'")
+
+
 class TestRecoveryRule:
     @pytest.mark.parametrize(
         'text',
@@ -303,44 +450,3 @@ class TestRecoveryRule:
 
 def _detected(text: str) -> bool:
     return detect_commit(parse_command(text))
-
-
-def _measure_repeated_evaluators() -> None:
-    count, has_commit = json.loads(sys.stdin.read())
-    tail = '\'g""it com""mit -m x\'' if has_commit else 'true'
-    command = parse_command('eval ' * count + tail)
-    calls = 0
-
-    def counted_parse(text: str) -> Command:
-        nonlocal calls
-        calls += 1
-        return parse_command(text)
-
-    start = perf_counter()
-    with patch.object(detector, 'parse_command', counted_parse):
-        detected = detect_commit(command)
-    print(json.dumps({'detected': detected, 'calls': calls, 'seconds': perf_counter() - start}))
-
-
-@pytest.mark.parametrize('count', [16, 32, 64])
-@pytest.mark.parametrize('has_commit', [False, True])
-def test_repeated_evaluators_have_bounded_parse_work(count: int, *, has_commit: bool) -> None:
-    result = run_setup(
-        [
-            sys.executable,
-            '-c',
-            (
-                f'from tests.test_detector import {_measure_repeated_evaluators.__name__} '
-                'as measure; measure()'
-            ),
-        ],
-        stdin=json.dumps([count, has_commit]).encode('utf-8'),
-        env=_ENV,
-        timeout=DETECTOR_REGRESSION_TIMEOUT_SECONDS,
-        check=False,
-    )
-    assert result.returncode == 0, process_transcript(result)
-    measurements = json.loads(decode_text(result.stdout))
-    assert measurements['detected'] is has_commit
-    assert measurements['calls'] <= 4 * (count + 1) ** 2
-    print(f'{count=}, {has_commit=}: {measurements}')

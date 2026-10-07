@@ -1,3 +1,8 @@
+from pathlib import PureWindowsPath
+
+import pytest
+
+from defsort import _terminal
 from defsort._color import BOLD, RED, YELLOW
 from defsort._display._summary import build_summary_row, format_summary_rows
 from defsort._display._width import display_width
@@ -617,3 +622,11 @@ def _summary_result(*, changed: bool) -> SortResult:
         warning=None,
         blocking_code=[],
     )
+
+
+def test_windows_summary_normalizes_only_display(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_terminal, 'PurePath', PureWindowsPath)
+    row = build_summary_row(r'C:\repo\file.py', _summary_result(changed=True))
+    output = format_summary_rows([row], verbose=False, color=False)
+    assert 'C:/repo/file.py' in output
+    assert row.path == r'C:\repo\file.py'

@@ -146,7 +146,7 @@ Discovery walks upward to the git repository root and includes that root in the 
 defaults instead of inheriting from a more distant file.
 
 For invalid, unreadable, or unknown file content, defsort emits `DefsortConfigWarning` and uses the
-applicable default. Defsort does not explicitly raise these diagnostics; a caller's warning filters
+applicable default. defsort does not explicitly raise these diagnostics; a caller's warning filters
 can promote them to exceptions.
 
 Results are cached per resolved directory for the process lifetime. A long-running embedder must
@@ -188,8 +188,10 @@ ending. `sort()`, `check()`, `detect()`, and `DefsortConfig` all accept the same
 
 For example, `^# Section: .+$` is supported. Grouping, alternation, lookaround, counted repetition,
 `?`, backreferences, misplaced anchors, unattached repetition, and multiple repetitions are
-rejected. A pattern that does not compile raises `ValueError` and chains the original `re.error`. A
-pattern that compiles but uses unsupported syntax raises `ValueError` without an `re.error` cause.
+rejected. A literal `{` or `}` must be written as `\{` or `\}`, or placed inside a character class,
+even though `re` alone would read a lone brace literally. A pattern that does not compile raises
+`ValueError` and chains the original `re.error`. A pattern that compiles but uses unsupported
+syntax raises `ValueError` without an `re.error` cause.
 
 ## `defsort.DefsortConfig`
 

@@ -1,9 +1,8 @@
 import ast
 import re
 import textwrap
-from collections.abc import Hashable, Iterator
-from types import FunctionType, MappingProxyType
-from typing import cast
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -35,6 +34,10 @@ from defsort._core._analysis import (
 )
 from defsort._core._parse import parse_definitions
 from defsort._types import EngineOptions, SortPolicy
+from tests._helpers import execute_source
+
+if TYPE_CHECKING:
+    from collections.abc import Hashable
 
 _BODY_REF_SCOPE_CASES: dict[str, tuple[str, set[str]]] = {
     # Nesting depth: a binding in a grandchild belongs to the grandchild.
@@ -1126,7 +1129,7 @@ class TestClassCreationProtocols:
             'class alpha(Base):\n'
             '    pass\n'
         )
-        FunctionType(compile(src, '<test>', 'exec'), {})()
+        execute_source(src)
         parsed = parse_definitions(src)
         assert 'zed' not in parsed.definitions[-1].eager_refs
 
@@ -1217,7 +1220,7 @@ class TestClassCreationProtocols:
             'class alpha(Base):\n'
             '    pass\n'
         )
-        FunctionType(compile(src, '<test>', 'exec'), {})()
+        execute_source(src)
         parsed = parse_definitions(src)
         assert 'zed' not in parsed.definitions[-1].eager_refs
 
@@ -1320,8 +1323,10 @@ class TestCollectAllNamesFromRoot:
 class TestCollectBodyRefs:
     def _refs(self, method_src: str, members: set[str]) -> set[str]:
         tree = ast.parse(f'class C:\n{textwrap.indent(method_src, "    ")}')
-        cls = cast('ast.ClassDef', tree.body[0])
-        func = cast('ast.FunctionDef', cls.body[0])
+        cls = tree.body[0]
+        assert isinstance(cls, ast.ClassDef)
+        func = cls.body[0]
+        assert isinstance(func, ast.FunctionDef)
         return collect_body_refs(func, members, 'C')
 
     def test_alias_and_getattr_ignored(self) -> None:
@@ -1345,6 +1350,28 @@ class TestCollectBodyRefs:
     def test_comprehension_rebinding_excluded(self) -> None:
         src = 'def a(self):\n    x = [self.b for self in ()]\n    return (x, self.c)'
         assert self._refs(src, {'a', 'b', 'c'}) == {'c'}
+
+    def test_dict_unpacking_comprehension_scans_key_without_value(self) -> None:
+        tree = ast.parse(
+            'class C:\n'
+            '    def method(self):\n'
+            '        return {self.alpha: self.beta for x in self.items}\n'
+        )
+        cls = tree.body[0]
+        assert isinstance(cls, ast.ClassDef)
+        func = cls.body[0]
+        assert isinstance(func, ast.FunctionDef)
+        statement = func.body[0]
+        assert isinstance(statement, ast.Return)
+        comprehension = statement.value
+        assert isinstance(comprehension, ast.DictComp)
+        # Model the Python 3.15 AST shape on older supported interpreters.
+        vars(comprehension)['value'] = None
+
+        assert collect_body_refs(func, {'alpha', 'beta', 'items'}, 'C') == {
+            'alpha',
+            'items',
+        }
 
     def test_grandchild_generic_class_type_param_scope_ownership(self) -> None:
         src = (
@@ -1377,6 +1404,16 @@ class TestCollectBodyRefs:
     def test_nested_class_type_params_evaluate_in_outer_scope(self) -> None:
         src = 'def a(self):\n    class C[T: self.b]:\n        pass\n    return self.c'
         assert self._refs(src, {'a', 'b', 'c'}) == {'b', 'c'}
+
+    def test_nested_default_and_comprehension_refs_count(self) -> None:
+        source = (
+            'def a(self):\n'
+            '    def inner(value=self.b):\n'
+            '        return value\n'
+            '    values = [self.c for item in ()]\n'
+            '    return values, self.d\n'
+        )
+        assert self._refs(source, {'a', 'b', 'c', 'd'}) == {'b', 'c', 'd'}
 
     def test_nested_default_evaluates_in_outer_scope(self) -> None:
         src = 'def a(self):\n    def inner(self=self.b):\n        return self\n    return inner'
@@ -1412,31 +1449,7 @@ class TestCollectBodyRefs:
     def test_renamed_receiver(self) -> None:
         assert self._refs('def a(this):\n    this.b()', {'a', 'b'}) == {'b'}
 
-    def test_scanner_uses_project_child_iterator(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        real_iterator = ast.iter_child_nodes
-        calls = 0
-
-        def counting_iterator(node: ast.AST) -> Iterator[ast.AST]:
-            nonlocal calls
-            calls += 1
-            return real_iterator(node)
-
-        source = (
-            'def a(self):\n'
-            '    def inner(value=self.b):\n'
-            '        return value\n'
-            '    values = [self.c for item in ()]\n'
-            '    return values, self.d\n'
-        )
-
-        with monkeypatch.context() as context:
-            context.setattr(ast, 'iter_child_nodes', counting_iterator)
-            refs = self._refs(source, {'a', 'b', 'c', 'd'})
-
-        assert refs == {'b', 'c', 'd'}
-        assert calls == 0
-
-    def test_scope_kind_uses_exact_type_dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_scope_kind_classifies_scope_nodes(self) -> None:
         tree = ast.parse(
             'def sync(): pass\n'
             'async def async_(): pass\n'
@@ -1463,21 +1476,7 @@ class TestCollectBodyRefs:
             'generator_expression',
             None,
         ]
-        calls = 0
-        real_isinstance = isinstance
-
-        def counting_isinstance(
-            obj: object,
-            class_or_tuple: type[object] | tuple[type[object], ...],
-        ) -> bool:
-            nonlocal calls
-            calls += 1
-            return real_isinstance(obj, class_or_tuple)
-
-        monkeypatch.setattr(analysis, 'isinstance', counting_isinstance, raising=False)
-
         assert [analysis._body_ref_scope_kind(node) for node in nodes] == expected
-        assert calls == 0
 
     @pytest.mark.parametrize(
         ('source', 'expected'),

@@ -22,11 +22,6 @@ class ReorderGuardParams:
     max_reorder_count: int | None = None
     max_reorder_percent: int | None = None
 
-    @property
-    def _enabled(self) -> bool:
-        """Return whether at least one threshold is configured."""
-        return self.max_reorder_count is not None or self.max_reorder_percent is not None
-
 
 @dataclass(frozen=True, slots=True)
 class _ReorderGuardResult:
@@ -135,7 +130,7 @@ def evaluate_reorder_guard(
     Returns:
         Movement totals and any exceeded-threshold reasons.
     """
-    if params is None or not params._enabled:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    if params is None:
         return _ReorderGuardResult(0, 0)
 
     moved, total = _count_reorder_moves(params.baseline_defs, sorted_defs)

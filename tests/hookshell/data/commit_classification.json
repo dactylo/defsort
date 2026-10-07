@@ -1,9 +1,53 @@
 {
-  "provenance": {
-    "note": "Byte-identical copy in docwrap; each copy records the other's commit hash.",
-    "docwrap_commit": "pending"
-  },
   "entries": [
+    {
+      "id": "ansi-c-subcommand",
+      "command": "git $'commit'",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "ansi-c-option",
+      "command": "git commit $'-a'",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "ansi-c-executable",
+      "command": "$'git' commit",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "ansi-c-concatenated-subcommand",
+      "command": "git com$'mit'",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "ansi-c-data-echo",
+      "command": "echo $'git commit'",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "ansi-c-data-grep",
+      "command": "grep $'git commit' docs/hook.md",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "ansi-c-escaped-subcommand",
+      "command": "git $'com\\x6dit'",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "ansi-c-escaped-executable",
+      "command": "$'g\\x69t' commit",
+      "outcome": "unsupported",
+      "detected": true
+    },
     {
       "id": "single-line",
       "command": "git commit -m 'summary'",
@@ -83,6 +127,12 @@
       "detected": true
     },
     {
+      "id": "heredoc-message-arbitrary-label",
+      "command": "git commit -m \"$(cat <<'MESSAGE'\nsubject\nMESSAGE\n)\"",
+      "outcome": "supported",
+      "detected": true
+    },
+    {
       "id": "semicolon-separator",
       "command": "git add a.py; git commit -m x",
       "outcome": "supported",
@@ -114,63 +164,87 @@
     },
     {
       "id": "incident-command",
-      "command": "git add src/sequential_hooks/_adapters/_common.py src/sequential_hooks/_containment/__init__.py src/sequential_hooks/_containment/_posix.py src/sequential_hooks/_containment/_uncontained.py src/sequential_hooks/_containment/_windows.py src/sequential_hooks/_containment/_windows_api.py src/sequential_hooks/_doctor/__init__.py src/sequential_hooks/_doctor/_types.py src/sequential_hooks/_runner.py\n git diff --cached --check\n git commit -m 'docs: correct reviewed docstring contracts' -m 'Apply the 15 accepted docstring proposals for failure conditions,\ncompletion sentinels, process lifecycle, version fallback, and timeout\nsemantics. Executable code is unchanged.\n\nValidation: exact proposal matching, non-docstring AST comparison, and\nmake check passed. Native Windows tests remain platform-skipped.'",
+      "command": "git add src/example/_adapters/_common.py src/example/_containment/__init__.py src/example/_containment/_posix.py src/example/_containment/_uncontained.py src/example/_containment/_windows.py src/example/_containment/_windows_api.py src/example/_doctor/__init__.py src/example/_doctor/_types.py src/example/_runner.py\n git diff --cached --check\n git commit -m 'docs: correct reviewed docstring contracts' -m 'Apply the 15 accepted docstring proposals for failure conditions,\ncompletion sentinels, process lifecycle, version fallback, and timeout\nsemantics. Executable code is unchanged.\n\nValidation: exact proposal matching, non-docstring AST comparison, and\nmake check passed. Native Windows tests remain platform-skipped.'",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git diff before git commit"
     },
     {
       "id": "read-only-status",
       "command": "git status && git commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git status before git commit"
     },
     {
       "id": "read-only-status-short",
       "command": "git status --short && git commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git status before git commit"
+    },
+    {
+      "id": "read-only-status-short-cluster",
+      "command": "git status -sb && git commit -m x",
+      "outcome": "unsupported",
+      "detected": true,
+      "element": "read-only git status before git commit"
     },
     {
       "id": "read-only-status-porcelain",
       "command": "git status --porcelain=v1 && git add a.py && git commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git status before git commit"
     },
     {
       "id": "read-only-diff-stat-and-log",
       "command": "git diff --cached --stat; git log --oneline -3; git commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git diff before git commit"
+    },
+    {
+      "id": "read-only-diff-staged",
+      "command": "git diff --staged && git commit -m x",
+      "outcome": "unsupported",
+      "detected": true,
+      "element": "read-only git diff before git commit"
     },
     {
       "id": "read-only-diff-check-after-add",
       "command": "git add a.py && git diff --check --cached && git commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git diff before git commit"
     },
     {
       "id": "read-only-log-format",
       "command": "git log -1 --format='%h %s' && git commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git log before git commit"
     },
     {
       "id": "read-only-log-n",
       "command": "git log -n 2 --format=%H && git commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git log before git commit"
     },
     {
       "id": "read-only-with-dash-c-route",
       "command": "git -C ./repo status --short && git -C ./repo commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git status before git commit"
     },
     {
       "id": "read-only-with-cd-route",
       "command": "cd ./repo && git status --short && git commit -m x",
       "outcome": "unsupported",
-      "detected": true
+      "detected": true,
+      "element": "read-only git status before git commit"
     },
     {
       "id": "amend-substitution-prefix",
@@ -953,14 +1027,14 @@
       "element": "expansion '$BUG'"
     },
     {
-      "id": "deny-other-heredoc-delimiter",
+      "id": "heredoc-message-eot-label",
       "command": "git commit -m \"$(cat <<'EOT'\nx\nEOT\n)\"",
-      "outcome": "unsupported",
+      "outcome": "supported",
       "detected": true
     },
     {
       "id": "deny-unquoted-heredoc-delimiter",
-      "command": "git commit -m \"$(cat <<EOF\nx\nEOF\n)\"",
+      "command": "git commit -m \"$(cat <<MESSAGE\nx\nMESSAGE\n)\"",
       "outcome": "unsupported",
       "detected": true
     },
@@ -1174,6 +1248,137 @@
       "outcome": "unrelated",
       "detected": false,
       "command_cwd": null
+    },
+    {
+      "id": "precheck-before-add",
+      "command": "git diff --check && git add a.py && git commit -m x",
+      "outcome": "unsupported",
+      "detected": true,
+      "element": "read-only git diff before git commit"
+    },
+    {
+      "id": "precheck-status-only",
+      "command": "git diff --check && git add a.py && git commit --dry-run",
+      "outcome": "supported",
+      "detected": true,
+      "commits": false
+    },
+    {
+      "id": "precheck-missing-cd",
+      "command": "cd ./missing && git diff --check && git commit -m x",
+      "outcome": "supported",
+      "detected": true,
+      "commits": false
+    },
+    {
+      "id": "precheck-missing-dash-c",
+      "command": "git -C ./missing status && git -C ./missing commit -m x",
+      "outcome": "supported",
+      "detected": true,
+      "commits": false
+    },
+    {
+      "id": "separate-add-check",
+      "command": "git add a.py && git diff --cached --check",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "standalone-diff-check",
+      "command": "git diff --check",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "standalone-status",
+      "command": "git status --short",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "standalone-log",
+      "command": "git log --oneline",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "read-only-status-undocumented-option",
+      "command": "git status -l && git commit -m x",
+      "outcome": "unsupported",
+      "detected": true,
+      "element": "option '-l' on git status"
+    },
+    {
+      "id": "deny-unquoted-heredoc-delimiter-eof",
+      "command": "git commit -m \"$(cat <<EOF\nx\nEOF\n)\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-uppercase-exe-shell",
+      "command": "BASH.EXE -c \"git commit -m x\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-exe-interpreter",
+      "command": "'C:\\tools\\NODE.EXE' -e 'require(\"child_process\").execSync(\"git commit -m x\")'",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-backtick-escaped-git",
+      "command": "echo `g\\\\it commit -m x`",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "data-sink-cat-redirect",
+      "command": "cat > notes.md <<'EOF'\ngit log then commit\nEOF",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-tee-file",
+      "command": "tee notes.md <<'EOF'\ngit add a.py && git commit -m x\nEOF",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "deny-heredoc-piped-to-shell",
+      "command": "cat <<'EOF' | sh\ngit commit -m x\nEOF",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-heredoc-to-process-substitution",
+      "command": "cat <<'EOF' > >(sh)\ngit commit -m x\nEOF",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-unquoted-sink-substitution",
+      "command": "cat > notes.md <<EOF\n$(git commit -m x)\nEOF",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-commit-after-data-sink",
+      "command": "cat > notes.md <<'EOF' && git commit -m x\nbody\nEOF",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-then-execute",
+      "command": "cat > s.sh <<'EOF' && sh s.sh\ngit commit -m x\nEOF",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-inside-eval-substitution",
+      "command": "eval \"$(tee s.sh <<'EOF'\ngit commit -m x\nEOF\n)\"",
+      "outcome": "unsupported",
+      "detected": true
     }
   ]
 }

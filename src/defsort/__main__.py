@@ -2,7 +2,7 @@
 
 import sys
 
-from defsort._cli import main
+from defsort._main import main
 
 if __name__ == '__main__':
     sys.exit(main())

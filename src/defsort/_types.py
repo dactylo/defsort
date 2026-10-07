@@ -1,4 +1,4 @@
-"""Public data types for the defsort library API."""
+"""Shared configuration, result, and internal processing records."""
 
 import enum
 import re
@@ -54,10 +54,12 @@ SortStatus = Literal['changed', 'invalid', 'skipped', 'unchanged']
 TieBreak = Literal['alphabetical', 'source']
 
 BANNER_MODE_VALUES: tuple[BannerMode, ...] = ('barriers', 'ignore', 'strip')
+COLOR_MODE_VALUES: tuple[ColorMode, ...] = ('auto', 'always', 'never')
 EVALUATION_ORDER_VALUES: tuple[EvaluationOrder, ...] = ('preserve', 'allow-reordering')
 EXIT_CHANGED = 1
 EXIT_ERROR = 2
 EXIT_OK = 0
+FALLBACK_MODE_VALUES: tuple[FallbackMode, ...] = ('warn', 'full-sort')
 MAIN_PLACEMENT_VALUES: tuple[MainPlacement, ...] = ('last', 'sorted')
 METHOD_BODIES_VALUES: tuple[MethodBodies, ...] = (
     'within-categories',
@@ -340,41 +342,20 @@ class MethodSortInfo:
     new_order: list[MethodDefinition]
 
 
-class IncrementalClassResult(NamedTuple):
-    """Per-class result from incremental method sorting.
+class ClassSortResult(NamedTuple):
+    """Per-class result from method sorting.
 
     Attributes:
         new_source: Rewritten class source, or `None` when unchanged.
         blocker: Reason sorting was blocked, or `None`.
         method_sort: Movement metadata when methods were reordered.
-        had_new_methods: Whether eligible incremental processing detected newly
-            added methods. This remains `False` for a newly added class.
-        boundary_layout: Exact class-local banner layout.
         banner_constraints: Banner constraints found within the class.
     """
 
     new_source: str | None  # rewritten class source, or None if unchanged
     blocker: Blocker | None
     method_sort: MethodSortInfo | None
-    had_new_methods: bool
-    boundary_layout: tuple[BoundaryLayoutPart, ...] = ()
     banner_constraints: 'tuple[BannerConstraint, ...]' = ()
-
-
-@dataclass(frozen=True, slots=True)
-class PreCommitAdd:
-    """A `git add` segment preceding a commit.
-
-    Attributes:
-        tokens: Exact parsed command tokens.
-        exec_cwd: Effective directory in which to replay the segment.
-        git_cwd: Effective Git working directory after `-C` processing; it may
-            be a worktree subdirectory.
-    """
-
-    tokens: tuple[str, ...]
-    exec_cwd: str
-    git_cwd: str
 
 
 @dataclass(frozen=True, slots=True)

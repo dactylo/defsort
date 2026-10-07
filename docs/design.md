@@ -1,7 +1,7 @@
 # Concepts and safety
 
-Defsort makes definition order a deterministic, configurable project policy. As people and coding
-agents add functions, placement can reflect the sequence of edits. Defsort applies an ordering
+defsort makes definition order a deterministic, configurable project policy. As people and coding
+agents add functions, placement can reflect the sequence of edits. defsort applies an ordering
 convention across those edits, with dependency and alphabetical strategies and separate controls
 for top-level definitions and class methods.
 
@@ -38,9 +38,10 @@ method-order = "none"
 ```
 
 `main = "last"` keeps a top-level `main()` after other definitions unless a definition-time read
-requires it earlier. Set `main = "sorted"` to treat it like other functions. In dependency order,
-`tie-break = "source"` keeps unrelated ready definitions in their authored order; the default
-`alphabetical` breaks those ties by name.
+requires it earlier. Under `evaluation-order = "preserve"`, an eager `main()` keeps its source
+order relative to other eager groups, so it can remain earlier. Set `main = "sorted"` to treat it
+like other functions. In dependency order, `tie-break = "source"` keeps unrelated ready definitions
+in their authored order; the default `alphabetical` breaks those ties by name.
 
 ### Dependencies and cycles
 
@@ -49,7 +50,7 @@ it considers definition-time components, including bases, decorators, class stat
 signatures. Method bodies do not create dependencies for their containing top-level class: doing so
 would make large class relationships dominate module order.
 
-Mutually dependent definitions form a cycle, so neither can precede every dependency. Defsort drops
+Mutually dependent definitions form a cycle, so neither can precede every dependency. defsort drops
 ordering edges within each cycle, then uses the configured tie-break. Dependencies between separate
 cycles still constrain their order. Safety checks apply to the resulting candidate.
 
@@ -83,7 +84,7 @@ first. An ordering preference cannot override a definition-time requirement.
 
 ### Which body relationships count
 
-Defsort recognizes literal attribute reads through a method's own receiver, such as `self.helper`
+defsort recognizes literal attribute reads through a method's own receiver, such as `self.helper`
 or `cls.factory`, using the actual first parameter name. Calls, stored references, and property
 reads count; assignments and deletions do not. Static methods recognize explicit
 `ContainingClass.member` reads. References to a property or overload member apply to its whole
@@ -135,7 +136,7 @@ Python can observe definition order. Decorators and default arguments run when a
 defined; class bodies, bases, and class-creation hooks can read names immediately. Reordering those
 definitions can change which value a name refers to or whether that value exists yet.
 
-Defsort checks the actual proposed order against a bounded model of these reads. It preserves the
+defsort checks the actual proposed order against a bounded model of these reads. It preserves the
 binding seen by covered definition-time reads, keeps grouped definitions together, and requires
 valid output. Sorting is idempotent: sorting the result again produces the same source. These
 checks do not prove that arbitrary Python programs behave identically after sorting.
@@ -202,13 +203,13 @@ behavior can allow an unsafe one. Preserve authored order when those limits matt
 
 ## Source preservation
 
-Defsort moves complete definitions with their decorators and owned comments into the existing
+defsort moves complete definitions with their decorators and owned comments into the existing
 source layout. It preserves surrounding whitespace, line endings, class headers and footers, and
 the final-newline state. Consecutive overload and property groups move together. Sorting does not
 impose blank-line style; run a formatter for that purpose.
 
 Trailing comments sometimes require a blank line to remain distinct from the next definition.
-Defsort may relocate one authored blank line per affected boundary, preserving that line's bytes.
+defsort may relocate one authored blank line per affected boundary, preserving that line's bytes.
 See [source preservation in the CLI reference](cli.md#source-preservation) for exact separator and
 mixed-ending behavior, and [platform compatibility](platform.md) for encoding and file metadata.
 
@@ -244,7 +245,7 @@ their physical lines with comments or other statements. It removes every eligibl
 annotations-only import in one sort. Reflective use through strings is not detected.
 
 On Python 3.14 and later, adding this import selects stringized annotations instead of the default
-deferred annotation values. Defsort applies this cross-version policy without inferring your
+deferred annotation values. defsort applies this cross-version policy without inferring your
 project's target Python version. Choose `--no-future` when that representation change is
 unsuitable. A future import cannot repair an eager-order blocker.
 
@@ -280,6 +281,6 @@ Only direct module-body definitions and sortable class methods move. Conditional
 created definitions are outside that set. Code between movable definitions remains subject to the
 interstitial guard, and trailing directive comments receive separate protection.
 
-Defsort provides structural ordering rather than framework-specific placement rules, arbitrary
+defsort provides structural ordering rather than framework-specific placement rules, arbitrary
 name-priority rules, or guesses about which definitions are most important. Use the supported
 policy axes, banners, and disabled scopes to express the organization your readers need.

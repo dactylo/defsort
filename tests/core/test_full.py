@@ -15,6 +15,7 @@ from defsort._types import (
     SortResult,
     SortScopeOrder,
 )
+from tests._helpers import execute_source
 
 _SRC_UNORDERED = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
 
@@ -386,7 +387,7 @@ class TestOverloadGroupSeparation:
             add_future=False,
             remove_future=False,
         )
-        original_class = _execute_source(source)['C']
+        original_class = execute_source(source)['C']
         assert isinstance(original_class, type)
         original_descriptor = vars(original_class)['value']
         assert isinstance(original_descriptor, property)
@@ -394,7 +395,7 @@ class TestOverloadGroupSeparation:
 
         result = sort_file(source, options=options)
         repeated = sort_file(result.new_source, options=options)
-        unchanged_class = _execute_source(result.new_source)['C']
+        unchanged_class = execute_source(result.new_source)['C']
         assert isinstance(unchanged_class, type)
         unchanged_descriptor = vars(unchanged_class)['value']
         assert isinstance(unchanged_descriptor, property)
@@ -1103,7 +1104,7 @@ class TestSortFile:
             '    @property\n'
             '    def name(self):\n        return self._name\n'
         )
-        original_class = _execute_source(src)['MyClass']
+        original_class = execute_source(src)['MyClass']
         assert isinstance(original_class, type)
         original_descriptor = vars(original_class)['name']
         assert isinstance(original_descriptor, property)
@@ -1111,7 +1112,7 @@ class TestSortFile:
         assert original_descriptor.fdel is None
 
         result = sort_file(src, options=EngineOptions(policy=SortPolicy()))
-        unchanged_class = _execute_source(result.new_source)['MyClass']
+        unchanged_class = execute_source(result.new_source)['MyClass']
         assert isinstance(unchanged_class, type)
         unchanged_descriptor = vars(unchanged_class)['name']
         assert isinstance(unchanged_descriptor, property)
@@ -1166,7 +1167,7 @@ class TestSortFileClassSuiteAnnotations:
     ) -> None:
         future = 'from __future__ import annotations\n\n\n' if existing_future else ''
         source = f'{future}class ZetaType:\n    pass\n\n\nclass Alpha:\n{suite}'
-        _execute_source(source)
+        execute_source(source)
         options = EngineOptions(
             policy=SortPolicy(definition_order='alphabetical', method_order='none'),
             add_future=add_future,
@@ -1181,7 +1182,7 @@ class TestSortFileClassSuiteAnnotations:
                 'class ZetaType'
             )
             assert 'from __future__ import annotations' in result.new_source
-            _execute_source(result.new_source)
+            execute_source(result.new_source)
         else:
             assert result.skipped is True
             assert result.new_source == source
@@ -1245,7 +1246,7 @@ class TestSortFileEagerOrderSafety:
             '\r\n'
             '    value = helper()'
         )
-        _execute_source(source)
+        execute_source(source)
         options = EngineOptions(
             policy=SortPolicy(definition_order='alphabetical', method_order='none'),
             force=force,
@@ -1274,7 +1275,7 @@ class TestSortFileEagerOrderSafety:
 
         result = sort_file(source, options=options)
 
-        namespace = _execute_source(result.new_source)
+        namespace = execute_source(result.new_source)
         assert result.blocker is None
         assert vars(namespace['AlphaLexer'])['rules'] == {'root': [('1',), ('2',)]}
 
@@ -1296,7 +1297,7 @@ class TestSortFileEagerOrderSafety:
 
         assert result.blocker is None
         assert result.new_source == source
-        assert vars(_execute_source(result.new_source)['Alpha'])['value'] == 42
+        assert vars(execute_source(result.new_source)['Alpha'])['value'] == 42
 
     def test_dependency_order_refuses_preexisting_called_sibling_inversion(self) -> None:
         source = (
@@ -1474,10 +1475,10 @@ class TestSortFileEagerOrderSafety:
         force: bool,
         allow_reordering: bool,
     ) -> None:
-        _execute_source(source)
+        execute_source(source)
         if sys.version_info < (3, 14):
             with pytest.raises(NameError):
-                _execute_source(unsafe_source)
+                execute_source(unsafe_source)
         options = EngineOptions(
             policy=SortPolicy(
                 definition_order='alphabetical',
@@ -1515,7 +1516,7 @@ class TestSortFileEagerOrderSafety:
         options = EngineOptions(policy=SortPolicy(definition_order='alphabetical'))
 
         result = sort_file(source, options=options)
-        namespace = _execute_source(result.new_source)
+        namespace = execute_source(result.new_source)
 
         assert namespace['events'] == ['zeta', 'alpha']
         assert sort_file(result.new_source, options=options).new_source == result.new_source
@@ -1550,9 +1551,9 @@ class TestSortFileEagerOrderSafety:
             force=True,
         )
 
-        original_namespace = _execute_source(source)
+        original_namespace = execute_source(source)
         result = sort_file(source, options=options)
-        accepted_namespace = _execute_source(result.new_source)
+        accepted_namespace = execute_source(result.new_source)
 
         assert result.new_source == expected
         assert result.new_source != result.original_source
@@ -1576,7 +1577,7 @@ class TestSortFileEagerOrderSafety:
             '\n'
             '    value = helper()\n'
         )
-        _execute_source(source)
+        execute_source(source)
         options = EngineOptions(
             policy=SortPolicy(definition_order='alphabetical', method_order='none')
         )
@@ -1586,7 +1587,7 @@ class TestSortFileEagerOrderSafety:
         assert result.skipped is False
         assert result.blocker is None
         assert result.new_source.index('class Alpha') < result.new_source.index('def zeta_compute')
-        _execute_source(result.new_source)
+        execute_source(result.new_source)
 
     @pytest.mark.parametrize(
         'all_value',
@@ -1646,12 +1647,12 @@ class TestSortFileRemoveFuture:
         source: str,
     ) -> tuple[dict[str, object], dict[str, object]]:
         options = EngineOptions(policy=SortPolicy(), add_future=False, remove_future=True)
-        original_namespace = _execute_source(source)
+        original_namespace = execute_source(source)
 
         result = sort_file(source, options=options)
 
         assert 'from __future__ import annotations' in result.new_source
-        transformed_namespace = _execute_source(result.new_source)
+        transformed_namespace = execute_source(result.new_source)
         repeated = sort_file(result.new_source, options=options)
         assert repeated.new_source == result.new_source
         return original_namespace, transformed_namespace
@@ -1708,14 +1709,14 @@ class TestSortFileRemoveFuture:
             'from __future__ import annotations\n\n'
             'def feature():\n    return annotations.compiler_flag\n'
         )
-        original = _execute_source(source)['feature']
+        original = execute_source(source)['feature']
         assert isinstance(original, FunctionType)
         assert original() == 16777216
 
         options = EngineOptions(policy=SortPolicy())
         result = sort_file(source, options=options)
 
-        transformed = _execute_source(result.new_source)['feature']
+        transformed = execute_source(result.new_source)['feature']
         assert isinstance(transformed, FunctionType)
         assert transformed() == 16777216
         assert result.new_source == source
@@ -2905,9 +2906,3 @@ class TestTrailingCommentOwnershipGuard:
         assert first.count(comment) == 1
         assert second == first
         assert second.count(comment) == 1
-
-
-def _execute_source(source: str) -> dict[str, object]:
-    namespace: dict[str, object] = {}
-    FunctionType(compile(source, '<test>', 'exec'), namespace)()
-    return namespace

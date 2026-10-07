@@ -29,10 +29,6 @@ _SORT_OPTIONS = tuple(
 )
 
 
-class _DeterministicRandom(random.Random):
-    pass
-
-
 def _banner(rng: random.Random, label: str, *, indent: str = '') -> str:
     rule = rng.choice(('-', '=', '*', '#', '~')) * rng.randint(4, 12)
     if rng.choice((False, True)):
@@ -117,7 +113,7 @@ def _module(rng: random.Random, case: int) -> str:
 
 
 def _assert_idempotent(*, cases: int, seed: int) -> None:
-    rng = _DeterministicRandom(seed)
+    rng = random.Random(seed)  # noqa: S311 - Seeded for reproducible cases, not security.
     for case in range(cases):
         source = _module(rng, case)
         for options in _SORT_OPTIONS:

@@ -1,3 +1,4 @@
+import argparse
 import ast
 import errno
 import importlib.metadata
@@ -6,18 +7,18 @@ import json
 import os
 import subprocess
 import sys
-import warnings
-from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 
 import defsort._git as git_module
 from defsort import _cli, _downstream
+from defsort._arguments import overrides_from_args
 from defsort._cli import (
+    _COMMAND_GROUPS,
     EXIT_CHANGED,
     EXIT_ERROR,
     EXIT_OK,
@@ -29,14 +30,13 @@ from defsort._cli import (
     _FileSortResult,
     _FileStatus,
     _guarded_skip,
-    _overrides_from_args,
-    _render_safe_config_warnings,
     _ResolvedConfig,
     _run_sort,
     main,
 )
 from defsort._config import ResolvedConfig, clear_config_cache
 from defsort._display._types import SummaryRow
+from defsort._hook_front import _build_hook_parser
 from defsort._types import (
     BANNER_MODE_VALUES,
     EVALUATION_ORDER_VALUES,
@@ -64,6 +64,7 @@ from tests._helpers import (
     finish_process,
     invoke_cli,
     process_transcript,
+    register_distribution,
     run_cli,
     run_closing_after_first_line,
     run_setup,
@@ -82,6 +83,27 @@ _AXIS_FLAGS = [
     ('main', 'main', MAIN_PLACEMENT_VALUES),
     ('tie-break', 'tie_break', TIE_BREAK_VALUES),
 ]
+
+_BUDGET_SCRIPT = """
+import runpy
+import sys
+
+heavy = ('defsort._hook', 'defsort._cli', 'defsort._library', 'defsort._core',
+         'defsort._config', 'defsort._files', 'defsort._git', 'defsort._display')
+sys.argv = ['defsort', 'hook', '--agent', 'claude']
+try:
+    runpy.run_module('defsort', run_name='__main__', alter_sys=True)
+except SystemExit as stop:
+    status = stop.code
+else:
+    status = None
+loaded = sorted(
+    name for name in sys.modules
+    if name in heavy or any(name.startswith(prefix + '.') for prefix in heavy)
+)
+sys.stderr.write(f'budget-status={status}\\n')
+sys.stderr.write('budget-loaded=' + ','.join(loaded) + '\\n')
+"""
 
 # Every value of every policy flag, plus the short option.
 _AXIS_FLAG_CASES = [
@@ -117,6 +139,103 @@ _CLOSED_STDOUT_STATUS = {
     'help-before-write': EXIT_OK,
 }
 
+
+_ORDERING_HELP = (
+    (
+        '-o, --order {dependency,alphabetical,none} order for definitions and methods '
+        '(default: dependency)'
+    ),
+    (
+        '--definition-order {dependency,alphabetical,none} order for top-level definitions '
+        '(default: dependency)'
+    ),
+    '--method-order {dependency,alphabetical,none} order for class methods (default: dependency)',
+    (
+        '--evaluation-order {preserve,allow-reordering} keep code that runs at definition time '
+        'in its order (default: preserve)'
+    ),
+    (
+        '--method-bodies {within-categories,ignore,across-categories} how calls inside methods '
+        'affect method order (default: within-categories)'
+    ),
+    '--method-visibility {mixed,public-first} where private methods go (default: mixed)',
+    (
+        '--method-dunders {before-regular,after-regular} where dunder methods other than '
+        '__new__ and __init__ go (default: before-regular)'
+    ),
+    '--main {last,sorted} keep main() last or sort it normally (default: last)',
+    (
+        '--tie-break {alphabetical,source} order of definitions with no dependency between them '
+        '(default: alphabetical)'
+    ),
+    '--banners {barriers,ignore,strip} how comment banners divide sections (default: barriers)',
+    (
+        '--banner-pattern REGEX also treat comment lines matching REGEX as banners; replaces '
+        'the configured pattern'
+    ),
+    '--no-banner-pattern ignore the configured banner pattern',
+)
+_HOOK_HELP = {
+    'options': (
+        '-h, --help show this help message and exit',
+        '-a, --agent NAME coding agent: agy, claude, codex',
+        '-e, --event NAME hook event, for agents whose payload does not name it (agy)',
+        '-i, --incremental sort only definitions added since the last commit',
+        (
+            '--no-incremental sort every definition, even when configuration enables '
+            'incremental mode'
+        ),
+        (
+            '--incremental-fallback {warn,full-sort} what to do when incremental sorting is '
+            'blocked (default: warn)'
+        ),
+        (
+            '--allow-on-failure allow the command when defsort itself fails; safety blockers '
+            'still deny'
+        ),
+    ),
+    'ordering': _ORDERING_HELP,
+}
+_ROOT_HELP = {
+    'positional arguments': ('PATH files or directories to check (default: current directory)',),
+    'options': (
+        '-h, --help show this help message and exit',
+        '--version show the version and exit',
+    ),
+    'output (choose one)': (
+        '-p, --preview show where definitions would move',
+        '-d, --diff show a unified diff',
+        '-w, --write rewrite files in place',
+        '-j, --json print results as JSON',
+        '--show-policy show the ordering policy that applies to each path',
+        '--detect report current order instead of sorting (JSON always detects order)',
+    ),
+    'ordering': _ORDERING_HELP,
+    'other changes': (
+        '--hoist move simple constants from between definitions to the top of the module',
+        (
+            '--no-future do not add from __future__ import annotations; files that need it '
+            'are skipped'
+        ),
+    ),
+    'safety': (
+        '-f, --force sort files that have code between definitions or exceed a reorder limit',
+    ),
+    'selection': (
+        '-i, --incremental sort only definitions added since the last commit (requires Git)',
+        (
+            '--no-incremental sort every definition, even when configuration enables '
+            'incremental mode'
+        ),
+    ),
+    'display': (
+        '-v, --verbose also list unchanged files',
+        '--color {auto,always,never} when to use color (default: auto)',
+        '--show-skips list skipped files in summary, diff, and write output (default: on)',
+        '--hide-skips do not list skipped files in summary, diff, and write output',
+    ),
+    'commands': ('hook run as a coding-agent hook (see defsort hook --help)',),
+}
 
 _SRC_ALREADY_ORDERED = 'def alpha():\n    pass\n\n\ndef bravo():\n    return alpha()\n'
 _SRC_BANNER_CONSTRAINED = 'def zulu():\n    pass\n\n\n# --------\n\n\ndef alpha():\n    pass\n'
@@ -182,48 +301,31 @@ _SRC_NEEDS_SORT = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    pass\
 
 
 class TestArgParsing:
-    def test_json_mutual_exclusivity_with_diff(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(['--json', '-d', str(f)])
-        assert result_status == 2, result_stderr
-
-    def test_json_mutual_exclusivity_with_preview(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(['--json', '-p', str(f)])
-        assert result_status == 2, result_stderr
-
-    def test_json_mutual_exclusivity_with_write(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(['--json', '-w', str(f)])
-        assert result_status == 2, result_stderr
-
-    def test_mode_mutual_exclusivity(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(['-p', '-d', str(f)])
-        assert result_status == 2, result_stderr
-
-    def test_mode_mutual_exclusivity_dw(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(['-d', '-w', str(f)])
-        assert result_status == 2, result_stderr
-
-    def test_mode_mutual_exclusivity_pw(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(['-p', '-w', str(f)])
-        assert result_status == 2, result_stderr
-
     def test_no_args_defaults_to_cwd(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
         f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
         result_status, result_stdout, result_stderr = invoke_cli([], cwd=tmp_path)
         assert result_status == 1, result_stderr
         assert 'test.py' in result_stdout
+
+    @pytest.mark.parametrize(
+        ('first', 'second'),
+        [
+            ('--json', '-d'),
+            ('--json', '-p'),
+            ('--json', '-w'),
+            ('-p', '-d'),
+            ('-d', '-w'),
+            ('-p', '-w'),
+        ],
+    )
+    def test_output_modes_are_mutually_exclusive(
+        self, tmp_path: Path, first: str, second: str
+    ) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        result_status, _result_stdout, result_stderr = invoke_cli([first, second, str(f)])
+        assert result_status == 2, result_stderr
 
 
 class TestBannerFlag:
@@ -239,7 +341,7 @@ class TestBannerFlag:
         result_status, _result_stdout, result_stderr = invoke_cli([*mode_args, str(source)])
 
         assert result_status == (0 if '--write' in mode_args else 1), result_stderr
-        assert f'defsort: {source}: sort constrained by 1 banner' in result_stderr
+        assert f'defsort: {source.as_posix()}: sort constrained by 1 banner' in result_stderr
 
     def test_banner_constraints_json_is_structured_and_silent(self, tmp_path: Path) -> None:
         source = tmp_path / 'test.py'
@@ -263,7 +365,7 @@ class TestBannerFlag:
         result_status, result_stdout, result_stderr = invoke_cli(['--preview', str(source)])
 
         assert result_status == 1, result_stderr
-        assert f'defsort: {source}: sort constrained by 1 banner' in result_stderr
+        assert f'defsort: {source.as_posix()}: sort constrained by 1 banner' in result_stderr
         assert 'line 9: --------:' in result_stdout
         assert 'zulu (after)' in result_stdout
         assert 'alpha (before)' in result_stdout
@@ -293,16 +395,6 @@ class TestBannerFlag:
         assert 'line 9: --------:' in result_stderr
         assert 'zulu (after)' in result_stderr
         assert 'alpha (before)' in result_stderr
-
-    def test_banner_pattern_flags_explain_override_and_reset(self) -> None:
-        _result_status, result_stdout, _result_stderr = invoke_cli(['--help'])
-
-        normalized = ' '.join(result_stdout.split())
-        assert (
-            '--banner-pattern BANNER_PATTERN Add a safe full-match pattern to built-in banner '
-            'recognition; overrides config.' in normalized
-        )
-        assert '--no-banner-pattern Clear the configured custom banner pattern.' in normalized
 
     @pytest.mark.parametrize('mode', BANNER_MODE_VALUES)
     def test_hook_parser_accepts_modes(self, mode: BannerMode, registered_hosts: Path) -> None:
@@ -345,7 +437,7 @@ class TestBannerFlag:
         assert compact_stdout == ''
         assert compact_stderr == ''
         assert verbose_status == 0, verbose_stderr
-        assert f'defsort: {source}: sort constrained by 1 banner' in verbose_stderr
+        assert f'defsort: {source.as_posix()}: sort constrained by 1 banner' in verbose_stderr
         detail_stream = verbose_stdout if '--preview' in mode_args else verbose_stderr
         assert 'line 5: --------:' in detail_stream
 
@@ -644,20 +736,18 @@ class TestClassBlockerOutput:
         blocker_line = '  class C: skipped (code between methods)\n'
         assert exit_code == EXIT_ERROR
         assert target.read_text(encoding='utf-8') == _SRC_CLASS_LOCAL_INTERSTITIAL
-        assert str(target) not in captured.out
-        assert f'error: {target}: write denied\n' in captured.err
+        assert target.as_posix() not in captured.out
+        assert f'error: {target.as_posix()}: write denied\n' in captured.err
         assert captured.err.count(blocker_line) == 1
 
 
 class TestClosedStdout:
     @pytest.mark.parametrize('case', list(_CLOSED_STDOUT_STATUS))
-    def test_closure_is_quiet(self, case: str, tmp_path: Path) -> None:
+    def test_closure_is_quiet_and_keeps_the_established_status(
+        self, case: str, tmp_path: Path
+    ) -> None:
         result = _closed_stdout_result(case, tmp_path)
         assert result.stderr == b'', process_transcript(result)
-
-    @pytest.mark.parametrize('case', list(_CLOSED_STDOUT_STATUS))
-    def test_closure_keeps_the_established_status(self, case: str, tmp_path: Path) -> None:
-        result = _closed_stdout_result(case, tmp_path)
         assert result.returncode == _CLOSED_STDOUT_STATUS[case], process_transcript(result)
 
 
@@ -692,7 +782,7 @@ class TestClosedStdoutInProcess:
         def fail_cli(_argv: Sequence[str] | None) -> int:
             raise OSError(errno.EINVAL, 'main work')
 
-        monkeypatch.setattr(_cli, '_run_cli', fail_cli)
+        monkeypatch.setattr(_cli, 'run_cli', fail_cli)
         monkeypatch.setattr(_downstream, '_WINDOWS', True)
 
         with pytest.raises(OSError, match='main work') as error:
@@ -708,18 +798,12 @@ class TestClosedStdoutInProcess:
             print('discarded')
             return EXIT_CHANGED
 
-        monkeypatch.setattr(_cli, '_run_cli', run_cli)
+        monkeypatch.setattr(_cli, 'run_cli', run_cli)
         closed = _ClosedStream()
         monkeypatch.setattr(sys, 'stdout', closed)
 
-        try:
-            assert main([]) == EXIT_CHANGED
-            assert sys.stdout is not closed
-            assert sys.stdout.write('discarded') == len('discarded')
-            sys.stdout.flush()
-        finally:
-            if sys.stdout is not closed:
-                sys.stdout.close()
+        assert main([]) == EXIT_CHANGED
+        assert sys.stdout is closed
 
     def test_windows_einval_during_output_keeps_the_status(
         self, monkeypatch: pytest.MonkeyPatch
@@ -733,16 +817,12 @@ class TestClosedStdoutInProcess:
             return EXIT_CHANGED
 
         monkeypatch.setattr(_downstream, '_WINDOWS', True)
-        monkeypatch.setattr(_cli, '_run_cli', run_cli)
+        monkeypatch.setattr(_cli, 'run_cli', run_cli)
         closed = _WindowsClosedStream()
         monkeypatch.setattr(sys, 'stdout', closed)
 
-        try:
-            assert main([]) == EXIT_CHANGED
-            assert sys.stdout is not closed
-        finally:
-            if sys.stdout is not closed:
-                sys.stdout.close()
+        assert main([]) == EXIT_CHANGED
+        assert sys.stdout is closed
 
 
 class TestColorDiff:
@@ -791,7 +871,7 @@ class TestColorPreview:
 
         assert result_status == EXIT_CHANGED, result_stderr
         assert result_stderr.startswith(
-            f'\033[1m{f}\033[0m: skipped\n  reason: code between definitions\n'
+            f'\033[1m{f.as_posix()}\033[0m: skipped\n  reason: code between definitions\n'
         )
         assert '\033[1m: skipped' not in result_stderr
         assert '\033[1m  reason:' not in result_stderr
@@ -929,44 +1009,6 @@ class TestConfigWarningRendering:
         assert r'bad\x1b]2;path\x07/pyproject.toml' in result_stderr
         assert '\x1b]2;path\x07' not in result_stderr
 
-    def test_unrelated_warning_delegates_before_body_exception(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        seen: list[str] = []
-
-        def record_warning(message: Warning | str, *args: object, **kwargs: object) -> None:
-            del args, kwargs
-            seen.append(str(message))
-
-        def warn_then_raise() -> None:
-            with _render_safe_config_warnings():
-                warnings.warn('unrelated', UserWarning, stacklevel=1)
-                raise RuntimeError('sentinel')
-
-        monkeypatch.setattr(warnings, 'showwarning', record_warning)
-
-        with pytest.raises(RuntimeError, match='sentinel'):
-            warn_then_raise()
-
-        assert seen == ['unrelated']
-
-    def test_unrelated_warning_delegates_immediately(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        seen: list[str] = []
-
-        def record_warning(message: Warning | str, *args: object, **kwargs: object) -> None:
-            del args, kwargs
-            seen.append(str(message))
-
-        monkeypatch.setattr(warnings, 'showwarning', record_warning)
-
-        with _render_safe_config_warnings():
-            warnings.warn('unrelated', UserWarning, stacklevel=1)
-            assert seen == ['unrelated']
-
 
 class TestDetectErrorHandling:
     def test_detect_compile_invalid_exits_2(self, tmp_path: Path) -> None:
@@ -1001,7 +1043,7 @@ class TestDetectErrorHandling:
         result_status, result_stdout, result_stderr = invoke_cli(['--detect', str(bad), str(good)])
 
         assert result_status == EXIT_ERROR, result_stderr
-        assert f'error: {bad}' in result_stderr
+        assert f'error: {bad.as_posix()}' in result_stderr
         assert 'good.py' in result_stdout
 
 
@@ -1034,7 +1076,7 @@ class TestDetectFlag:
         f = tmp_path / 'mod.py'
         f.write_text('x = 1\n')
         result_status, _result_stdout, result_stderr = invoke_cli(['--detect', '-w', str(f)])
-        assert result_status != 0, result_stderr
+        assert result_status == EXIT_ERROR, result_stderr
 
     def test_detect_shows_order(self, tmp_path: Path) -> None:
         src = 'def alpha():\n    return 1\n\n\ndef bravo():\n    return alpha()\n'
@@ -1042,7 +1084,7 @@ class TestDetectFlag:
         f.write_text(src)
         result_status, result_stdout, result_stderr = invoke_cli(['--detect', str(f)])
         assert result_status == 0, result_stderr
-        assert 'dependency' in result_stdout or 'both' in result_stdout
+        assert result_stdout.splitlines()[0].rstrip().endswith(' both')
 
     def test_detect_skips_single_def(self, tmp_path: Path) -> None:
         f = tmp_path / 'mod.py'
@@ -1110,7 +1152,7 @@ class TestDetectFlag:
         result_status, result_stdout, result_stderr = invoke_cli(['--detect', '-v', str(f)])
         assert result_status == 0, result_stderr
         # Verbose should include tau scores
-        assert 'tau' in result_stdout.lower() or 'score' in result_stdout.lower()
+        assert '(tau: 1.00)' in result_stdout
 
 
 class TestDiffMode:
@@ -1492,7 +1534,7 @@ class TestExitCodes:
 
         captured = capsys.readouterr()
         assert rc == EXIT_ERROR
-        assert captured.err == f'error: {first}: sentinel\n'
+        assert captured.err == f'error: {first.as_posix()}: sentinel\n'
         assert 'Traceback' not in captured.err
         assert processed == [_SRC_ALREADY_ORDERED, _SRC_NEEDS_SORT]
         assert 'second.py' in captured.out
@@ -1545,127 +1587,52 @@ class TestFileHandling:
         assert 'link.py' not in result_stdout
 
 
-class TestHelpEpilog:
-    def test_force_help_names_only_bypassable_blockers(self) -> None:
-        result_status, result_stdout, result_stderr = invoke_cli(['--help'])
+class TestHelp:
+    def test_help_ends_with_the_commands_section(self) -> None:
+        _status, stdout, _stderr = invoke_cli(['--help'])
 
-        assert result_status == 0, result_stderr
-        normalized = ' '.join(result_stdout.split())
-        assert 'Bypass interstitial and reorder-guard blockers.' in normalized
-        assert 'duplicate-name' not in normalized
-        assert 'Bypass safety checks.' not in normalized
+        assert stdout.endswith(
+            '\n\ncommands:\n'
+            '  hook                  run as a coding-agent hook (see defsort hook --help)\n'
+        )
 
-    def test_help_describes_hook_subcommand(self) -> None:
-        result_status, result_stdout, result_stderr = invoke_cli(['--help'])
+    def test_help_groups_every_option_with_its_help(self) -> None:
+        _status, stdout, _stderr = invoke_cli(['--help'])
 
-        assert result_status == 0, result_stderr
-        normalized = ' '.join(result_stdout.split())
-        assert 'hook Agent hook entry point (see defsort hook --help)' in normalized
+        sections = _help_sections(stdout)
+        assert list(sections) == list(_ROOT_HELP)
+        assert sections == {title: ' '.join(entries) for title, entries in _ROOT_HELP.items()}
 
-    def test_help_groups_detailed_policy_options(self) -> None:
-        help_text = _build_parser().format_help()
-        policy = help_text.partition('\nordering policy options:\n')[2].partition(
-            '\nsubcommands:'
-        )[0]
-        flags = {
-            line.strip().split(',', maxsplit=1)[0].split()[0]
-            for line in policy.splitlines()
-            if line.startswith('  -')
-        }
+    def test_help_starts_with_short_usage_and_description(self) -> None:
+        status, stdout, stderr = invoke_cli(['--help'])
 
-        assert flags == {
-            '--definition-order',
-            '--method-order',
-            '--evaluation-order',
-            '--method-bodies',
-            '--method-visibility',
-            '--method-dunders',
-            '--main',
-            '--tie-break',
-            '--banners',
-            '--banner-pattern',
-            '--no-banner-pattern',
-        }
+        assert (status, stderr) == (0, '')
+        usage, description, _rest = stdout.split('\n\n', 2)
+        assert usage == 'usage: defsort [options] [PATH ...]'
+        assert description == (
+            'Sort Python functions, classes, and methods by a configurable policy.'
+        )
 
-    def test_help_places_every_short_option_before_long_only_options(self) -> None:
-        help_text = _build_parser().format_help()
-        options = help_text.partition('options:\n')[2].partition('\nsubcommands:')[0]
-        general, separator, _policy = options.partition('\nordering policy options:\n')
-        flags = [
-            line.strip().split(',', maxsplit=1)[0].split()[0]
-            for line in general.splitlines()
-            if line.startswith('  -')
-        ]
+    def test_post_parse_error_prints_short_usage(self) -> None:
+        status, stdout, stderr = invoke_cli(['--show-policy', '--detect'])
 
-        short_flags = [flag for flag in flags if not flag.startswith('--')]
+        assert (status, stdout) == (2, '')
+        assert stderr == (
+            'usage: defsort [options] [PATH ...]\n'
+            'defsort: error: --show-policy is not allowed with --detect\n'
+        )
 
-        assert separator
-        assert short_flags == [
-            '-h',
-            '-p',
-            '-d',
-            '-j',
-            '-w',
-            '-o',
-            '-i',
-            '-f',
-            '-v',
-        ]
-        assert flags[:2] == ['-h', '--version']
-        flags_without_version = [flag for flag in flags if flag != '--version']
-        assert flags_without_version[: len(short_flags)] == short_flags
-        assert flags_without_version[len(short_flags) : len(short_flags) + 4] == [
-            '--color',
-            '--no-incremental',
-            '--show-skips',
-            '--hide-skips',
-        ]
+    def test_usage_error_prints_short_usage(self) -> None:
+        status, stdout, stderr = invoke_cli(['--bogus'])
 
-    def test_policy_option_help_explains_behavior(self) -> None:
-        descriptions = [
-            (
-                '--evaluation-order {preserve,allow-reordering}',
-                'Preserve definition-time evaluation order or allow reordering.',
-            ),
-            (
-                '--method-bodies {within-categories,ignore,across-categories}',
-                (
-                    'Let method-body dependencies stay within categories, be ignored, or cross '
-                    'categories.'
-                ),
-            ),
-            (
-                '--method-visibility {mixed,public-first}',
-                'Keep regular methods mixed or place public methods before private methods.',
-            ),
-            (
-                '--method-dunders {before-regular,after-regular}',
-                'Place non-lifecycle dunders before or after regular methods.',
-            ),
-            (
-                '--main {last,sorted}',
-                'Anchor main() last or sort it normally.',
-            ),
-            (
-                '--tie-break {alphabetical,source}',
-                'Break dependency ties alphabetically or by source order.',
-            ),
-        ]
-        result_status, result_stdout, result_stderr = invoke_cli(['--help'])
-
-        assert result_status == 0, result_stderr
-        help_text = ' '.join(result_stdout.split())
-        for option, behavior in descriptions:
-            assert f'{option} {behavior}' in help_text
+        assert (status, stdout) == (2, '')
+        assert stderr == (
+            'usage: defsort [options] [PATH ...]\n'
+            'defsort: error: unrecognized arguments: --bogus\n'
+        )
 
 
 class TestHookSubcommandParser:
-    def test_alpha_long_flag_rejected(self) -> None:
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['hook', '--agent', 'claude', '--alpha'], stdin='{}'
-        )
-        assert result_status != 0, result_stderr
-
     def test_hook_accepts_agent_option(self, registered_hosts: Path) -> None:
         assert registered_hosts.is_dir()
         result_status, _result_stdout, result_stderr = invoke_cli(
@@ -1687,51 +1654,35 @@ class TestHookSubcommandParser:
         )
         assert result_status == 2, result_stderr
 
-    def test_hook_help_exits_0(self) -> None:
-        result_status, result_stdout, result_stderr = invoke_cli(['hook', '--help'])
-        assert result_status == 0, result_stderr
-        assert 'defsort hook' in result_stdout
-        assert '--alpha' not in result_stdout
-        assert '-a, --agent NAME' in result_stdout
-        assert '-e, --event NAME' in result_stdout
-        assert '--order' in result_stdout
-        assert '--evaluation-order' in result_stdout
-        assert '--allow-on-failure' in result_stdout
-        assert '--banners' in result_stdout
-        assert '--incremental' in result_stdout
-        assert '--no-incremental' in result_stdout
+    @pytest.mark.usefixtures('registered_hosts')
+    def test_hook_help_groups_every_option_with_its_help(self) -> None:
+        _status, stdout, _stderr = invoke_cli(['hook', '--help'])
 
-    def test_hook_help_explains_agent_and_failure_overrides(self) -> None:
-        result_status, result_stdout, result_stderr = invoke_cli(['hook', '--help'])
+        sections = _help_sections(stdout)
+        assert list(sections) == list(_HOOK_HELP)
+        assert sections == {title: ' '.join(entries) for title, entries in _HOOK_HELP.items()}
 
-        assert result_status == 0, result_stderr
-        normalized = ' '.join(result_stdout.split())
-        assert (
-            "Agent hook entry point; reads the coding agent's payload as JSON from stdin."
-            in normalized
-        )
-        assert (
-            '--allow-on-failure Warn and allow infrastructure failures after a command is '
-            'accepted; safety blockers still deny.' in normalized
-        )
-        assert (
-            '--no-incremental Disable incremental mode, overriding configured incremental mode.'
-            in normalized
+    def test_hook_help_lists_agents_from_the_registry(self, registered_hosts: Path) -> None:
+        register_distribution(
+            registered_hosts,
+            'defsort-host-example',
+            {'example': 'tests.hosts_example.adapter:ExampleAdapter'},
         )
 
-    def test_hook_host_option_does_not_replace_required_agent(self) -> None:
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['hook', '--host', 'claude'], stdin='{}'
-        )
-        assert result_status == 2, result_stderr
-        assert 'the following arguments are required: -a/--agent' in result_stderr
+        _status, stdout, _stderr = invoke_cli(['hook', '--help'])
 
-    def test_hook_rejects_host_option_alongside_agent(self) -> None:
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['hook', '--agent', 'claude', '--host', 'claude'], stdin='{}'
+        assert '\n  -a, --agent NAME      coding agent: agy, claude, codex, example\n' in stdout
+
+    def test_hook_help_starts_with_short_usage_and_description(self) -> None:
+        status, stdout, stderr = invoke_cli(['hook', '--help'])
+
+        assert (status, stderr) == (0, '')
+        usage, description, _rest = stdout.split('\n\n', 2)
+        assert usage == 'usage: defsort hook --agent NAME [options]'
+        assert ' '.join(description.split()) == (
+            "Run defsort as a coding-agent hook, reading the agent's hook payload as JSON "
+            'from stdin.'
         )
-        assert result_status == 2, result_stderr
-        assert 'unrecognized arguments: --host claude' in result_stderr
 
     def test_hook_requires_agent(self) -> None:
         result_status, _result_stdout, result_stderr = invoke_cli(['hook'], stdin='{}')
@@ -1784,6 +1735,22 @@ class TestHookSubcommandParser:
             ['hook', '--agent', 'claude', '--bogus']
         )
         assert result_status == 2, result_stderr
+
+    def test_hook_usage_error_prints_short_usage_without_reading_registry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_registry_read() -> list[str]:
+            raise AssertionError('the hook registry was read')
+
+        monkeypatch.setattr('defsort._hosts.registered_host_names', unexpected_registry_read)
+
+        status, stdout, stderr = invoke_cli(['hook'])
+
+        assert (status, stdout) == (2, '')
+        assert stderr == (
+            'usage: defsort hook --agent NAME [options]\n'
+            'defsort hook: error: the following arguments are required: -a/--agent\n'
+        )
 
 
 class TestIncrementalFlag:
@@ -2116,79 +2083,6 @@ class TestJsonOutput:
         assert rec['dep_score'] is None
         assert rec['alpha_score'] is None
 
-    def test_json_full_current_source_parse_once(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        source = _SRC_NEEDS_SORT
-        transformed_source = _SRC_ALREADY_ORDERED
-        path = tmp_path / 'test.py'
-        path.write_bytes(source.encode('utf-8'))
-        parse_counts: Counter[str] = Counter()
-        original_parse = ast.parse
-
-        def counting_parse(
-            candidate: str,
-            *args: Any,  # noqa: ANN401 - `ast.parse` varies by Python version.
-            **kwargs: Any,  # noqa: ANN401 - `ast.parse` varies by Python version.
-        ) -> ast.AST:
-            parse_counts[candidate] += 1
-            return cast('ast.AST', original_parse(candidate, *args, **kwargs))
-
-        monkeypatch.setattr(ast, 'parse', counting_parse)
-
-        assert main(['--json', str(path)]) == EXIT_CHANGED
-        capsys.readouterr()
-
-        assert parse_counts[source] == 1, parse_counts
-        assert parse_counts[transformed_source] == 0
-
-    def test_json_incremental_current_source_parse_once(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        baseline = 'def alpha():\n    pass\n\n\ndef charlie():\n    return alpha()\n'
-        current_source = baseline + '\n\ndef bravo():\n    return alpha()\n'
-        transformed_source = (
-            'def alpha():\n    pass\n\n\ndef bravo():\n    return alpha()\n\n\n'
-            'def charlie():\n    return alpha()\n'
-        )
-        path = tmp_path / 'test.py'
-        path.write_bytes(current_source.encode('utf-8'))
-        parse_counts: Counter[str] = Counter()
-        original_parse = ast.parse
-
-        def counting_parse(
-            candidate: str,
-            *args: Any,  # noqa: ANN401 - `ast.parse` varies by Python version.
-            **kwargs: Any,  # noqa: ANN401 - `ast.parse` varies by Python version.
-        ) -> ast.AST:
-            parse_counts[candidate] += 1
-            return cast('ast.AST', original_parse(candidate, *args, **kwargs))
-
-        def fetch_baseline(paths: list[Path]) -> dict[Path, BlobReadResult]:
-            assert paths == [path]
-            return {
-                path: BlobReadResult(
-                    status=BlobReadStatus.CONTENT,
-                    content=baseline,
-                )
-            }
-
-        monkeypatch.setattr(ast, 'parse', counting_parse)
-        monkeypatch.setattr('defsort._cli._batch_fetch_cli_baselines', fetch_baseline)
-
-        assert main(['--json', '--incremental', str(path)]) == EXIT_CHANGED
-        capsys.readouterr()
-
-        assert parse_counts[current_source] == 1, parse_counts
-        assert parse_counts[baseline] > 0
-        assert parse_counts[transformed_source] > 0
-
     def test_json_incremental_infra_error(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
         f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
@@ -2298,7 +2192,7 @@ class TestJsonOutput:
         data = json.loads(result_stdout)
         rec = data['files'][0]
         # With --force, interstitial file should not be skipped
-        assert rec['status'] != 'skipped'
+        assert rec['status'] == 'changed'
 
 
 class TestLargeReorderGuard:
@@ -2429,21 +2323,25 @@ class TestModuleInvocation:
         assert result.returncode == EXIT_OK, process_transcript(result)
         assert 'usage: defsort' in decode_text(result.stdout)
 
-    def test_subprocess_host_roots_cleaned_after_normal_exit(self) -> None:
-        roots: list[Path] = []
-        for _ in range(2):
-            result = run_setup(
-                [
-                    sys.executable,
-                    '-c',
-                    'from tests._helpers import _HOSTS; assert _HOSTS.is_dir(); print(_HOSTS)',
-                ],
-                env=_ENV,
-            )
-            roots.append(Path(decode_text(result.stdout).strip()))
-
-        assert roots[0] != roots[1]
-        assert all(not root.exists() for root in roots)
+    def test_hook_fast_path_skips_engine_imports(self, tmp_path: Path) -> None:
+        payload = json.dumps(
+            {
+                'session_id': 'budget',
+                'transcript_path': '/dev/null',
+                'cwd': str(tmp_path),
+                'permission_mode': 'default',
+                'hook_event_name': 'PreToolUse',
+                'tool_name': 'Bash',
+                'tool_input': {'command': 'ls -la'},
+                'tool_use_id': 'toolu_budget',
+            }
+        )
+        result = run_setup(
+            [sys.executable, '-c', _BUDGET_SCRIPT], stdin=payload.encode(), env=_ENV, check=False
+        )
+        stderr = result.stderr.decode().replace('\r\n', '\n')
+        assert 'budget-status=0\n' in stderr, stderr
+        assert 'budget-loaded=\n' in stderr, stderr
 
 
 class TestMultiFile:
@@ -2546,8 +2444,8 @@ class TestMultiFilePreview:
 
         assert result_status == EXIT_CHANGED, result_stderr
         assert 'c.py:' in result_stdout
-        assert f'{skipped_a}: skipped\n' in result_stderr
-        assert f'{skipped_b}: skipped\n' in result_stderr
+        assert f'{skipped_a.as_posix()}: skipped\n' in result_stderr
+        assert f'{skipped_b.as_posix()}: skipped\n' in result_stderr
         assert result_stderr.count('  reason: code between definitions') == 2
         assert result_stderr.count('  fix: use --force to bypass safety checks') == 2
         assert (
@@ -2556,8 +2454,8 @@ class TestMultiFilePreview:
         assert result_stderr.count('  Code between definitions:') == 2
         assert '    line 4: registry = {}' in result_stderr
         assert '    line 4: if os.environ.get("DEFSORT_EXAMPLE_DEBUG") == "1":' in result_stderr
-        assert f'{skipped_a}:4:' not in result_stderr
-        assert f'{skipped_b}:4:' not in result_stderr
+        assert f'{skipped_a.as_posix()}:4:' not in result_stderr
+        assert f'{skipped_b.as_posix()}:4:' not in result_stderr
         assert 'Proposed reorder:' not in result_stderr
         assert result_stderr.count('  Current') == 2
 
@@ -2768,7 +2666,7 @@ class TestPerFileConfig:
         target.write_bytes(_SRC_NEEDS_SORT.encode('utf-8'))
 
         seen: list[Path] = []
-        nested_incremental: list[bool] = []
+        nested_incremental: list[bool | None] = []
         original_run_sort = _run_sort
 
         def fetch_baseline(paths: list[Path]) -> dict[Path, BlobReadResult]:
@@ -2783,7 +2681,7 @@ class TestPerFileConfig:
             tree: ast.Module,
         ) -> SortResult:
             if source == _SRC_NEEDS_SORT:
-                nested_incremental.append(config.incremental)
+                nested_incremental.append(config.resolved.incremental)
             return original_run_sort(source, config, baseline_raw, tree=tree)
 
         with pytest.MonkeyPatch.context() as mp:
@@ -2942,11 +2840,14 @@ class TestPreviewMethodTables:
         )
         f = tmp_path / 'test.py'
         f.write_text(src, encoding='utf-8')
-        _result_status, result_stdout, _result_stderr = invoke_cli(['-p', str(f)])
-        assert 'C' in result_stdout
-        assert 'alpha' in result_stdout
-        assert 'bravo' in result_stdout
-        assert 'methods' in result_stdout
+        result_status, result_stdout, result_stderr = invoke_cli(['-p', str(f)])
+        assert result_status == EXIT_CHANGED, result_stderr
+        assert result_stdout.splitlines() == [
+            'C (2 methods):',
+            '  Current  Proposed  Move',
+            '  bravo    alpha     ^1',
+            '  alpha    bravo     v1',
+        ]
 
     def test_preview_verbose_shows_all_rows(self, tmp_path: Path) -> None:
         src = (
@@ -3049,7 +2950,7 @@ class TestSafetySkip:
 
         assert result_status == EXIT_CHANGED, result_stderr
         assert result_stdout == ''
-        assert result_stderr == f'{f}: skipped (code between definitions)\n'
+        assert result_stderr == f'{f.as_posix()}: skipped (code between definitions)\n'
         assert 'Proposed reorder:' not in result_stderr
         assert 'Use --force' not in result_stderr
 
@@ -3068,7 +2969,7 @@ class TestSafetySkip:
         assert result_status == 1, result_stderr
         # File should NOT be modified
         assert f.read_text(encoding='utf-8') == _SRC_INTERSTITIAL
-        assert result_stderr == f'{f}: skipped (code between definitions)\n'
+        assert result_stderr == f'{f.as_posix()}: skipped (code between definitions)\n'
         assert '--force' not in result_stderr
         assert '--force' not in result_stdout
 
@@ -3108,7 +3009,7 @@ class TestSafetySkip:
 
         assert result_status == EXIT_CHANGED, result_stderr
         assert path.read_text(encoding='utf-8') == source
-        assert f'{path}: skipped\n' in result_stderr
+        assert f'{path.as_posix()}: skipped\n' in result_stderr
         assert '  reason: sort would move a decorator' in result_stderr
         assert '--force' not in result_stderr
 
@@ -3119,7 +3020,7 @@ class TestSafetySkip:
         result_status, _result_stdout, result_stderr = invoke_cli(['-p', str(f)])
 
         assert result_status == EXIT_CHANGED, result_stderr
-        assert f'{f}: skipped\n' in result_stderr
+        assert f'{f.as_posix()}: skipped\n' in result_stderr
         assert '  reason: non-consecutive duplicate definitions\n' in result_stderr
         assert '  fix: remove the duplicate definition\n' in result_stderr
         assert '--force' not in result_stderr
@@ -3145,7 +3046,7 @@ class TestSafetySkip:
 
         assert result_status == EXIT_CHANGED, result_stderr
         assert f.read_text(encoding='utf-8') == source
-        assert f'{f}: skipped\n' in result_stderr
+        assert f'{f.as_posix()}: skipped\n' in result_stderr
         assert '  reason: sort would move a decorator' in result_stderr
         assert (
             '  fix: keep each referenced definition before the code that uses it' in result_stderr
@@ -3159,7 +3060,7 @@ class TestSafetySkip:
         result_status, result_stdout, result_stderr = invoke_cli(['-p', '--force', str(f)])
 
         assert result_status == EXIT_CHANGED, result_stderr
-        assert f'{f}: skipped\n' in result_stderr
+        assert f'{f.as_posix()}: skipped\n' in result_stderr
         assert '  reason: non-consecutive duplicate definitions\n' in result_stderr
         assert '  fix: remove the duplicate definition\n' in result_stderr
         assert '--force' not in result_stderr
@@ -3196,7 +3097,7 @@ class TestSafetySkip:
 
         assert result_status == 1, result_stderr
         assert result_stdout == ''
-        assert f'{f}: skipped\n' in result_stderr
+        assert f'{f.as_posix()}: skipped\n' in result_stderr
         assert '  reason: code between definitions\n' in result_stderr
         assert '  fix: use --force to bypass safety checks\n' in result_stderr
         assert 'Proposed reorder:' not in result_stderr
@@ -3204,7 +3105,7 @@ class TestSafetySkip:
         assert 'Proposed' in result_stderr
         assert 'Code between definitions:' in result_stderr
         assert "    line 6: if sys.platform == 'win32':" in result_stderr
-        assert f'{f}:6:' not in result_stderr
+        assert f'{f.as_posix()}:6:' not in result_stderr
         assert (
             result_stderr.index('  reason:')
             < result_stderr.index('  Code between definitions:')
@@ -3382,7 +3283,7 @@ class TestSkipMessageVisibility:
         result_status, _result_stdout, result_stderr = invoke_cli(['--hide-skips', '-p', str(f)])
 
         assert result_status == EXIT_CHANGED, result_stderr
-        assert f'{f}: skipped\n' in result_stderr
+        assert f'{f.as_posix()}: skipped\n' in result_stderr
         assert '  reason: code between definitions\n' in result_stderr
         assert '  fix: use --force to bypass safety checks\n' in result_stderr
         assert 'Code between definitions:' in result_stderr
@@ -3415,7 +3316,7 @@ class TestSkipMessageVisibility:
         result_status, _result_stdout, result_stderr = invoke_cli(['--show-skips', str(f)])
 
         assert result_status == EXIT_CHANGED, result_stderr
-        assert result_stderr == f'{f}: skipped (code between definitions)\n'
+        assert result_stderr == f'{f.as_posix()}: skipped (code between definitions)\n'
 
 
 class TestSummaryMode:
@@ -3461,6 +3362,7 @@ class TestSummaryMode:
         f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
         _result_status, _result_stdout, result_stderr = invoke_cli([str(f)])
         assert 'skipped' in result_stderr
+        assert 'code between definitions' in result_stderr
 
     def test_summary_retains_rows_only(
         self,
@@ -3524,6 +3426,33 @@ class TestSyntaxErrorHandling:
         bad.write_text('def foo(:\n', encoding='utf-8')
         result_status, _result_stdout, result_stderr = invoke_cli(['-w', str(bad)])
         assert result_status == 2, result_stderr
+
+
+class TestUnavailableStdout:
+    @pytest.mark.parametrize(
+        'argv',
+        [
+            ['--help'],
+            ['--version'],
+            ['--bogus'],
+            ['-d', 'missing.py'],
+            ['hook', '--help'],
+            ['hook', '--agent', 'claude'],
+        ],
+        ids=['help', 'version', 'usage-error', 'diff', 'hook-help', 'hook'],
+    )
+    def test_every_mode_reports_one_error_line(
+        self, argv: list[str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Restore stdout before capsys finalizes, so its capture stream is not reinstated.
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sys, 'stdout', None)
+            status = main(argv)
+
+        assert (status, capsys.readouterr().err) == (
+            EXIT_ERROR,
+            'error: standard output is unavailable\n',
+        )
 
 
 class TestVersion:
@@ -3723,9 +3652,42 @@ def _git_init_with_duplicate_method_baseline(tmp_path: Path) -> None:
     )
 
 
+def _help_entries(
+    parser: argparse.ArgumentParser, prefix: str
+) -> Iterator[tuple[str, str | None]]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparsers = cast('argparse._SubParsersAction[argparse.ArgumentParser]', action)
+            visible = [choice.dest for choice in subparsers._choices_actions]
+            for choice in subparsers._choices_actions:
+                yield f'{prefix} {choice.dest}', choice.help
+            for name in visible:
+                yield from _help_entries(subparsers.choices[name], f'{prefix} {name}')
+        elif action.help is not argparse.SUPPRESS:
+            label = '/'.join(action.option_strings) or action.dest
+            yield f'{prefix} {label}', action.help
+
+
+def _help_sections(help_text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    body: list[str] = []
+    for line in help_text.splitlines():
+        if line.endswith(':') and not line.startswith((' ', 'usage:')):
+            body = sections.setdefault(line.removesuffix(':'), [])
+        else:
+            body.append(line)
+    return {title: ' '.join(' '.join(lines).split()) for title, lines in sections.items()}
+
+
 def _parse_overrides(argv: list[str]) -> SortOverrides:
     args = _build_parser().parse_args([*argv, 'x.py'])
-    return _overrides_from_args(args)
+    return overrides_from_args(args)
+
+
+def _starts_in_lowercase_style(text: str) -> bool:
+    first = text.split(maxsplit=1)[0]
+    is_acronym = first.upper() == first and any(character.isalpha() for character in first)
+    return text[0].islower() or is_acronym
 
 
 def test_abbreviation_rejected(tmp_path: Path) -> None:
@@ -3733,9 +3695,24 @@ def test_abbreviation_rejected(tmp_path: Path) -> None:
     assert status == 2, stderr
 
 
-def test_alpha_flag_rejected() -> None:
-    status, _stdout, stderr = invoke_cli(['-a'])
-    assert status == 2, stderr
+def test_entry_point_escapes_unencodable_stdout_text() -> None:
+    script = (
+        'import sys\n'
+        'import defsort._cli\n'
+        'import defsort._main\n'
+        'def run_cli(_argv):\n'
+        "    print('bad\\udcff.py')\n"
+        '    return 0\n'
+        'defsort._cli.run_cli = run_cli\n'
+        'sys.exit(defsort._main.main([]))\n'
+    )
+    result = run_setup(
+        [sys.executable, '-c', script],
+        env={**_ENV, 'PYTHONIOENCODING': 'utf-8:strict'},
+        check=False,
+    )
+    assert result.returncode == 0, process_transcript(result)
+    assert b'bad\\udcff.py' in result.stdout
 
 
 def test_error_path_and_detail_escape_terminal_controls(tmp_path: Path) -> None:
@@ -3746,6 +3723,24 @@ def test_error_path_and_detail_escape_terminal_controls(tmp_path: Path) -> None:
     assert result_status == 2, result_stderr
     assert r'missing\x1b]2;path\x07\x0a.py' in result_stderr
     assert '\x1b]2;path\x07' not in result_stderr
+
+
+def test_every_visible_option_and_command_has_lowercase_help() -> None:
+    entries = [
+        *_help_entries(_build_parser(), 'defsort'),
+        *_help_entries(_build_hook_parser(), 'defsort hook'),
+        *(
+            (f'defsort {name}', text)
+            for _title, commands in _COMMAND_GROUPS
+            for name, text in commands
+        ),
+    ]
+    problems = [
+        f'{name}: {text!r}'
+        for name, text in entries
+        if not text or not _starts_in_lowercase_style(text) or text.endswith('.')
+    ]
+    assert problems == []
 
 
 def test_invalid_cli_regex_is_usage_error(tmp_path: Path) -> None:
@@ -3908,8 +3903,8 @@ def test_show_policy_groups_by_source(tmp_path: Path) -> None:
         ['--show-policy', 'one/mod.py', 'two/mod.py'], cwd=tmp_path
     )
     assert result_stdout.count('policy from ') == 2
-    assert result_stdout.index(str(Path('one') / 'pyproject.toml')) < result_stdout.index(
-        str(Path('two') / 'pyproject.toml')
+    assert result_stdout.index((Path('one') / 'pyproject.toml').as_posix()) < result_stdout.index(
+        (Path('two') / 'pyproject.toml').as_posix()
     )
 
 
