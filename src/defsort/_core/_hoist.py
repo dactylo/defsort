@@ -96,7 +96,7 @@ def get_safe_to_hoist_by_gap(
         tree: The full source AST.
         candidates_by_gap: Candidate names keyed by their source gap position.
         candidate_positions: Proposed final positions by source occurrence, or
-            None to use source positions.
+            `None` to use source positions.
 
     Returns:
         Safe constant names keyed by source gap position.
@@ -168,7 +168,7 @@ def extract_hoistable_constants(
     """Extract hoistable constant assignments from trailing content.
 
     A constant is extractable when it's a simple assignment with a single
-    UPPER_SNAKE_CASE target in safe_names, a pure literal value, and the
+    `UPPER_SNAKE_CASE` target in `safe_names`, a pure literal value, and the
     remaining content after extraction is safe (blank lines/comments only).
 
     Args:
@@ -178,10 +178,10 @@ def extract_hoistable_constants(
             re-parsing.
 
     Returns:
-        (hoisted_sources, hoisted_line_numbers): Exact source spans, including
-        their relocated blank-line boundaries, for hoistable constants and
-        their 1-based physical line numbers in the exact trailing text. Empty
-        if unsafe.
+        (`hoisted_sources`, `hoisted_line_numbers`): Exact source spans,
+        including their relocated blank-line boundaries, for hoistable
+        constants and their 1-based physical line numbers in the exact trailing
+        text. Empty if unsafe.
     """
     if not trailing.strip():
         return [], set()

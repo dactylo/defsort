@@ -61,10 +61,10 @@ def incremental_merge[T](  # noqa: PLR0913
     existing order. Callers handle safety checks, annotation hazards, and
     source reassembly.
 
-    The conformance check uses key_fn (identity keys), not index_fn, because
-    indices are not stable across independent parses. The method-level caller
-    uses (name, property_kind) identity and the top-level caller uses
-    (name, kind) identity.
+    The conformance check uses `key_fn` (identity keys), not `index_fn`,
+    because indices are not stable across independent parses. The method-level
+    caller uses (`name`, `property_kind`) identity and the top-level caller
+    uses (`name`, `kind`) identity.
 
     Args:
         current: Items in current source order.
@@ -77,7 +77,7 @@ def incremental_merge[T](  # noqa: PLR0913
         min_baseline: Minimum baseline size required for conformance checking.
 
     Returns:
-        (merged_list, None) on success or ([], blocker) on failure.
+        (`merged_list`, `None`) on success or (`[]`, `blocker`) on failure.
     """
     new_indices = {index_fn(item) for item in new_items}
 

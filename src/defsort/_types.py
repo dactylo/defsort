@@ -54,7 +54,14 @@ SortStatus = Literal['changed', 'invalid', 'skipped', 'unchanged']
 TieBreak = Literal['alphabetical', 'source']
 
 BANNER_MODE_VALUES: tuple[BannerMode, ...] = ('barriers', 'ignore', 'strip')
+CLASS_BLOCKER_LABELS = {
+    'duplicates': 'duplicate method names',
+    'interstitial': 'code between methods',
+}
 COLOR_MODE_VALUES: tuple[ColorMode, ...] = ('auto', 'always', 'never')
+DYNAMIC_ALL_MESSAGE = (
+    'sort would reorder definitions that a dynamically built __all__ may depend on'
+)
 EVALUATION_ORDER_VALUES: tuple[EvaluationOrder, ...] = ('preserve', 'allow-reordering')
 EXIT_CHANGED = 1
 EXIT_ERROR = 2
@@ -102,12 +109,14 @@ class BlobReadStatus(enum.Enum):
         DECODE_FAILED: The blob exists but cannot be decoded as Python source.
         INFRA_ERROR: Git could not complete the blob read.
         MISSING: Git reports no object for the requested key.
+        OUTSIDE_REPOSITORY: The file is outside a Git worktree.
     """
 
     CONTENT = 'content'  # blob text available; BlobReadResult.content is set
     DECODE_FAILED = 'decode_failed'  # blob exists but cannot be decoded
-    INFRA_ERROR = 'infra_error'  # git call failed / not a repo
+    INFRA_ERROR = 'infra_error'  # per-object baseline read failure
     MISSING = 'missing'  # no blob at that key (cat-file header 'missing')
+    OUTSIDE_REPOSITORY = 'outside_repository'
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -119,24 +128,33 @@ class BlobReadResult:
         content: Decoded blob text for `BlobReadStatus.CONTENT`, otherwise
             `None`.
         encoding: Detected source encoding, defaulting to `utf-8`.
+        detail: Cause for infrastructure or decoding failures, otherwise
+            `None`.
 
     `content` is a string exactly when `status` is `BlobReadStatus.CONTENT`.
 
     Raises:
-        ValueError: If `content` disagrees with `status`.
+        ValueError: If `content` or `detail` disagrees with `status`.
     """
 
     status: BlobReadStatus
     content: str | None = None
     encoding: str = 'utf-8'
+    detail: str | None = None
 
     def __post_init__(self) -> None:
         """Validate that content matches the blob read status.
 
         Raises:
             ValueError: If a `CONTENT` result lacks string content or a
-                non-content result carries content.
+                non-content result carries content, or a nonfailure carries
+                detail.
         """
+        if self.detail is not None and self.status not in (
+            BlobReadStatus.INFRA_ERROR,
+            BlobReadStatus.DECODE_FAILED,
+        ):
+            raise ValueError('blob read detail requires INFRA_ERROR or DECODE_FAILED')
         if self.status is BlobReadStatus.CONTENT:
             if not isinstance(self.content, str):
                 raise ValueError('CONTENT blob reads require string content')
@@ -212,6 +230,7 @@ class Definition:
         is_overload: Whether the definition is an overload declaration.
         section: Stable section identity assigned by banner analysis.
         eager_refs: Names read while the definition is created.
+        binds_other_names: Whether creation may bind names besides its own.
         has_eager_evaluation: Whether creating the definition can observe
             order.
     """
@@ -231,6 +250,7 @@ class Definition:
     section: int = 0
     eager_refs: set[str] = field(default_factory=set[str])
     has_eager_evaluation: bool = False
+    binds_other_names: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -307,6 +327,7 @@ class MethodDefinition:
         safe_gap_after: Whether the following gap permits grouping.
         body_refs: Class-local names read by the method body.
         eager_reads: Class-local names read while the method is created.
+        binds_other_names: Whether creation may bind names besides its own.
         has_eager_evaluation: Whether creating the method can observe order.
     """
 
@@ -325,6 +346,7 @@ class MethodDefinition:
     body_refs: set[str] = field(default_factory=set[str])
     eager_reads: set[str] = field(default_factory=set[str])
     has_eager_evaluation: bool = False
+    binds_other_names: bool = False
 
 
 @dataclass
@@ -396,7 +418,7 @@ class BannerConstraint:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SortCheckResult:
-    """Result of check().
+    """Result of `check()`.
 
     Attributes:
         status: The sort status of the source.
@@ -530,7 +552,7 @@ def is_soft_blocker(blocker: Blocker) -> bool:
         blocker: The blocker to classify.
 
     Returns:
-        True when the blocker only constrains incremental sorting rather than
+        `True` when the blocker only constrains incremental sorting rather than
         indicating an unsafe transformation.
     """
     return blocker in _SOFT_BLOCKER_VALUES
@@ -668,7 +690,7 @@ class DefsortConfig:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class SortOverrides:
-    """CLI flag overrides applied on top of a resolved DefsortConfig.
+    """CLI flag overrides applied on top of a resolved `DefsortConfig`.
 
     Nullable fields are `None` when not overridden. `clear_banner_pattern`
     remains false unless the caller requests a reset.

@@ -2,12 +2,13 @@ from pathlib import PureWindowsPath
 
 import pytest
 
-from defsort import _terminal
-from defsort._color import BOLD, RED, YELLOW
+from defsort._display._color import YELLOW
 from defsort._display._summary import build_summary_row, format_summary_rows
 from defsort._display._width import display_width
-from defsort._types import Definition, MethodDefinition, MethodSortInfo, SortResult
-from tests.display._helpers import _make_def
+from defsort._types import Definition, SortResult
+from defsort._vendor.hookfront import _terminal
+from defsort._vendor.hookfront._color import BOLD, RED
+from tests.display._helpers import make_def, method_swap
 
 
 class TestCjkAlignment:
@@ -42,7 +43,7 @@ class TestCjkAlignment:
 
 class TestFormatSummary:
     def test_all_unchanged_no_output(self) -> None:
-        _d = _make_def
+        _d = make_def
         unchanged = SortResult(
             original_source='same',
             new_source='same',
@@ -62,7 +63,7 @@ class TestFormatSummary:
         assert output == ''
 
     def test_all_unchanged_verbose_shows_table(self) -> None:
-        _d = _make_def
+        _d = make_def
         unchanged = SortResult(
             original_source='same',
             new_source='same',
@@ -82,7 +83,7 @@ class TestFormatSummary:
         assert 'TOTAL' not in output
 
     def test_columns_right_aligned(self) -> None:
-        _d = _make_def
+        _d = make_def
         r1 = SortResult(
             original_source='',
             new_source='x',
@@ -137,16 +138,9 @@ class TestFormatSummary:
         assert max(lengths) - min(lengths) <= 1, f'Column alignment inconsistent: {lengths}'
 
     def test_filename_colored_by_severity(self) -> None:
-        _d = _make_def
-        # 2 of 2 moved = 100% -> red
-        result = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
+        _d = make_def
+        # 2 of 2 moved = 100% -> yellow
+        result = _summary_result(changed=True)
         output = format_summary_rows(
             [build_summary_row(path, result) for path, result in [('f.py', result)]],
             verbose=False,
@@ -160,35 +154,12 @@ class TestFormatSummary:
         # Both filename and percentage share the same severity color
         assert data.startswith(f'{color}f.py\033[0m')
         assert data.rstrip().endswith(f'{color}100%\033[0m')
-
-    def test_filename_not_colored_at_zero_pct(self) -> None:
-        _d = _make_def
-        result = SortResult(
-            original_source='from __future__ import annotations\n\ndef a():\n    pass\n',
-            new_source='def a():\n    pass\n',
-            original_order=[_d(0, 'a')],
-            new_order=[_d(0, 'a')],
-            warning=None,
-            blocking_code=[],
-        )
-        output = format_summary_rows(
-            [build_summary_row(path, result) for path, result in [('f.py', result)]],
-            verbose=False,
-            color=True,
-        )
-        data = output.splitlines()[1]
-        assert data.startswith('f.py')  # no ANSI at start
+        assert YELLOW in data
+        assert RED not in data
 
     def test_header_bold_when_color_enabled(self) -> None:
-        _d = _make_def
-        result = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
+        _d = make_def
+        result = _summary_result(changed=True)
         output = format_summary_rows(
             [build_summary_row(path, result) for path, result in [('f.py', result)]],
             verbose=False,
@@ -198,28 +169,8 @@ class TestFormatSummary:
         assert '\033[1m' in lines[0]  # header is bold
         assert '\033[1m' not in lines[1]  # data row not bold (non-verbose)
 
-    def test_high_pct_uses_yellow(self) -> None:
-        _d = _make_def
-        # 2 of 2 moved = 100%
-        result = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
-        output = format_summary_rows(
-            [build_summary_row(path, result) for path, result in [('f.py', result)]],
-            verbose=False,
-            color=True,
-        )
-        data = output.splitlines()[1]
-        assert YELLOW in data
-        assert RED not in data
-
     def test_low_pct_uses_yellow(self) -> None:
-        _d = _make_def
+        _d = make_def
         # 2 of 5 moved = 40% (swap first two, rest unchanged)
         result = SortResult(
             original_source='',
@@ -239,8 +190,7 @@ class TestFormatSummary:
         assert RED not in data
 
     def test_methods_in_separate_column(self) -> None:
-        _d = _make_def
-        m = MethodDefinition
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -250,17 +200,7 @@ class TestFormatSummary:
             blocking_code=[],
             total_methods=2,
             method_sorts=[
-                MethodSortInfo(
-                    class_name='C',
-                    original_order=[
-                        m(index=0, name='b', start_line=1, end_line=2, source=''),
-                        m(index=1, name='a', start_line=3, end_line=4, source=''),
-                    ],
-                    new_order=[
-                        m(index=1, name='a', start_line=3, end_line=4, source=''),
-                        m(index=0, name='b', start_line=1, end_line=2, source=''),
-                    ],
-                ),
+                method_swap('C', ('b', 'a'), lines=(1, 3)),
             ],
         )
         output = format_summary_rows(
@@ -280,33 +220,6 @@ class TestFormatSummary:
         assert data_fields[methods_idx] == '2'
         assert '66%' in data  # 2 of 3 moved = 66%
 
-    def test_multi_file_with_total(self) -> None:
-        _d = _make_def
-        r1 = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
-        r2 = SortResult(
-            original_source='',
-            new_source='y',
-            original_order=[_d(0, 'c'), _d(1, 'b'), _d(2, 'a')],
-            new_order=[_d(2, 'a'), _d(1, 'b'), _d(0, 'c')],
-            warning=None,
-            blocking_code=[],
-        )
-        output = format_summary_rows(
-            [build_summary_row(path, result) for path, result in [('a.py', r1), ('b.py', r2)]],
-            verbose=False,
-            color=False,
-        )
-        lines = output.splitlines()
-        assert len(lines) == 4  # header + 2 data + TOTAL
-        assert 'TOTAL' in lines[3]
-
     def test_retained_rows_preserve_exact_output(self) -> None:
         rows = [
             build_summary_row('a.py', _summary_result(changed=True)),
@@ -321,15 +234,8 @@ class TestFormatSummary:
         )
 
     def test_single_file_no_total(self) -> None:
-        _d = _make_def
-        result = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
+        _d = make_def
+        result = _summary_result(changed=True)
         output = format_summary_rows(
             [build_summary_row(path, result) for path, result in [('f.py', result)]],
             verbose=False,
@@ -351,7 +257,7 @@ class TestFormatSummary:
         assert 'TOTAL' not in output
 
     def test_source_only_change(self) -> None:
-        _d = _make_def
+        _d = make_def
         source_only = SortResult(
             original_source='from __future__ import annotations\n\ndef a():\n    pass\n',
             new_source='def a():\n    pass\n',
@@ -360,14 +266,7 @@ class TestFormatSummary:
             warning=None,
             blocking_code=[],
         )
-        changed = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
+        changed = _summary_result(changed=True)
         output = format_summary_rows(
             [
                 build_summary_row(path, result)
@@ -380,15 +279,8 @@ class TestFormatSummary:
         assert 'TOTAL' in output  # n_changed=2
 
     def test_total_row_bold_when_color_enabled(self) -> None:
-        _d = _make_def
-        r1 = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
+        _d = make_def
+        r1 = _summary_result(changed=True)
         r2 = SortResult(
             original_source='',
             new_source='y',
@@ -408,15 +300,8 @@ class TestFormatSummary:
         assert '\033[1m' in lines[3]  # TOTAL bold
 
     def test_total_row_omitted_when_n_changed_lt_2(self) -> None:
-        _d = _make_def
-        changed = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
+        _d = make_def
+        changed = _summary_result(changed=True)
         unchanged = SortResult(
             original_source='same',
             new_source='same',
@@ -439,7 +324,7 @@ class TestFormatSummary:
         assert 'b.py' in output
 
     def test_truncated_zero_pct_still_colored(self) -> None:
-        _d = _make_def
+        _d = make_def
         # 2 of 201 moved = 0.995% -> truncates to 0%, but n_moved > 0
         result = SortResult(
             original_source='',
@@ -459,15 +344,8 @@ class TestFormatSummary:
         assert YELLOW in data
 
     def test_verbose_color_distinguishes_by_severity_not_bold(self) -> None:
-        _d = _make_def
-        changed = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
+        _d = make_def
+        changed = _summary_result(changed=True)
         unchanged = SortResult(
             original_source='same',
             new_source='same',
@@ -495,15 +373,8 @@ class TestFormatSummary:
         assert YELLOW not in lines[2]
 
     def test_verbose_excludes_unchanged_from_total(self) -> None:
-        _d = _make_def
-        r1 = SortResult(
-            original_source='',
-            new_source='x',
-            original_order=[_d(0, 'b'), _d(1, 'a')],
-            new_order=[_d(1, 'a'), _d(0, 'b')],
-            warning=None,
-            blocking_code=[],
-        )
+        _d = make_def
+        r1 = _summary_result(changed=True)
         r2 = SortResult(
             original_source='',
             new_source='y',
@@ -533,7 +404,7 @@ class TestFormatSummary:
         assert total_line.split() == ['TOTAL', '5', '0', '5', '4', '80%']
 
     def test_zero_pct_no_color(self) -> None:
-        _d = _make_def
+        _d = make_def
         result = SortResult(
             original_source='from __future__ import annotations\n\ndef a():\n    pass\n',
             new_source='def a():\n    pass\n',
@@ -550,6 +421,7 @@ class TestFormatSummary:
         data = output.splitlines()[1]
         assert YELLOW not in data
         assert RED not in data
+        assert data.startswith('f.py')
 
     def test_zero_total_file(self) -> None:
         result = SortResult(

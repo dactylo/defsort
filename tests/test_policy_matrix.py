@@ -104,7 +104,7 @@ def run(cache):
 """
 
 _TARGETED_CASES = [
-    # Spec-named interaction cases plus a three-axis banner combination.
+    # Explicit policy interactions plus a three-axis banner combination.
     DefsortConfig(
         method_visibility='public-first',
         method_bodies='within-categories',
@@ -141,7 +141,7 @@ def test_kitchen_sink_exercises_sorting() -> None:
 # True all-pairs coverage necessarily includes valid but ineffective combinations.
 # Ignore expected ineffective-option warnings in this engine interaction sweep.
 @pytest.mark.filterwarnings(
-    r'ignore:\[tool\.defsort\] .* has no effect under the resolved strategies:UserWarning'
+    r'ignore:.* has no effect under the resolved strategies; ignoring:UserWarning'
 )
 @pytest.mark.parametrize(
     'options',

@@ -1,4 +1,4 @@
-"""High-level public API: sort_file, sort_file_incremental, detect_order."""
+"""Private engine entry points for sorting and order detection."""
 
 import ast
 from collections.abc import Sequence
@@ -31,8 +31,10 @@ from defsort._core._safety import (
     has_anchored_main_annotation_hazard,
     has_annotation_order_hazard,
 )
+from defsort._core._syntax import parse_source
 from defsort._types import (
     BannerMode,
+    Blocker,
     Definition,
     DetectResult,
     EngineOptions,
@@ -70,14 +72,29 @@ def _apply_hoist_and_future(
         definitions,
         policy=options.policy,
     ):
-        add_tree = tree if result_source is source else ast.parse(result_source)
+        add_tree = tree if result_source is source else parse_source(result_source)
         if not has_future_annotations_import(result_source, _tree=add_tree):
             return ensure_future_annotations(result_source)
     if options.remove_future:
-        remove_tree = tree if result_source is source else ast.parse(result_source)
+        remove_tree = tree if result_source is source else parse_source(result_source)
         if has_future_annotations_import(result_source, _tree=remove_tree):
             result_source = remove_unused_future_annotations(result_source, _tree=remove_tree)
     return result_source
+
+
+def _apply_incremental_safety_gate(result: SortResult, safety_gate: Blocker | None) -> SortResult:
+    """Discard a changed wrapper candidate when its engine safety gate refuses it."""
+    if result.new_source == result.original_source or safety_gate is None:
+        return result
+    return replace(
+        result,
+        new_source=result.original_source,
+        new_order=result.original_order,
+        blocker=safety_gate,
+        warning=blocker_message(safety_gate),
+        method_sorts=[],
+        skipped=True,
+    )
 
 
 def _classify_order(dep_match: bool, alpha_match: bool) -> OrderKind:
@@ -102,7 +119,7 @@ def _post_sort_future_management(
     if not options.add_future and not options.remove_future:
         return new_source
 
-    new_tree = ast.parse(new_source)
+    new_tree = parse_source(new_source)
     parsed = parse_definitions(new_source, tree=new_tree)
     new_postamble_names = parse_postamble_names(parsed.postamble)
     has_future = has_future_annotations_import(new_source, _tree=new_tree)
@@ -220,7 +237,8 @@ def detect_order(
     Raises:
         TypeError: If `banner_pattern` is neither a string nor `None`.
         ValueError: If `banner_pattern` does not compile or uses unsupported
-            syntax. Compilation failures chain the underlying `re.error`.
+            syntax, or source parsing encounters a lone Unicode surrogate.
+            Pattern compilation failures chain the underlying `re.error`.
     """
     compile_banner_pattern(banner_pattern)
     parsed = parse_definitions(
@@ -262,7 +280,8 @@ def sort_file_incremental(
         TypeError: If the configured banner pattern is neither a string nor
             `None`.
         ValueError: If the configured banner pattern does not compile or uses
-            unsupported syntax. Compilation failures chain `re.error`.
+            unsupported syntax, or parsing source or baseline encounters a lone
+            Unicode surrogate. Pattern compilation failures chain `re.error`.
     """
     validate_banner_pattern(options.policy.banner_pattern)
 
@@ -270,7 +289,7 @@ def sort_file_incremental(
     # sort_incremental_impl() calls ast.parse() and raises SyntaxError;
     # the CLI must not crash on invalid input.
     try:
-        tree = _tree if _tree is not None else ast.parse(source)
+        tree = _tree if _tree is not None else parse_source(source)
     except SyntaxError:
         return make_unchanged_result(source)
 
@@ -302,9 +321,9 @@ def sort_file_incremental(
         # Convert the blocker value to its human-readable message for
         # SortResult.warning (matching sort_file()'s convention).
         result_source = source
-        if result.blocker is None and not result.class_blockers:
-            # No new definitions and no blocker. Hoisting and future-import
-            # removal still apply independently of incremental sorting.
+        if result.blocker is None:
+            # No new definitions or file blocker. Hoisting and future-import
+            # removal still apply independently of blocked classes.
             # IMPORTANT: Do NOT delegate to sort_file() here -- the user
             # may have modified function bodies (adding new dependency
             # edges) without adding new definitions, which would cause
@@ -319,8 +338,9 @@ def sort_file_incremental(
                 )
             except LayoutPreservationError:
                 result = replace(result, blocker='layout')
-        warning = blocker_message(result.blocker) if result.blocker else None
-        if warning is None and result.class_blockers:
+        warning = (result.message or blocker_message(result.blocker)) if result.blocker else None
+        changed = result_source != source
+        if warning is None and not changed and result.class_blockers:
             warning = result.class_blockers[0].message
         unchanged_result = SortResult(
             original_source=source,
@@ -330,11 +350,14 @@ def sort_file_incremental(
             warning=warning,
             blocking_code=[],
             blocker=result.blocker,
-            skipped=result.blocker is not None or bool(result.class_blockers),
+            skipped=result.blocker is not None or (not changed and bool(result.class_blockers)),
             total_methods=total_methods,
             class_blockers=result.class_blockers,
         )
-        return with_banner_constraints(unchanged_result, result.banner_constraints)
+        return with_banner_constraints(
+            _apply_incremental_safety_gate(unchanged_result, result.safety_gate),
+            result.banner_constraints,
+        )
 
     # A hard blocker on the success path means one scope changed while another
     # was blocked. Discard those changes and skip the whole file.
@@ -344,7 +367,7 @@ def sort_file_incremental(
             new_source=source,
             original_order=result.original_defs,
             new_order=result.original_defs,
-            warning=blocker_message(result.blocker),
+            warning=result.message or blocker_message(result.blocker),
             blocking_code=[],
             blocker=result.blocker,
             skipped=True,
@@ -368,10 +391,13 @@ def sort_file_incremental(
         original_order=result.original_defs,
         new_order=list(result.sorted_defs) if result.sorted_defs else list(result.original_defs),
         blocker=result.blocker,
-        warning=blocker_message(result.blocker) if result.blocker else None,
+        warning=(result.message or blocker_message(result.blocker)) if result.blocker else None,
         blocking_code=[],
         method_sorts=result.method_sorts,
         total_methods=total_methods,
         class_blockers=result.class_blockers,
     )
-    return with_banner_constraints(sorted_result, result.banner_constraints)
+    return with_banner_constraints(
+        _apply_incremental_safety_gate(sorted_result, result.safety_gate),
+        result.banner_constraints,
+    )

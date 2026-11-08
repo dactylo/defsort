@@ -1,7 +1,5 @@
 """Top-level dependency and alphabetical definition ordering."""
 
-# pyright: reportPrivateUsage=false
-
 import heapq
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
@@ -27,7 +25,7 @@ class _DefinitionGroup:
     dependencies: set[str]
 
     @property
-    def _first_index(self) -> int:
+    def first_index(self) -> int:
         """Return the index of the group's first definition."""
         return self.definitions[0].index
 
@@ -38,7 +36,7 @@ class _DependencyMaps:
     def __init__(self, groups: list[_DefinitionGroup], policy: SortPolicy) -> None:
         """Initialize dependency indexes for the definition groups."""
         all_names = {g.name for g in groups}
-        self.group_ids = {id(group): group_id for group_id, group in enumerate(groups)}
+        self._group_ids = {id(group): group_id for group_id, group in enumerate(groups)}
         self.groups = list(groups)
 
         dependencies = {
@@ -55,25 +53,32 @@ class _DependencyMaps:
         cycle_by_name = {name: cycle for cycle in find_cycles(dependencies) for name in cycle}
 
         # Effective deps: strip only edges internal to the same cycle.
-        self.effective_deps: dict[int, set[str]] = {}
+        self._effective_deps: dict[int, set[str]] = {}
         for group_id, group in enumerate(groups):
             deps = dependencies[group.name] - cycle_by_name.get(group.name, frozenset())
-            self.effective_deps[group_id] = deps
+            self._effective_deps[group_id] = deps
 
         # In-degree
         self.in_degree: dict[int, int] = {}
         for group_id, _group in enumerate(groups):
-            self.in_degree[group_id] = len(self.effective_deps[group_id])
+            self.in_degree[group_id] = len(self._effective_deps[group_id])
 
         # Reverse deps: name -> list of group indices that depend on it
         self.reverse_deps: dict[str, list[int]] = defaultdict(list)
         for group_id, _group in enumerate(groups):
-            for dep_name in self.effective_deps[group_id]:
+            for dep_name in self._effective_deps[group_id]:
                 self.reverse_deps[dep_name].append(group_id)
 
-    def _group_id(self, group: _DefinitionGroup) -> int:
-        """Return the stable algorithm identity for a definition group."""
-        return self.group_ids[id(group)]
+    def group_id(self, group: _DefinitionGroup) -> int:
+        """Return the stable algorithm identity for a definition group.
+
+        Args:
+            group: The exact group object supplied during construction.
+
+        Returns:
+            Its zero-based position in the constructor's group sequence.
+        """
+        return self._group_ids[id(group)]
 
 
 class _GroupQueue:
@@ -91,22 +96,33 @@ class _GroupQueue:
             return bool(self._source)
         return bool(self._alphabetical)
 
-    def _pop(self) -> _DefinitionGroup:
-        """Pop the next group under the configured tie-break."""
+    def pop(self) -> _DefinitionGroup:
+        """Pop the next group under the configured tie-break.
+
+        Raises:
+            IndexError: If the queue is empty.
+        """
         if self._policy.tie_break == 'source':
             _, _order, group = heapq.heappop(self._source)
             return group
         _, _index, group = heapq.heappop(self._alphabetical)
         return group
 
-    def _push(self, group: _DefinitionGroup, group_order: int) -> None:
-        """Push a group using the configured tie-break key."""
+    def push(self, group: _DefinitionGroup, group_order: int) -> None:
+        """Push a group using the configured tie-break key.
+
+        Args:
+            group: Definition group to enqueue.
+            group_order: Stable secondary key after the group's first source
+                index under source tie-breaking. Alphabetical tie-breaking uses
+                the group name and first source index instead.
+        """
         if self._policy.tie_break == 'source':
-            heapq.heappush(self._source, (group._first_index, group_order, group))
+            heapq.heappush(self._source, (group.first_index, group_order, group))
         else:
             heapq.heappush(
                 self._alphabetical,
-                (group.name, group._first_index, group),
+                (group.name, group.first_index, group),
             )
 
 
@@ -144,7 +160,7 @@ def _pin_eager_groups(
     positions = [index for index, group in enumerate(groups) if _group_has_eager_evaluation(group)]
     if len(positions) <= 1:
         return groups
-    ordered = sorted((groups[index] for index in positions), key=lambda g: g._first_index)
+    ordered = sorted((groups[index] for index in positions), key=lambda g: g.first_index)
     pinned = list(groups)
     for slot, group in zip(positions, ordered, strict=True):
         pinned[slot] = group
@@ -167,16 +183,16 @@ def _topological_sort_groups(
     """Run Kahn's algorithm with the configured tie-breaking on groups."""
     queue = _GroupQueue(policy)
     for group in groups:
-        group_id = maps._group_id(group)
+        group_id = maps.group_id(group)
         if maps.in_degree[group_id] == 0:
-            queue._push(group, group_id)
+            queue.push(group, group_id)
 
     result: list[_DefinitionGroup] = []
     processed: set[int] = set()
 
     while queue:
-        group = queue._pop()
-        group_id = maps._group_id(group)
+        group = queue.pop()
+        group_id = maps.group_id(group)
         if group_id in processed:
             continue
         processed.add(group_id)
@@ -186,9 +202,9 @@ def _topological_sort_groups(
             if dependent_id not in processed:
                 maps.in_degree[dependent_id] -= 1
                 if maps.in_degree[dependent_id] == 0:
-                    queue._push(maps.groups[dependent_id], dependent_id)
+                    queue.push(maps.groups[dependent_id], dependent_id)
 
-    result.extend(group for group in groups if maps._group_id(group) not in processed)
+    result.extend(group for group in groups if maps.group_id(group) not in processed)
     return result
 
 
@@ -200,7 +216,7 @@ def group_consecutive_same_name(
     """Group consecutive definitions with the same name.
 
     Only groups if the previous definition had no interstitial code (checked
-    via had_interstitial_code, which reflects original state).
+    via `had_interstitial_code`, which reflects original state).
     Single definitions become groups of size 1. Group dependencies are the
     union of all member dependencies. Annotation deps are not aggregated here
     -- safety checks iterate group members directly.
@@ -281,8 +297,8 @@ def order_alphabetical(
     class_groups = [g for g in other_groups if g.definitions[0].kind == 'class']
     func_groups = [g for g in other_groups if g.definitions[0].kind == 'function']
 
-    class_groups.sort(key=lambda g: (g.name, g._first_index))
-    func_groups.sort(key=lambda g: (g.name, g._first_index))
+    class_groups.sort(key=lambda g: (g.name, g.first_index))
+    func_groups.sort(key=lambda g: (g.name, g.first_index))
 
     ordered_groups = _pin_eager_groups(class_groups + func_groups + main_groups, policy=policy)
     result: list[Definition] = []

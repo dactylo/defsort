@@ -1,10 +1,9 @@
 import pytest
 
-from defsort._color import (
+from defsort._display._color import (
     _BLUE,
     _CYAN,
     _MAGENTA,
-    RED,
 )
 from defsort._display._movement import (
     _format_method_tables,
@@ -21,13 +20,14 @@ from defsort._types import (
     SectionBoundary,
     SortResult,
 )
-from tests.display._helpers import _make_def, _make_result
+from defsort._vendor.hookfront._color import RED
+from defsort._vendor.hookfront._terminal import escape_terminal_text
+from tests.display._helpers import make_def, make_result, method_swap
 
 
 class TestCountMovedSplit:
     def test_both_defs_and_methods(self) -> None:
-        _d = _make_def
-        m = MethodDefinition
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -36,17 +36,7 @@ class TestCountMovedSplit:
             warning=None,
             blocking_code=[],
             method_sorts=[
-                MethodSortInfo(
-                    class_name='C',
-                    original_order=[
-                        m(index=0, name='b', start_line=1, end_line=2, source=''),
-                        m(index=1, name='a', start_line=3, end_line=4, source=''),
-                    ],
-                    new_order=[
-                        m(index=1, name='a', start_line=3, end_line=4, source=''),
-                        m(index=0, name='b', start_line=1, end_line=2, source=''),
-                    ],
-                ),
+                method_swap('C', ('b', 'a'), lines=(1, 3)),
             ],
         )
         top, methods = count_moved_split(result)
@@ -54,8 +44,7 @@ class TestCountMovedSplit:
         assert methods == 2
 
     def test_methods_only(self) -> None:
-        _d = _make_def
-        m = MethodDefinition
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -64,17 +53,7 @@ class TestCountMovedSplit:
             warning=None,
             blocking_code=[],
             method_sorts=[
-                MethodSortInfo(
-                    class_name='C',
-                    original_order=[
-                        m(index=0, name='b', start_line=1, end_line=2, source=''),
-                        m(index=1, name='a', start_line=3, end_line=4, source=''),
-                    ],
-                    new_order=[
-                        m(index=1, name='a', start_line=3, end_line=4, source=''),
-                        m(index=0, name='b', start_line=1, end_line=2, source=''),
-                    ],
-                ),
+                method_swap('C', ('b', 'a'), lines=(1, 3)),
             ],
         )
         top, methods = count_moved_split(result)
@@ -82,7 +61,7 @@ class TestCountMovedSplit:
         assert methods == 2
 
     def test_no_movement(self) -> None:
-        _d = _make_def
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -98,44 +77,14 @@ class TestCountMovedSplit:
 
 class TestFormatMethodTables:
     def test_all_moved_header(self) -> None:
-        m = MethodDefinition
-        methods_orig = [
-            m(index=0, name='bravo', start_line=2, end_line=3, source=''),
-            m(index=1, name='alpha', start_line=5, end_line=6, source=''),
-        ]
-        methods_new = [
-            m(index=1, name='alpha', start_line=5, end_line=6, source=''),
-            m(index=0, name='bravo', start_line=2, end_line=3, source=''),
-        ]
-        info = MethodSortInfo(class_name='Foo', original_order=methods_orig, new_order=methods_new)
+        info = method_swap('Foo', ('bravo', 'alpha'), lines=(2, 5))
         output = _format_method_tables([info])
         assert 'Foo (2 methods):' in output
         assert 'of' not in output.split('Foo')[1].split(':')[0]
 
     def test_multiple_classes(self) -> None:
-        m = MethodDefinition
-        info1 = MethodSortInfo(
-            class_name='Foo',
-            original_order=[
-                m(index=0, name='b', start_line=2, end_line=3, source=''),
-                m(index=1, name='a', start_line=5, end_line=6, source=''),
-            ],
-            new_order=[
-                m(index=1, name='a', start_line=5, end_line=6, source=''),
-                m(index=0, name='b', start_line=2, end_line=3, source=''),
-            ],
-        )
-        info2 = MethodSortInfo(
-            class_name='Bar',
-            original_order=[
-                m(index=0, name='z', start_line=2, end_line=3, source=''),
-                m(index=1, name='y', start_line=5, end_line=6, source=''),
-            ],
-            new_order=[
-                m(index=1, name='y', start_line=5, end_line=6, source=''),
-                m(index=0, name='z', start_line=2, end_line=3, source=''),
-            ],
-        )
+        info1 = method_swap('Foo', ('b', 'a'), lines=(2, 5))
+        info2 = method_swap('Bar', ('z', 'y'), lines=(2, 5))
         output = _format_method_tables([info1, info2])
         assert 'Foo' in output
         assert 'Bar' in output
@@ -184,16 +133,7 @@ class TestFormatMethodTables:
 
 class TestFormatMethodTablesSpectralColor:
     def test_moved_methods_get_spectral_color(self) -> None:
-        m = MethodDefinition
-        methods_orig = [
-            m(index=0, name='bravo', start_line=2, end_line=3, source=''),
-            m(index=1, name='alpha', start_line=5, end_line=6, source=''),
-        ]
-        methods_new = [
-            m(index=1, name='alpha', start_line=5, end_line=6, source=''),
-            m(index=0, name='bravo', start_line=2, end_line=3, source=''),
-        ]
-        info = MethodSortInfo(class_name='Foo', original_order=methods_orig, new_order=methods_new)
+        info = method_swap('Foo', ('bravo', 'alpha'), lines=(2, 5))
         output = _format_method_tables([info], color=True)
         lines = output.splitlines()
         # Class header (line 0) is bold
@@ -221,29 +161,8 @@ class TestFormatMethodTablesSpectralColor:
         ]
 
     def test_per_class_independent_spectrum(self) -> None:
-        m = MethodDefinition
-        info1 = MethodSortInfo(
-            class_name='Foo',
-            original_order=[
-                m(index=0, name='b', start_line=2, end_line=3, source=''),
-                m(index=1, name='a', start_line=5, end_line=6, source=''),
-            ],
-            new_order=[
-                m(index=1, name='a', start_line=5, end_line=6, source=''),
-                m(index=0, name='b', start_line=2, end_line=3, source=''),
-            ],
-        )
-        info2 = MethodSortInfo(
-            class_name='Bar',
-            original_order=[
-                m(index=0, name='z', start_line=2, end_line=3, source=''),
-                m(index=1, name='y', start_line=5, end_line=6, source=''),
-            ],
-            new_order=[
-                m(index=1, name='y', start_line=5, end_line=6, source=''),
-                m(index=0, name='z', start_line=2, end_line=3, source=''),
-            ],
-        )
+        info1 = method_swap('Foo', ('b', 'a'), lines=(2, 5))
+        info2 = method_swap('Bar', ('z', 'y'), lines=(2, 5))
         output = _format_method_tables([info1, info2], color=True)
         # Both classes should have colored rows
         # Both class sections start their gradient at RED
@@ -302,7 +221,7 @@ class TestFormatMethodTablesSpectralColor:
 
 class TestFormatMovementTable:
     def test_repeated_names_correct_movement(self) -> None:
-        _d = _make_def
+        _d = make_def
         # original [bravo, alpha, alpha] -> new [alpha, alpha, bravo]
         # Second alpha moved from pos 2 to pos 1: should show ^1
         result = SortResult(
@@ -322,7 +241,7 @@ class TestFormatMovementTable:
 
 class TestFormatMovementTableCompactMode:
     def test_default_shows_only_moved_rows(self) -> None:
-        _d = _make_def
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -340,7 +259,7 @@ class TestFormatMovementTableCompactMode:
         assert 'delta' not in '\n'.join(data_lines)
 
     def test_verbose_shows_all_rows(self) -> None:
-        _d = _make_def
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -356,7 +275,7 @@ class TestFormatMovementTableCompactMode:
         assert data_lines[3] == 'delta    delta     -'
 
     def test_verbose_spectral_color_on_moved_rows(self) -> None:
-        _d = _make_def
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -376,7 +295,7 @@ class TestFormatMovementTableCompactMode:
 
 class TestFormatMovementTableSpectralColor:
     def test_current_colored_by_destination(self) -> None:
-        _d = _make_def
+        _d = make_def
         # Simple swap: bravo(0) <-> alpha(1)
         # In proposed order: alpha(1) is pos 0 (RED), bravo(0) is pos 1
         # Current column: row 0 shows bravo (original_order[0])
@@ -400,7 +319,7 @@ class TestFormatMovementTableSpectralColor:
         ]
 
     def test_moved_rows_get_spectral_color(self) -> None:
-        _d = _make_def
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -419,7 +338,7 @@ class TestFormatMovementTableSpectralColor:
             assert '\033[1m' not in line  # no bold
 
     def test_proposed_and_move_share_color(self) -> None:
-        _d = _make_def
+        _d = make_def
         # 6 defs: each gets a unique spectrum color
         orig = [_d(i, name) for i, name in enumerate(['f', 'e', 'd', 'c', 'b', 'a'])]
         new = [
@@ -443,7 +362,7 @@ class TestFormatMovementTableSpectralColor:
         ]
 
     def test_spectral_colors_span_only_moved_items(self) -> None:
-        _d = _make_def
+        _d = make_def
         # 8 defs total, first 2 unmoved (already in sorted position).
         # Moved items (6) should each get a distinct spectrum color.
         orig = [
@@ -487,7 +406,7 @@ class TestFormatMovementTableSpectralColor:
         assert _BLUE in lines[5]
 
     def test_unmoved_rows_no_color(self) -> None:
-        _d = _make_def
+        _d = make_def
         result = SortResult(
             original_source='',
             new_source='x',
@@ -505,7 +424,7 @@ class TestFormatMovementTableSpectralColor:
 
 class TestMovementPositions:
     def test_repeated_names_use_stable_indices(self) -> None:
-        original = [_make_def(4, 'same'), _make_def(9, 'middle'), _make_def(7, 'same')]
+        original = [make_def(4, 'same'), make_def(9, 'middle'), make_def(7, 'same')]
         proposed = [original[2], original[1], original[0]]
 
         positions = movement_positions(original, proposed)
@@ -519,7 +438,7 @@ class TestPrintPreview:
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        result = _make_result(changed=False)
+        result = make_result(changed=False)
         result.banner_constraints = [
             BannerConstraint(
                 scope='definitions',
@@ -561,7 +480,7 @@ class TestPrintPreview:
     ) -> None:
         emitted = print_preview(
             'test.py',
-            _make_result(changed=True),
+            make_result(changed=True),
             verbose=False,
             ordering='dependency',
             color=True,
@@ -573,7 +492,7 @@ class TestPrintPreview:
         assert capsys.readouterr().out.startswith('\033[1mtest.py\033[0m:\n\n')
 
     def test_emits_movement_table(self, capsys: pytest.CaptureFixture[str]) -> None:
-        result = _make_result(changed=True)
+        result = make_result(changed=True)
         emitted = print_preview(
             'test.py',
             result,
@@ -596,7 +515,7 @@ class TestPrintPreview:
     ) -> None:
         emitted = print_preview(
             'bad\x1b]2;path\x07.py',
-            _make_result(changed=True),
+            make_result(changed=True),
             verbose=False,
             ordering='dependency',
             color=True,
@@ -610,7 +529,7 @@ class TestPrintPreview:
         assert output.count('\n') > 2
 
     def test_unchanged_no_verbose(self) -> None:
-        result = _make_result(changed=False)
+        result = make_result(changed=False)
         emitted = print_preview(
             'test.py',
             result,
@@ -622,8 +541,36 @@ class TestPrintPreview:
         )
         assert emitted is False
 
+    def test_unchanged_preview_escapes_path_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = 'bad\x85name.py'
+        escaped_inputs: list[str] = []
+
+        def record_escape(value: str) -> str:
+            escaped_inputs.append(value)
+            return escape_terminal_text(value)
+
+        monkeypatch.setattr('defsort._display._movement.escape_terminal_text', record_escape)
+
+        emitted = print_preview(
+            path,
+            make_result(changed=False),
+            verbose=True,
+            ordering='dependency',
+            color=False,
+            multi=False,
+            first=True,
+        )
+
+        assert emitted is True
+        assert capsys.readouterr().out == 'bad\\x85name.py: already in dependency order\n'
+        assert escaped_inputs == [path]
+
     def test_unchanged_verbose(self, capsys: pytest.CaptureFixture[str]) -> None:
-        result = _make_result(changed=False)
+        result = make_result(changed=False)
         emitted = print_preview(
             'test.py',
             result,
@@ -642,7 +589,7 @@ class TestPrintPreview:
     ) -> None:
         emitted = print_preview(
             'test.py',
-            _make_result(changed=False),
+            make_result(changed=False),
             verbose=True,
             ordering='dependency',
             color=True,

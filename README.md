@@ -31,8 +31,9 @@ To update an existing installation after pulling changes:
 uv tool install --reinstall .
 ```
 
-Git 2.42 or newer is required for agent hooks, incremental mode, and a configured reorder guard.
-Ordinary CLI sorting and the library do not require Git. See
+Git 2.42 or newer is required for incremental mode and the reorder guard on the command line, after
+an agent's edit, and in commits that sort working-tree files. Sorting staged files at commit time
+works with older Git. Ordinary CLI sorting and the library do not require Git. See
 [platform compatibility](docs/platform.md) for runtime requirements and file-handling details.
 
 ## Quick start
@@ -78,8 +79,7 @@ sorted baselines file by file and limit later reordering.
   commits and preserves partial staging. Follow the [hook setup guide](docs/hook.md#configuration)
   for Claude Code, Codex, or Antigravity. Choose either plugin installation or manual registration.
 - **Multiple formatting hooks:** use the
-  [composition guide](docs/hook.md#composing-with-other-hooks) to run modifying hooks in order. It
-  includes the current Antigravity limitation.
+  [composition guide](docs/hook.md#composing-with-other-hooks) to run modifying hooks in order.
 - **pre-commit:** use a local registration with an installed CLI as described in the
   [pre-commit guide](docs/hook.md#pre-commit).
 
@@ -112,7 +112,7 @@ Use `check()` to inspect skipped or invalid source before deciding what to do. T
 
 See the [development guide](docs/development.md) for pinned CI dependencies and lock updates.
 
-Run `make setup` with uv 0.12.23 to create the pinned `.venv` before project commands.
+Run `make setup` with uv 0.13.6 to create the pinned `.venv` before project commands.
 `make install` and `make reinstall` install only the CLI through uv.
 
 ```bash
@@ -120,9 +120,6 @@ make quality # read-only quality checks
 make check   # quality checks and one full test run
 make format  # apply repository formatters
 ```
-
-To contribute an agent integration, see
-[adding a bundled agent](docs/hook.md#adding-a-bundled-agent).
 
 ## License
 

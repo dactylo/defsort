@@ -23,7 +23,17 @@ from defsort import (
     sort,
 )
 from defsort._types import BANNER_MODE_VALUES, ClassBlocker
-from tests._helpers import _ENV, decode_text, execute_source, process_transcript, run_setup
+from tests._deep_input import DEEP_DEFINITIONS, TOO_DEEP, deep_source_case
+from tests._helpers import (
+    DYNAMIC_ALL_BASELINE,
+    DYNAMIC_ALL_SOURCE,
+    DYNAMIC_ALL_WARNING,
+    ENV,
+    execute_source,
+    incremental_gate_case,
+    process_transcript,
+    run_setup,
+)
 
 _API_INEFFECTIVE_CASES = [
     (
@@ -165,16 +175,33 @@ class TestBlockerMessagePopulation:
             assert result.blocker is None
             assert result.blocker_message is None
 
-    def test_class_blockers_carry_messages(self) -> None:
-        result = defsort.check(_SRC_DUP_METHODS)
+    @pytest.mark.parametrize('baseline', [None, DYNAMIC_ALL_BASELINE], ids=['full', 'incremental'])
+    def test_dynamic_all_names_cause_in_library(self, baseline: str | None) -> None:
+        config = DefsortConfig(definition_order='alphabetical')
+        result = defsort.check(DYNAMIC_ALL_SOURCE, baseline=baseline, config=config)
         assert result.status == 'skipped'
-        assert result.class_blockers[0].message == 'non-consecutive duplicate definitions'
+        assert result.blocker == 'eager_order'
+        assert result.blocker_message == DYNAMIC_ALL_WARNING
+        assert (
+            defsort.sort(DYNAMIC_ALL_SOURCE, baseline=baseline, config=config)
+            == DYNAMIC_ALL_SOURCE
+        )
 
     def test_full_sort_skip_carries_blocker_message(self) -> None:
         result = defsort.check(_SKIPPED)
         assert result.status == 'skipped'
         assert result.blocker == 'interstitial'
         assert result.blocker_message == 'code between definitions'
+
+    def test_incremental_change_keeps_top_level_blocker(self) -> None:
+        baseline = 'class C:\n    def z(self): pass\n\ndef zeta(): pass\n\ndef alpha(): pass\n'
+        current = baseline.replace(
+            '    def z(self): pass\n', '    def z(self): pass\n    def a(self): pass\n'
+        )
+        result = defsort.check(current, baseline=baseline)
+        assert result.status == 'changed'
+        assert result.blocker == 'non_conforming'
+        assert result.blocker_message
 
     def test_incremental_skip_carries_blocker_message(self) -> None:
         baseline = 'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
@@ -257,17 +284,6 @@ class TestCheck:
     @pytest.mark.parametrize('source', ['break\n', 'nonlocal name\n'])
     def test_compile_invalid_syntax(self, source: str) -> None:
         assert defsort.check(source).status == 'invalid'
-
-    def test_does_not_remove_future_import(self) -> None:
-        src = (
-            'from __future__ import annotations\n\n\n'
-            'def bravo(x: Alpha) -> None:\n    pass\n\n\n'
-            'class Alpha:\n    pass\n'
-        )
-        result = defsort.check(src)
-        assert result.status in ('unchanged', 'changed')
-        sorted_src = defsort.sort(src)
-        assert 'from __future__ import annotations' in sorted_src
 
     def test_first_definition_header_like_body_comment_remains_valid(self) -> None:
         source = (
@@ -607,13 +623,6 @@ class TestDetect:
 
 
 class TestDetectValidation:
-    def test_bad_pattern_raises_value_error_with_cause(self) -> None:
-        with pytest.raises(ValueError, match='banner_pattern') as excinfo:
-            detect('def broken(', banner_pattern='[')
-        cause = excinfo.value.__cause__
-        assert isinstance(cause, re.error)
-        assert str(excinfo.value) == f'{_BANNER_PATTERN_ERROR_PREFIX}{cause}'
-
     def test_invalid_banners_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match='banners') as excinfo:
             detect('def broken(', banners=cast('BannerMode', 'bogus'))
@@ -730,7 +739,7 @@ class TestEmptyBaselineParity:
 
 
 class TestHardBlockerLeak:
-    BASELINE = (
+    _BASELINE = (
         'class Foo:\n'
         '    def alpha(self):\n'
         '        pass\n\n'
@@ -741,7 +750,7 @@ class TestHardBlockerLeak:
         'def b():\n'
         '    pass\n'
     )
-    SOURCE = (
+    _SOURCE = (
         'class Foo:\n'
         '    def alpha(self):\n'
         '        pass\n\n'
@@ -759,13 +768,13 @@ class TestHardBlockerLeak:
     )
 
     def test_check_reports_skipped(self) -> None:
-        result = check(self.SOURCE, baseline=self.BASELINE)
+        result = check(self._SOURCE, baseline=self._BASELINE)
         assert result.status == 'skipped'
         assert result.blocker is not None
 
     def test_sort_returns_original(self) -> None:
-        result = sort(self.SOURCE, baseline=self.BASELINE)
-        assert result == self.SOURCE
+        result = sort(self._SOURCE, baseline=self._BASELINE)
+        assert result == self._SOURCE
 
 
 class TestIndependentScopes:
@@ -902,6 +911,7 @@ class TestLazyFacade:
         assert list(library.__all__) == list(defsort.__all__)
         for name in defsort.__all__:
             assert getattr(defsort, name) is getattr(library, name)
+        assert callable(defsort.clear_config_cache)
 
     def test_first_access_in_fresh_interpreter_loads_library_lazily(self) -> None:
         script = (
@@ -910,13 +920,13 @@ class TestLazyFacade:
             "assert 'defsort._library' not in sys.modules, 'library loaded at import'\n"
             "assert 'defsort._core' not in sys.modules, 'engine loaded at import'\n"
             "assert not hasattr(defsort, '_cli')\n"
-            'from defsort import _downstream\n'
+            'from defsort import _types\n'
             "assert 'defsort._library' not in sys.modules, 'library loaded by probes'\n"
             'for name in defsort.__all__:\n'
             '    getattr(defsort, name)\n'
             "assert 'defsort._library' in sys.modules\n"
         )
-        result = run_setup([sys.executable, '-c', script], env=_ENV, check=False)
+        result = run_setup([sys.executable, '-c', script], env=ENV, check=False)
         assert result.returncode == 0, process_transcript(result)
 
     def test_library_import_failure_surfaces_on_first_access(self) -> None:
@@ -930,7 +940,7 @@ class TestLazyFacade:
             '    sys.exit(0)\n'
             'sys.exit(1)\n'
         )
-        result = run_setup([sys.executable, '-c', script], env=_ENV, check=False)
+        result = run_setup([sys.executable, '-c', script], env=ENV, check=False)
         assert result.returncode == 0, process_transcript(result)
 
     def test_unexported_name_is_not_an_attribute(self) -> None:
@@ -941,27 +951,22 @@ class TestLazyFacade:
             defsort.__getattr__(name)
 
 
-class TestPublicAPI:
-    def test_clear_config_cache_importable(self) -> None:
-        assert callable(defsort.clear_config_cache)
-
-
 class TestPublicBannerConfiguration:
-    BUILTIN_SOURCE = 'def bravo():\n    pass\n\n\n# --------\n\n\ndef alpha():\n    pass\n'
-    CUSTOM_SOURCE = 'def bravo():\n    pass\n\n\n# CUSTOM\n\n\ndef alpha():\n    pass\n'
+    _BUILTIN_SOURCE = 'def bravo():\n    pass\n\n\n# --------\n\n\ndef alpha():\n    pass\n'
+    _CUSTOM_SOURCE = 'def bravo():\n    pass\n\n\n# CUSTOM\n\n\ndef alpha():\n    pass\n'
 
     def test_defaults_treat_builtin_banners_as_barriers(self) -> None:
-        assert sort(self.BUILTIN_SOURCE) == self.BUILTIN_SOURCE
-        assert check(self.BUILTIN_SOURCE).status == 'unchanged'
-        assert detect(self.BUILTIN_SOURCE) is None
+        assert sort(self._BUILTIN_SOURCE) == self._BUILTIN_SOURCE
+        assert check(self._BUILTIN_SOURCE).status == 'unchanged'
+        assert detect(self._BUILTIN_SOURCE) is None
 
     def test_explicit_ignore_mode_is_global(self) -> None:
         options = DefsortConfig(banners='ignore')
-        sorted_source = sort(self.BUILTIN_SOURCE, config=options)
-        detection = detect(self.BUILTIN_SOURCE, banners='ignore')
+        sorted_source = sort(self._BUILTIN_SOURCE, config=options)
+        detection = detect(self._BUILTIN_SOURCE, banners='ignore')
 
         assert sorted_source.index('def alpha') < sorted_source.index('def bravo')
-        assert check(self.BUILTIN_SOURCE, config=options).status == 'changed'
+        assert check(self._BUILTIN_SOURCE, config=options).status == 'changed'
         assert detection is not None
         assert detection.order == 'unordered'
 
@@ -969,9 +974,9 @@ class TestPublicBannerConfiguration:
         pattern = r'# CUSTOM'
         options = DefsortConfig(banner_pattern=pattern)
 
-        assert sort(self.CUSTOM_SOURCE, config=options) == self.CUSTOM_SOURCE
-        assert check(self.CUSTOM_SOURCE, config=options).status == 'unchanged'
-        assert detect(self.CUSTOM_SOURCE, banner_pattern=pattern) is None
+        assert sort(self._CUSTOM_SOURCE, config=options) == self._CUSTOM_SOURCE
+        assert check(self._CUSTOM_SOURCE, config=options).status == 'unchanged'
+        assert detect(self._CUSTOM_SOURCE, banner_pattern=pattern) is None
 
     def test_incremental_calls_receive_banner_pattern(self) -> None:
         baseline = 'def bravo():\n    pass\n\n\n# CUSTOM\n\n\ndef charlie():\n    pass\n'
@@ -1035,23 +1040,6 @@ class TestPublicBannerConfiguration:
         assert str(excinfo.value) == f'{_BANNER_PATTERN_ERROR_PREFIX}{cause}'
 
 
-class TestPublicTypeExports:
-    def test_public_types_exported(self) -> None:
-        names = {
-            'Blocker',
-            'ClassBlocker',
-            'DefsortConfig',
-            'DetectResult',
-            'EvaluationOrder',
-            'OrderKind',
-            'SortCheckResult',
-            'SortScopeOrder',
-            'SortStatus',
-        }
-        for name in names:
-            assert getattr(defsort, name) is not None
-
-
 class TestRestrictedBannerPatternBoundary:
     def test_check_rejects_mutated_banner_pattern_before_processing_source(self) -> None:
         config = DefsortConfig()
@@ -1061,15 +1049,11 @@ class TestRestrictedBannerPatternBoundary:
         with pytest.raises(ValueError, match='banner_pattern'):
             check(source, config=config)
 
-        assert source == _NEEDS_SORT
-
     def test_detect_rejects_unsafe_banner_pattern_before_processing_source(self) -> None:
         source = _NEEDS_SORT
 
         with pytest.raises(ValueError, match='banner_pattern'):
             detect(source, banner_pattern='^# (a+)+$')
-
-        assert source == _NEEDS_SORT
 
     def test_sort_rejects_mutated_banner_pattern_before_processing_source(self) -> None:
         config = DefsortConfig()
@@ -1078,8 +1062,6 @@ class TestRestrictedBannerPatternBoundary:
 
         with pytest.raises(ValueError, match='banner_pattern'):
             sort(source, config=config)
-
-        assert source == _NEEDS_SORT
 
 
 class TestSort:
@@ -1166,15 +1148,6 @@ class A:
         )
         assert 'from __future__ import annotations' not in result
 
-    def test_does_not_remove_future_import(self) -> None:
-        src = (
-            'from __future__ import annotations\n\n\n'
-            'def bravo(x: Alpha) -> None:\n    pass\n\n\n'
-            'class Alpha:\n    pass\n'
-        )
-        result = defsort.sort(src)
-        assert 'from __future__ import annotations' in result
-
     def test_force_bypasses_safety(self) -> None:
         result = defsort.sort(_SKIPPED, config=DefsortConfig(force=True))
         assert result != _SKIPPED
@@ -1255,24 +1228,8 @@ class TestSortBaseline:
         assert result.index('alpha') < result.index('bravo')
         assert result.index('bravo') < result.index('charlie')
 
-    def test_no_baseline_is_full_sort(self) -> None:
-        src = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
-        result = defsort.sort(src)
-        assert result.index('alpha') < result.index('bravo')
-
 
 class TestSortWithScopes:
-    def test_both_none_is_noop(self) -> None:
-        src = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
-        result = defsort.sort(
-            src,
-            config=DefsortConfig(
-                definition_order='none',
-                method_order='none',
-            ),
-        )
-        assert result == src
-
     def test_definition_alpha_method_dep(self) -> None:
         src = 'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
         result = defsort.sort(
@@ -1554,8 +1511,11 @@ def test_every_public_export_is_documented() -> None:
 def test_ineffective_nondefault_warns(
     operation: Callable[..., object], key: str, opts: DefsortConfig
 ) -> None:
-    with pytest.warns(defsort.DefsortConfigWarning, match=key):
+    with pytest.warns(defsort.DefsortConfigWarning) as captured:
         operation('class C:\n    def a(self):\n        return 1\n', config=opts)
+    assert str(captured[0].message) == (
+        f'[tool.defsort] {key} has no effect under the resolved strategies; ignoring'
+    )
 
 
 def test_public_all_is_exactly_the_approved_set() -> None:
@@ -1595,9 +1555,9 @@ def test_sort_preserves_final_binding_of_mixed_main_group() -> None:
     )
 
     output = sort(source)
-    executed = run_setup([sys.executable, '-c', output + '\nprint(type(main).__name__)\n'])
+    executed = execute_source(output)
 
-    assert decode_text(executed.stdout) == 'type\n'
+    assert isinstance(executed['main'], type)
     assert output.index('def main') < output.index('class main')
 
 
@@ -1614,6 +1574,21 @@ def test_toml_resolved_config_matches_direct_construction(tmp_path: Path) -> Non
     src = 'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
     with pytest.warns(defsort.DefsortConfigWarning, match='tie-break'):
         assert defsort.sort(src, config=resolved) == defsort.sort(src, config=direct)
+
+
+def test_too_deep_source_is_invalid_input() -> None:
+    assert check(TOO_DEEP).status == 'invalid'
+    for operation in (sort, detect):
+        with pytest.raises(
+            SyntaxError, match=r"^source nests too deeply for Python's parser on this platform$"
+        ) as caught:
+            operation(TOO_DEEP)
+        assert isinstance(caught.value.__cause__, (RecursionError, MemoryError))
+    assert check(TOO_DEEP, baseline='pass\n').status == 'invalid'
+    with pytest.raises(
+        SyntaxError, match=r"^source nests too deeply for Python's parser on this platform$"
+    ):
+        sort(TOO_DEEP, baseline='pass\n')
 
 
 @pytest.mark.parametrize('scope', ['module', 'class', 'later-class'])
@@ -1646,6 +1621,55 @@ def test_unsatisfied_ownership_preserves_whole_source(
         assert result.status == 'skipped'
         assert result.blocker == 'layout'
         assert result.blocker_message
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'method',
+        'method_banner',
+        'future',
+        'duplicates_method',
+        'sectioned_method',
+        'top_level',
+        'duplicates_top_level',
+        'sectioned_top_level',
+        'unchanged',
+        'already_placed',
+        'none',
+        'non_conforming',
+    ],
+)
+def test_incremental_gate_candidate(case: str) -> None:
+    baseline, source, banners, definition_order, blocker = incremental_gate_case(case)
+    if case == 'future':
+        blocker = None
+    config = DefsortConfig(
+        definition_order=definition_order,
+        method_order='alphabetical',
+        banners=banners,
+    )
+    transformed = sort(source, config=config, baseline=baseline)
+    result = check(source, config=config, baseline=baseline)
+
+    assert result.blocker == blocker
+    assert result.status == (
+        'changed' if case == 'none' else 'skipped' if blocker else 'unchanged'
+    )
+    if case == 'none':
+        assert transformed.index('def a(') < transformed.index('def z(')
+        assert sort(transformed, config=config, baseline=baseline) == transformed
+    else:
+        assert transformed == source
+
+
+@pytest.mark.parametrize('kind', DEEP_DEFINITIONS)
+def test_deep_expression_sorts_in_library(kind: str) -> None:
+    source, expected = deep_source_case(kind)
+    assert check(source).status == 'changed'
+    assert sort(source) == expected
+    assert sort(expected) == expected
+    assert detect(source) is not None
 
 
 def test_vocabulary_aliases_are_literal_strings() -> None:

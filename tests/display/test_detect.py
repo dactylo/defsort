@@ -8,8 +8,6 @@ from defsort._types import DetectResult
 if TYPE_CHECKING:
     import pytest
 
-    from defsort._types import OrderKind
-
 
 class TestPrintDetect:
     def test_path_controls_escape_before_alignment(
@@ -23,12 +21,7 @@ class TestPrintDetect:
             ),
             ('plain.py', DetectResult(order='alphabetical', dep_score=0.30, alpha_score=0.95)),
         ]
-        totals: tuple[dict[OrderKind, int], int] = (
-            {'dependency': 1, 'alphabetical': 1},
-            2,
-        )
-
-        print_detect(entries, totals, verbose=False)
+        print_detect(entries, verbose=False)
 
         lines = capsys.readouterr().out.splitlines()
         assert lines[0].startswith(r'bad\x09name\x0a\x85.py')
@@ -38,8 +31,7 @@ class TestPrintDetect:
         entries: list[tuple[str, DetectResult | None]] = [
             ('mod.py', DetectResult(order='dependency', dep_score=0.95, alpha_score=0.30)),
         ]
-        totals: tuple[dict[OrderKind, int], int] = ({'dependency': 1}, 1)
-        print_detect(entries, totals, verbose=False)
+        print_detect(entries, verbose=False)
         output = capsys.readouterr().out
         assert 'mod.py' in output
         assert 'dependency' in output
@@ -49,11 +41,7 @@ class TestPrintDetect:
             ('a.py', DetectResult(order='dependency', dep_score=0.95, alpha_score=0.30)),
             ('b.py', DetectResult(order='alphabetical', dep_score=0.30, alpha_score=0.95)),
         ]
-        totals: tuple[dict[OrderKind, int], int] = (
-            {'dependency': 1, 'alphabetical': 1},
-            2,
-        )
-        print_detect(entries, totals, verbose=False)
+        print_detect(entries, verbose=False)
         output = capsys.readouterr().out
         assert '2 files' in output
 
@@ -61,8 +49,7 @@ class TestPrintDetect:
         entries: list[tuple[str, DetectResult | None]] = [
             ('mod.py', DetectResult(order='dependency', dep_score=0.95, alpha_score=0.30)),
         ]
-        totals: tuple[dict[OrderKind, int], int] = ({'dependency': 1}, 1)
-        print_detect(entries, totals, verbose=True)
+        print_detect(entries, verbose=True)
         output = capsys.readouterr().out
         assert 'tau' in output
 
@@ -70,8 +57,7 @@ class TestPrintDetect:
         entries: list[tuple[str, DetectResult | None]] = [
             ('single.py', None),
         ]
-        totals: tuple[dict[OrderKind, int], int] = ({}, 0)
-        print_detect(entries, totals, verbose=True)
+        print_detect(entries, verbose=True)
         output = capsys.readouterr().out
         assert 'single.py' in output
         assert 'too few definitions' in output

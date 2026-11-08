@@ -1,10 +1,10 @@
 """Detect-mode output formatting."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 
 from defsort._display._width import pad_cells
-from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import DetectResult, OrderKind
+from defsort._vendor.hookfront._terminal import escape_terminal_text, path_text
 
 _DETECT_SUMMARY_ORDER: tuple[OrderKind, ...] = (
     'dependency',
@@ -26,20 +26,19 @@ def _detect_score_str(order: OrderKind, dep_score: float, alpha_score: float) ->
 
 def print_detect(
     entries: Iterable[tuple[str, DetectResult | None]],
-    totals: tuple[Mapping[OrderKind, int], int],
     *,
     verbose: bool,
 ) -> None:
     """Print detect-mode results and summary.
 
     Args:
-        entries: List of (path, detection_or_None) tuples in file iteration
-            order. None means "too few definitions" (skipped). Preserves
-            interleaved ordering from _run_detect.
-        totals: (counts_dict, total_int) pair.
+        entries: List of (`path`, `detection_or_None`) tuples in file iteration
+            order. `None` means "too few definitions" (skipped). Preserves
+            interleaved ordering from `_run_detect`.
         verbose: Whether to show tau scores and skipped files.
     """
-    counts, total = totals
+    counts: dict[OrderKind, int] = {}
+    total = 0
     lines: list[str] = []
 
     for path, result in entries:
@@ -48,7 +47,10 @@ def print_detect(
             # Skipped file (too few definitions) -- verbose only
             if verbose:
                 lines.append(f'{pad_cells(safe_path, 40)} (too few definitions)')
-        elif verbose:
+            continue
+        total += 1
+        counts[result.order] = counts.get(result.order, 0) + 1
+        if verbose:
             score_str = _detect_score_str(result.order, result.dep_score, result.alpha_score)
             lines.append(f'{pad_cells(safe_path, 40)} {result.order:<13} {score_str}')
         else:

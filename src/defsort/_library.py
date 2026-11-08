@@ -1,11 +1,11 @@
 """Library API implementation behind the package facade."""
 
-import ast
 import warnings
 
 from defsort._config import (
     DefsortConfigWarning,
     clear_config_cache,
+    ineffective_policy_message,
     resolve_config,
 )
 from defsort._config import (
@@ -13,6 +13,7 @@ from defsort._config import (
 )
 from defsort._core import detect_order, sort_file
 from defsort._core._incremental import sort_incremental_impl
+from defsort._core._syntax import parse_source
 from defsort._types import (
     BANNER_MODE_VALUES,
     BannerMode,
@@ -43,6 +44,30 @@ from defsort._types import (
     blocker_message as _blocker_message,
 )
 
+__all__ = [
+    'BannerMode',
+    'Blocker',
+    'ClassBlocker',
+    'DefsortConfig',
+    'DefsortConfigWarning',
+    'DetectResult',
+    'EvaluationOrder',
+    'MainPlacement',
+    'MethodBodies',
+    'MethodDunders',
+    'MethodVisibility',
+    'OrderKind',
+    'SortCheckResult',
+    'SortScopeOrder',
+    'SortStatus',
+    'TieBreak',
+    'check',
+    'clear_config_cache',
+    'detect',
+    'resolve_config',
+    'sort',
+]
+
 
 def _apply_hard_blocker(new_source: str | None, blocker: Blocker | None) -> str | None:
     """Suppress new_source when a hard blocker is present."""
@@ -55,7 +80,7 @@ def _engine_options(config: DefsortConfig) -> _EngineOptions:
     """Convert public configuration to concrete non-transforming engine settings."""
     for key in _ineffective_policy_values(config):
         warnings.warn(
-            f'[tool.defsort] {key} has no effect under the resolved strategies',
+            ineffective_policy_message(key),
             DefsortConfigWarning,
             stacklevel=3,
         )
@@ -76,7 +101,7 @@ def _check_incremental(
 ) -> SortCheckResult:
     """Check whether incremental sorting would change the source."""
     try:
-        tree = ast.parse(source)
+        tree = parse_source(source)
     except (SyntaxError, ValueError):
         return SortCheckResult(status='invalid')
 
@@ -96,6 +121,12 @@ def _check_incremental(
     if new_source is not None:
         return SortCheckResult(
             status='changed',
+            blocker=result.blocker,
+            blocker_message=(
+                result.message or _blocker_message(result.blocker)
+                if result.blocker is not None
+                else None
+            ),
             banner_constrained=banner_constrained,
             class_blockers=result.class_blockers,
         )
@@ -108,7 +139,7 @@ def _check_incremental(
     return SortCheckResult(
         status='skipped',
         blocker=result.blocker,
-        blocker_message=_blocker_message(result.blocker),
+        blocker_message=result.message or _blocker_message(result.blocker),
         banner_constrained=banner_constrained,
         class_blockers=result.class_blockers,
     )
@@ -137,24 +168,27 @@ def check(
         config: Transformation configuration. Defaults to `DefsortConfig()`.
 
     Returns:
-        SortCheckResult with:
-            'invalid' if source is not valid Python (SyntaxError or ValueError,
-                including null bytes and lone Unicode surrogates).
-            'skipped' when sorting is blocked. A file-level skip carries its
+        `SortCheckResult` with:
+            `invalid` if source is not valid Python (`SyntaxError` or
+                `ValueError`, including null bytes and lone Unicode
+                surrogates).
+            `skipped` when sorting is blocked. A file-level skip carries its
                 classification in `blocker` and display text in
                 `blocker_message`. A class-only skip can instead report
                 `class_blockers` with both file-level fields `None`. A `layout`
                 blocker refuses the whole file even without an order change.
-            'changed' if sort() would change the source.
-            'unchanged' if source is already in the correct order.
+            `changed` if `sort()` would change the source. An incremental
+                change can carry a soft file-level blocker for the part left
+                unchanged in `blocker` and `blocker_message`.
+            `unchanged` if source is already in the correct order.
 
     Raises:
         TypeError: If `config.force` is not a `bool`, or
             `config.banner_pattern` is neither a string nor `None`.
-        ValueError: If a `config` vocabulary field holds an unknown value, or
+        ValueError: If a `config` vocabulary field holds an unknown value,
             `config.banner_pattern` does not compile or uses unsupported
-            syntax.
-            Compilation failures chain the `re.error`.
+            syntax, or parsing a non-empty baseline encounters a lone Unicode
+            surrogate. Pattern compilation failures chain the `re.error`.
     """
     policy = config if config is not None else DefsortConfig()
     validate_config(policy)
@@ -162,8 +196,7 @@ def check(
     if incremental_baseline is not None:
         return _check_incremental(source, incremental_baseline, options=policy)
     try:
-        tree = ast.parse(source)
-        compile(tree, '<defsort.check>', 'exec')
+        tree = parse_source(source, filename='<defsort.check>', check=True)
     except (SyntaxError, ValueError):
         return SortCheckResult(status='invalid')
     result = sort_file(
@@ -185,7 +218,7 @@ def check(
                 status='unchanged',
                 banner_constrained=banner_constrained,
             )
-        message = _blocker_message(result.blocker) if result.blocker is not None else None
+        message = result.warning if result.blocker is not None else None
         return SortCheckResult(
             status='skipped',
             blocker=result.blocker,
@@ -221,8 +254,8 @@ def detect(
             supported bounded subset.
 
     Returns:
-        DetectResult with classification and scores, or None when no comparable
-        section contains at least two definitions.
+        `DetectResult` with classification and scores, or `None` when no
+        comparable section contains at least two definitions.
 
     Raises:
         TypeError: If `banner_pattern` is neither a string nor `None`.
@@ -234,8 +267,7 @@ def detect(
     """
     validate_vocabulary('banners', banners, BANNER_MODE_VALUES)
     validate_banner_pattern(banner_pattern)
-    tree = ast.parse(source)  # raises SyntaxError for invalid Python
-    compile(tree, '<defsort.detect>', 'exec')
+    tree = parse_source(source, filename='<defsort.detect>', check=True)
     return detect_order(
         source,
         banners=banners,
@@ -270,15 +302,15 @@ def sort(
         SyntaxError: If source is not valid Python, including null bytes.
         ValueError: If a `config` vocabulary field holds an unknown value,
             `config.banner_pattern` does not compile or uses unsupported
-            syntax, or source contains lone Unicode surrogates. Compilation
-            failures chain the `re.error`.
+            syntax, or source or baseline contains a lone Unicode surrogate.
+            Pattern compilation failures chain the `re.error`.
     """
     policy = config if config is not None else DefsortConfig()
     validate_config(policy)
     engine_options = _engine_options(policy)
     incremental_baseline = _normalize_baseline(baseline)
     if incremental_baseline is not None:
-        tree = ast.parse(source)
+        tree = parse_source(source)
         result = sort_incremental_impl(
             source,
             incremental_baseline,
@@ -287,36 +319,10 @@ def sort(
         )
         new_source = _apply_hard_blocker(result.new_source, result.blocker)
         return new_source if new_source is not None else source
-    tree = ast.parse(source)
-    compile(tree, '<defsort.sort>', 'exec')
+    tree = parse_source(source, filename='<defsort.sort>', check=True)
     result = sort_file(
         source,
         options=engine_options,
         _tree=tree,
     )
     return result.new_source
-
-
-__all__ = [
-    'BannerMode',
-    'Blocker',
-    'ClassBlocker',
-    'DefsortConfig',
-    'DefsortConfigWarning',
-    'DetectResult',
-    'EvaluationOrder',
-    'MainPlacement',
-    'MethodBodies',
-    'MethodDunders',
-    'MethodVisibility',
-    'OrderKind',
-    'SortCheckResult',
-    'SortScopeOrder',
-    'SortStatus',
-    'TieBreak',
-    'check',
-    'clear_config_cache',
-    'detect',
-    'resolve_config',
-    'sort',
-]

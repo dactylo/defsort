@@ -110,11 +110,6 @@ class TestDetectOrder:
         assert result is not None
         assert result.order == 'both'
 
-    def test_dependency_order(self) -> None:
-        result = detect_order(_SRC_DEP)
-        assert result is not None
-        assert result.order in ('dependency', 'both')
-
     def test_detect_ignores_configured_policy(self) -> None:
         src = 'def zed():\n    return 1\n\n\ndef alpha():\n    return 2\n'
         result = detect_order(src)
@@ -267,19 +262,19 @@ class TestIncrementalFutureAnnotations:
     # `worker` annotates against `main`, and `main` is anchored last, so the
     # annotation can never be evaluated at definition time. Both sort modes must
     # add the postponed-annotations import.
-    ANCHORED_MAIN = 'def worker(value: main):\n    return value\n\n\ndef main():\n    return 1\n'
-    FUTURE_IMPORT = 'from __future__ import annotations'
+    _ANCHORED_MAIN = 'def worker(value: main):\n    return value\n\n\ndef main():\n    return 1\n'
+    _FUTURE_IMPORT = 'from __future__ import annotations'
 
     def _options(self) -> EngineOptions:
         return EngineOptions(policy=SortPolicy(), add_future=True, remove_future=True)
 
     def test_adds_future_import_when_no_definitions_are_new(self) -> None:
         result = sort_file_incremental(
-            self.ANCHORED_MAIN,
-            self.ANCHORED_MAIN,
+            self._ANCHORED_MAIN,
+            self._ANCHORED_MAIN,
             options=self._options(),
         )
-        assert self.FUTURE_IMPORT in (result.new_source or self.ANCHORED_MAIN)
+        assert self._FUTURE_IMPORT in (result.new_source or self._ANCHORED_MAIN)
 
     def test_adds_future_import_when_only_methods_move(self) -> None:
         baseline = (
@@ -299,19 +294,75 @@ class TestIncrementalFutureAnnotations:
             '    def beta(self) -> None: ...\n\n    def alpha(self) -> None: ...\n',
         )
         result = sort_file_incremental(source, baseline, options=self._options())
-        assert self.FUTURE_IMPORT in (result.new_source or source)
+        assert self._FUTURE_IMPORT in (result.new_source or source)
 
     def test_agrees_with_full_sort(self) -> None:
         options = self._options()
-        full = sort_file(self.ANCHORED_MAIN, options=options)
+        full = sort_file(self._ANCHORED_MAIN, options=options)
         incremental = sort_file_incremental(
-            self.ANCHORED_MAIN,
-            self.ANCHORED_MAIN,
+            self._ANCHORED_MAIN,
+            self._ANCHORED_MAIN,
             options=options,
         )
-        full_source = full.new_source or self.ANCHORED_MAIN
-        incremental_source = incremental.new_source or self.ANCHORED_MAIN
-        assert (self.FUTURE_IMPORT in full_source) == (self.FUTURE_IMPORT in incremental_source)
+        full_source = full.new_source or self._ANCHORED_MAIN
+        incremental_source = incremental.new_source or self._ANCHORED_MAIN
+        assert (self._FUTURE_IMPORT in full_source) == (self._FUTURE_IMPORT in incremental_source)
+
+    def test_incremental_removes_unused_future_beside_class_blocker(self) -> None:
+        baseline = 'class C:\n    def z(self): pass\n    x = 1\n'
+        source = f'{self._FUTURE_IMPORT}\n\n{baseline}    def a(self): pass\n'
+        result = sort_file_incremental(
+            source,
+            baseline,
+            options=EngineOptions(
+                policy=SortPolicy(method_order='alphabetical'),
+                remove_future=True,
+            ),
+        )
+
+        assert self._FUTURE_IMPORT not in result.new_source
+        assert '    def a(self): pass' in result.new_source
+        assert result.blocker is None
+        assert result.skipped is False
+        assert result.warning is None
+        assert [blocker.blocker for blocker in result.class_blockers] == ['interstitial']
+
+    def test_incremental_removes_unused_future_beside_soft_class_blocker(self) -> None:
+        baseline = 'class C:\n    def z(self): pass\n    def a(self): pass\n'
+        source = f'{self._FUTURE_IMPORT}\n\n{baseline}    def b(self): pass\n'
+        result = sort_file_incremental(
+            source,
+            baseline,
+            options=EngineOptions(
+                policy=SortPolicy(method_order='alphabetical'),
+                remove_future=True,
+            ),
+        )
+
+        assert self._FUTURE_IMPORT not in result.new_source
+        assert '    def b(self): pass' in result.new_source
+        assert result.blocker is None
+        assert result.skipped is False
+        assert result.warning is None
+        assert [blocker.blocker for blocker in result.class_blockers] == ['non_conforming']
+
+    def test_incremental_unchanged_class_blocker_keeps_skip_message(self) -> None:
+        baseline = 'class C:\n    def z(self): pass\n    x = 1\n'
+        source = baseline + '    def a(self): pass\n'
+        result = sort_file_incremental(
+            source,
+            baseline,
+            options=EngineOptions(
+                policy=SortPolicy(method_order='alphabetical'),
+                remove_future=True,
+            ),
+        )
+
+        assert result.new_source == source
+        assert result.blocker is None
+        assert result.skipped is True
+        assert result.warning == result.class_blockers[0].message
+        assert [blocker.blocker for blocker in result.class_blockers] == ['interstitial']
 
 
 class TestIncrementalMovementReporting:

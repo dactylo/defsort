@@ -1,24 +1,22 @@
-import argparse
 import ast
 import errno
 import importlib.metadata
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+import warnings
+from collections.abc import Buffer, Sequence
 from pathlib import Path
-from typing import cast
 from unittest.mock import patch
 
 import pytest
 
-import defsort._git as git_module
-from defsort import _cli, _downstream
+from defsort import DefsortConfig, DefsortConfigWarning, _cli, sort
 from defsort._arguments import overrides_from_args
 from defsort._cli import (
-    _COMMAND_GROUPS,
     EXIT_CHANGED,
     EXIT_ERROR,
     EXIT_OK,
@@ -32,11 +30,10 @@ from defsort._cli import (
     _guarded_skip,
     _ResolvedConfig,
     _run_sort,
-    main,
 )
+from defsort._cli import _main as main
 from defsort._config import ResolvedConfig, clear_config_cache
-from defsort._display._types import SummaryRow
-from defsort._hook_front import _build_hook_parser
+from defsort._files import write_source
 from defsort._types import (
     BANNER_MODE_VALUES,
     EVALUATION_ORDER_VALUES,
@@ -55,15 +52,32 @@ from defsort._types import (
     SortPolicy,
     SortResult,
 )
+from defsort._vendor.gitfiles._blobs import UnsupportedGitVersionError
+from defsort._vendor.gitfiles._repo import RepoDiscoveryResult, RepoDiscoveryStatus
+from defsort._vendor.gitfiles._run import GitCommandError
+from defsort._vendor.hookfront import _diff as diff_mod
+from defsort._vendor.hookfront import _streams
+from defsort._vendor.hookfront._terminal import path_text
+from tests._deep_input import DEEP_DEFINITIONS, TOO_DEEP, deep_source_case
 from tests._helpers import (
-    _CLI,
-    _ENV,
+    CLI,
+    DYNAMIC_ALL_SOURCE,
+    DYNAMIC_ALL_WARNING,
+    ENV,
     PROCESS_GROUP_FLAGS,
-    _init_empty_git_repo,
+    assert_renamed_result,
     decode_text,
+    fail_writes_to,
     finish_process,
+    incremental_gate_case,
+    init_empty_git_repo,
+    init_git_repo,
+    install_stand_in_git,
     invoke_cli,
+    isolate_git_config,
+    prepare_renamed_file,
     process_transcript,
+    redirect_recovery,
     register_distribution,
     run_cli,
     run_closing_after_first_line,
@@ -84,12 +98,22 @@ _AXIS_FLAGS = [
     ('tie-break', 'tie_break', TIE_BREAK_VALUES),
 ]
 
+# Every value of every policy flag, plus the short option.
+_AXIS_FLAG_CASES = [
+    ([f'--{flag}', value], field, value) for flag, field, values in _AXIS_FLAGS for value in values
+] + [(['-o', 'alphabetical'], 'order', 'alphabetical')]
+
+_BIG_UNSORTED = ''.join(
+    f'def f{index:04d}():\n    pass  # {"x" * 1024}\n\n\n' for index in range(2000, 0, -1)
+)
+
 _BUDGET_SCRIPT = """
 import runpy
 import sys
 
 heavy = ('defsort._hook', 'defsort._cli', 'defsort._library', 'defsort._core',
-         'defsort._config', 'defsort._files', 'defsort._git', 'defsort._display')
+         'defsort._config', 'defsort._files', 'defsort._git', 'defsort._display',
+         'defsort._vendor.gitfiles', 'difflib')
 sys.argv = ['defsort', 'hook', '--agent', 'claude']
 try:
     runpy.run_module('defsort', run_name='__main__', alter_sys=True)
@@ -104,15 +128,6 @@ loaded = sorted(
 sys.stderr.write(f'budget-status={status}\\n')
 sys.stderr.write('budget-loaded=' + ','.join(loaded) + '\\n')
 """
-
-# Every value of every policy flag, plus the short option.
-_AXIS_FLAG_CASES = [
-    ([f'--{flag}', value], field, value) for flag, field, values in _AXIS_FLAGS for value in values
-] + [(['-o', 'alphabetical'], 'order', 'alphabetical')]
-
-_BIG_UNSORTED = ''.join(
-    f'def f{index:04d}():\n    pass  # {"x" * 1024}\n\n\n' for index in range(2000, 0, -1)
-)
 
 _CLI_INEFFECTIVE_CASES = [
     ('method-bodies', ['--method-order', 'alphabetical', '--method-bodies', 'across-categories']),
@@ -466,26 +481,31 @@ class TestBatchFetchCliBaselines:
         bad = tmp_path / bad_name
         calls: list[list[str]] = []
 
-        def discover_roots(_paths: list[Path]) -> dict[Path, Path | None]:
-            return {bad.resolve(): tmp_path}
+        def discover_roots(_paths: list[Path]) -> dict[Path, RepoDiscoveryResult]:
+            return {
+                bad.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(tmp_path))
+            }
 
         def complete_run(
             command: list[str], *_args: object, **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
+        ) -> subprocess.CompletedProcess[bytes]:
             calls.append(command)
-            return subprocess.CompletedProcess(command, 0, 'git version 2.41.7\n', '')
+            return subprocess.CompletedProcess(command, 0, b'git version 2.41.7\n', b'')
 
         monkeypatch.setattr('defsort._cli._discover_repo_roots', discover_roots)
         monkeypatch.setattr(subprocess, 'run', complete_run)
 
-        with pytest.raises(git_module.UnsupportedGitVersionError) as caught:
+        with pytest.raises(UnsupportedGitVersionError) as caught:
             _batch_fetch_cli_baselines([bad])
 
-        assert caught.value.version == '2.41.7'
-        assert calls == [['git', '--version']]
+        assert str(caught.value) == (
+            'defsort: Git 2.42 or newer is required for incremental mode and the reorder guard '
+            'on working-tree files (found Git 2.41.7)'
+        )
+        assert [command[1:] for command in calls] == [['--version']]
 
     def test_existing_file_returns_content(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
+        init_empty_git_repo(tmp_path)
         content = 'def alpha():\n    pass\n'
         (tmp_path / 'mod.py').write_bytes(content.encode('utf-8'))
         run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
@@ -497,7 +517,7 @@ class TestBatchFetchCliBaselines:
         assert entry.content == content
 
     def test_missing_file_returns_sentinel(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
+        init_empty_git_repo(tmp_path)
         # Create an initial commit so HEAD exists
         (tmp_path / 'other.py').write_text('x = 1\n')
         run_setup(['git', 'add', 'other.py'], cwd=tmp_path)
@@ -512,7 +532,7 @@ class TestBatchFetchCliBaselines:
         # Repo A
         repo_a = tmp_path / 'repo_a'
         repo_a.mkdir()
-        _init_empty_git_repo(repo_a)
+        init_empty_git_repo(repo_a)
         (repo_a / 'a.py').write_bytes(b'def a():\n    pass\n')
         run_setup(['git', 'add', 'a.py'], cwd=repo_a)
         run_setup(['git', 'commit', '-m', 'init'], cwd=repo_a)
@@ -520,7 +540,7 @@ class TestBatchFetchCliBaselines:
         # Repo B
         repo_b = tmp_path / 'repo_b'
         repo_b.mkdir()
-        _init_empty_git_repo(repo_b)
+        init_empty_git_repo(repo_b)
         (repo_b / 'b.py').write_bytes(b'def b():\n    pass\n')
         run_setup(['git', 'add', 'b.py'], cwd=repo_b)
         run_setup(['git', 'commit', '-m', 'init'], cwd=repo_b)
@@ -533,15 +553,15 @@ class TestBatchFetchCliBaselines:
         assert entry_b.status is BlobReadStatus.CONTENT
         assert entry_b.content == 'def b():\n    pass\n'
 
-    def test_non_git_repo_returns_infra_error(self, tmp_path: Path) -> None:
+    def test_non_git_repo_returns_outside_repository(self, tmp_path: Path) -> None:
         f = tmp_path / 'mod.py'
         f.write_text('def a():\n    pass\n')
 
         result = _batch_fetch_cli_baselines([f])
-        assert result[f].status is BlobReadStatus.INFRA_ERROR
+        assert result[f].status is BlobReadStatus.OUTSIDE_REPOSITORY
 
     def test_non_utf8_baseline_returns_none(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
+        init_empty_git_repo(tmp_path)
         f = tmp_path / 'binary.py'
         f.write_bytes(b'\x80\x81\x82\xff')
         run_setup(['git', 'add', 'binary.py'], cwd=tmp_path)
@@ -561,22 +581,22 @@ class TestBatchFetchCliBaselines:
         root.mkdir()
         path = tmp_path / 'outside' / 'mod.py'
 
-        def discover_roots(_paths: list[Path]) -> dict[Path, Path | None]:
-            return {path.resolve(): root}
+        def discover_roots(_paths: list[Path]) -> dict[Path, RepoDiscoveryResult]:
+            return {path.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(root))}
 
         monkeypatch.setattr(
             'defsort._cli._discover_repo_roots',
             discover_roots,
         )
 
-        with patch('defsort._cli.batch_fetch_worktree_baselines') as fetch:
+        with patch('defsort._cli.read_head_baselines') as fetch:
             result = _batch_fetch_cli_baselines([path])
         fetch.assert_not_called()
 
         assert result[path].status is BlobReadStatus.INFRA_ERROR
 
     def test_subdirectory_caching(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
+        init_empty_git_repo(tmp_path)
         sub = tmp_path / 'pkg'
         sub.mkdir()
         (tmp_path / 'top.py').write_bytes(b'def top():\n    pass\n')
@@ -594,7 +614,7 @@ class TestBatchFetchCliBaselines:
 
     @pytest.mark.skipif(sys.platform == 'win32', reason='POSIX byte filename semantics')
     def test_unencodable_path_does_not_poison_repo_batch(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
+        init_empty_git_repo(tmp_path)
         good = tmp_path / 'good.py'
         bad_name = b'bad-\xff.py'.decode('utf-8', errors='surrogateescape')
         bad = tmp_path / bad_name
@@ -609,14 +629,88 @@ class TestBatchFetchCliBaselines:
         assert result[bad].status is BlobReadStatus.INFRA_ERROR
 
 
+class TestCaseAliasReporting:
+    @pytest.mark.parametrize('aliased', [False, True])
+    @pytest.mark.parametrize('json_mode', [False, True])
+    def test_invalid_file_keeps_invalid_status(
+        self, tmp_path: Path, aliased: bool, json_mode: bool
+    ) -> None:
+        target = tmp_path / 'bad.py'
+        target.write_text('return 1\n', encoding='utf-8')
+        paths = [str(target)]
+        if aliased:
+            alias = tmp_path / 'also_bad.py'
+            os.link(target, alias)
+            paths.append(str(alias))
+
+        status, stdout, stderr = invoke_cli([*(['--json'] if json_mode else []), *paths])
+
+        assert status == EXIT_ERROR
+        if json_mode:
+            [record] = json.loads(stdout)['files']
+            assert record['status'] == 'invalid'
+            assert 'names of one file need different results' not in record['warning']
+        else:
+            assert 'error:' in stderr
+            assert 'names of one file need different results' not in stderr
+
+    def test_json_reports_one_record(self, tmp_path: Path) -> None:
+        target = tmp_path / 'CaseFile.py'
+        target.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        alias = tmp_path / 'casefile.py'
+        if not alias.exists():
+            pytest.skip('requires a case-insensitive filesystem')
+
+        result_status, result_stdout, result_stderr = invoke_cli(
+            ['--json', str(target), str(alias)]
+        )
+
+        assert result_status == EXIT_CHANGED, result_stderr
+        assert [record['path'] for record in json.loads(result_stdout)['files']] == [str(target)]
+
+
 class TestClassBlockerOutput:
+    def test_class_blocker_lines_name_their_files(self, tmp_path: Path) -> None:
+        first = tmp_path / 'one.py'
+        second = tmp_path / 'two.py'
+        for target in (first, second):
+            target.write_text(_SRC_CLASS_LOCAL_INTERSTITIAL, encoding='utf-8')
+        status, _stdout, stderr = invoke_cli(['--diff', str(first), str(second)])
+        assert status == EXIT_CHANGED, stderr
+        assert stderr == (
+            f'{path_text(first)}: class C: skipped (code between methods)\n'
+            f'{path_text(second)}: class C: skipped (code between methods)\n'
+        )
+
+    def test_class_only_skip_with_top_level_interstitial_reports_class(
+        self, tmp_path: Path
+    ) -> None:
+        source = (
+            'class C:\n    def z(self): pass\n    x = 1\n    def a(self): pass\n'
+            '\nregistry = {}\n\ndef zeta(): pass\n'
+        )
+        target = tmp_path / 'mod.py'
+        target.write_text(source, encoding='utf-8')
+        args = ['--method-order', 'alphabetical', str(target)]
+        status, _stdout, stderr = invoke_cli(args)
+        assert status == EXIT_CHANGED
+        assert f'{path_text(target)}: class C: skipped (code between methods)' in stderr
+        _status, stdout, _stderr = invoke_cli(['--json', *args])
+        record = json.loads(stdout)['files'][0]
+        assert record['class_blockers'] == [
+            {'class': 'C', 'occurrence': 1, 'blocker': 'interstitial'}
+        ]
+        status, _stdout, _stderr = invoke_cli(['--write', *args])
+        assert status == EXIT_CHANGED
+        assert target.read_text(encoding='utf-8') == source
+
     def test_diff_changed_file_lists_class_blocker_once(self, tmp_path: Path) -> None:
         target = tmp_path / 'mod.py'
         target.write_text(_SRC_CLASS_LOCAL_INTERSTITIAL, encoding='utf-8')
 
         result_status, result_stdout, result_stderr = invoke_cli(['--diff', str(target)])
 
-        blocker_line = '  class C: skipped (code between methods)\n'
+        blocker_line = f'{path_text(target)}: class C: skipped (code between methods)\n'
         assert result_status == EXIT_CHANGED, result_stderr
         assert '+def beta():' in result_stdout
         assert result_stderr == blocker_line
@@ -637,12 +731,11 @@ class TestClassBlockerOutput:
 
     def test_incremental_summary_lists_blocked_class(self, tmp_path: Path) -> None:
         _git_init_with_duplicate_method_baseline(tmp_path)
+        target = tmp_path / 'mod.py'
 
-        _result_status, _result_stdout, result_stderr = invoke_cli(
-            ['-i', str(tmp_path / 'mod.py')]
-        )
+        _result_status, _result_stdout, result_stderr = invoke_cli(['-i', str(target)])
 
-        assert 'class C: skipped (duplicate method names)' in result_stderr
+        assert f'{path_text(target)}: class C: skipped (duplicate method names)' in result_stderr
 
     def test_json_mode_serializes_class_blockers(self, tmp_path: Path) -> None:
         target = tmp_path / 'mod.py'
@@ -655,13 +748,27 @@ class TestClassBlockerOutput:
             {'class': 'C', 'occurrence': 1, 'blocker': 'duplicates'}
         ]
 
+    def test_preview_gives_interstitial_class_its_own_remedy(self, tmp_path: Path) -> None:
+        target = tmp_path / 'mod.py'
+        target.write_text(_SRC_CLASS_LOCAL_INTERSTITIAL, encoding='utf-8')
+
+        status, _stdout, stderr = invoke_cli(['--preview', str(target)])
+
+        assert status == EXIT_CHANGED, stderr
+        assert f'{path_text(target)}: class C: skipped (code between methods)\n' in stderr
+        assert (
+            '  fix: move the code between methods of class C before its first method '
+            'or after its last'
+        ) in stderr.replace('\n       ', ' ')
+
     def test_preview_lists_blocked_class(self, tmp_path: Path) -> None:
         target = tmp_path / 'mod.py'
         target.write_text(_SRC_DUP_METHODS, encoding='utf-8')
 
         _result_status, _result_stdout, result_stderr = invoke_cli(['-p', str(target)])
 
-        assert 'class C: skipped (duplicate method names)' in result_stderr
+        assert f'{path_text(target)}: class C: skipped (duplicate method names)' in result_stderr
+        assert '  fix: rename or remove the duplicate method in class C' in result_stderr
 
     def test_summary_blocked_class_in_changed_file(self, tmp_path: Path) -> None:
         source = (
@@ -673,7 +780,7 @@ class TestClassBlockerOutput:
 
         _result_status, _result_stdout, result_stderr = invoke_cli([str(target)])
 
-        assert 'class C: skipped (duplicate method names)' in result_stderr
+        assert f'{path_text(target)}: class C: skipped (duplicate method names)' in result_stderr
 
     def test_summary_hide_skips_keeps_blocked_class_in_changed_file(
         self,
@@ -688,7 +795,7 @@ class TestClassBlockerOutput:
 
         result_status, _result_stdout, result_stderr = invoke_cli(['--hide-skips', str(target)])
 
-        blocker_line = '  class C: skipped (duplicate method names)\n'
+        blocker_line = f'{path_text(target)}: class C: skipped (duplicate method names)\n'
         assert result_status == EXIT_CHANGED, result_stderr
         assert result_stderr == blocker_line
         assert result_stderr.count(blocker_line) == 1
@@ -699,7 +806,7 @@ class TestClassBlockerOutput:
 
         _result_status, _result_stdout, result_stderr = invoke_cli([str(target)])
 
-        assert 'class C: skipped (duplicate method names)' in result_stderr
+        assert f'{path_text(target)}: class C: skipped (duplicate method names)' in result_stderr
 
     def test_write_changed_file_lists_class_blocker_once(self, tmp_path: Path) -> None:
         target = tmp_path / 'mod.py'
@@ -707,7 +814,7 @@ class TestClassBlockerOutput:
 
         result_status, _result_stdout, result_stderr = invoke_cli(['--write', str(target)])
 
-        blocker_line = '  class C: skipped (code between methods)\n'
+        blocker_line = f'{path_text(target)}: class C: skipped (code between methods)\n'
         rewritten = target.read_text(encoding='utf-8')
         assert result_status == EXIT_OK, result_stderr
         assert rewritten.index('def alpha') < rewritten.index('def beta')
@@ -733,7 +840,7 @@ class TestClassBlockerOutput:
         exit_code = main(['--write', str(target)])
 
         captured = capsys.readouterr()
-        blocker_line = '  class C: skipped (code between methods)\n'
+        blocker_line = f'{path_text(target)}: class C: skipped (code between methods)\n'
         assert exit_code == EXIT_ERROR
         assert target.read_text(encoding='utf-8') == _SRC_CLASS_LOCAL_INTERSTITIAL
         assert target.as_posix() not in captured.out
@@ -752,6 +859,44 @@ class TestClosedStdout:
 
 
 class TestClosedStdoutInProcess:
+    def test_byte_closure_stops_before_processing_the_next_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        class _ClosedBytes(io.BytesIO):
+            fail_write = True
+
+            def write(self, data: Buffer) -> int:
+                if self.fail_write:
+                    raise BrokenPipeError
+                return super().write(data)
+
+        first = tmp_path / 'first.py'
+        second = tmp_path / 'second.py'
+        first.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        second.write_text('def invalid syntax', encoding='utf-8')
+        buffer = _ClosedBytes()
+        closed = io.TextIOWrapper(buffer, encoding='utf-8')
+        monkeypatch.setattr(sys, 'stdout', closed)
+
+        try:
+            with (
+                patch.object(_cli, '_sort_one_file', wraps=_cli._sort_one_file) as sort_file,
+                patch.object(
+                    diff_mod, 'write_stdout_bytes', wraps=diff_mod.write_stdout_bytes
+                ) as write_bytes,
+            ):
+                assert main(('-d', str(first), str(second))) == EXIT_CHANGED
+            assert [call.args[0] for call in sort_file.call_args_list] == [first]
+            assert write_bytes.call_count == 1
+            assert capsys.readouterr().err == ''
+        finally:
+            buffer.fail_write = False
+            if sys.stdout is not closed:
+                sys.stdout.close()
+
     def test_closure_stops_before_processing_the_next_file(
         self,
         tmp_path: Path,
@@ -783,7 +928,7 @@ class TestClosedStdoutInProcess:
             raise OSError(errno.EINVAL, 'main work')
 
         monkeypatch.setattr(_cli, 'run_cli', fail_cli)
-        monkeypatch.setattr(_downstream, '_WINDOWS', True)
+        monkeypatch.setattr(_streams, '_WINDOWS', True)
 
         with pytest.raises(OSError, match='main work') as error:
             main([])
@@ -816,7 +961,7 @@ class TestClosedStdoutInProcess:
             print('discarded')
             return EXIT_CHANGED
 
-        monkeypatch.setattr(_downstream, '_WINDOWS', True)
+        monkeypatch.setattr(_streams, '_WINDOWS', True)
         monkeypatch.setattr(_cli, 'run_cli', run_cli)
         closed = _WindowsClosedStream()
         monkeypatch.setattr(sys, 'stdout', closed)
@@ -969,6 +1114,32 @@ class TestCommandExitCodes:
 
 
 class TestConfigWarningRendering:
+    def test_ineffective_policy_text_matches_across_surfaces(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.defsort]\norder = "alphabetical"\ntie-break = "source"\n',
+            encoding='utf-8',
+        )
+        target = tmp_path / 'mod.py'
+        target.write_text('x = 1\n', encoding='utf-8')
+        main([str(target)])
+        cli_text = capsys.readouterr().err
+        expected = '[tool.defsort] tie-break has no effect under the resolved strategies; ignoring'
+        assert f'warning: {expected}\n' in cli_text
+
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter('always', DefsortConfigWarning)
+            sort(
+                'x = 1\n',
+                config=DefsortConfig(
+                    definition_order='alphabetical',
+                    method_order='alphabetical',
+                    tie_break='source',
+                ),
+            )
+        assert [str(item.message) for item in captured] == [expected]
+
     def test_invalid_key_renders_warning_line(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -978,17 +1149,20 @@ class TestConfigWarningRendering:
         main([str(target)])
         err = capsys.readouterr().err
         assert (
-            "Warning: Invalid [tool.defsort] banners: 'bogus' "
-            "(expected 'barriers', 'ignore', or 'strip'), using default" in err
+            f'warning: {tmp_path.as_posix()}/pyproject.toml: [tool.defsort].banners: '
+            "invalid value 'bogus'; expected barriers, ignore, strip; using barriers\n" in err
         )
 
     def test_rendering_survives_pythonwarnings_ignore(self, tmp_path: Path) -> None:
         (tmp_path / 'pyproject.toml').write_text('[tool.defsort]\nbanners = "bogus"\n')
         target = tmp_path / 'mod.py'
         target.write_text('x = 1\n')
-        env = {**_ENV, 'PYTHONWARNINGS': 'ignore'}
+        env = {**ENV, 'PYTHONWARNINGS': 'ignore'}
         proc = run_cli([str(target)], env=env)
-        assert 'Warning: Invalid [tool.defsort] banners' in proc.stderr
+        assert (
+            f'warning: {tmp_path.as_posix()}/pyproject.toml: [tool.defsort].banners:'
+            in proc.stderr
+        )
 
     @pytest.mark.skipif(
         sys.platform == 'win32', reason='Windows forbids control characters in filenames'
@@ -1178,6 +1352,103 @@ class TestDiffMode:
         assert result_status == 1, result_stderr
         assert '---' in result_stdout
 
+    def test_redirected_diff_applies_as_a_patch(self, tmp_path: Path) -> None:
+        names = ('lf.py', 'crlf.py', 'latin.py', 'tabs.py', 'my file.py', 'abs.py')
+        source = _SRC_NEEDS_SORT
+        fixtures = {
+            'lf.py': source.encode(),
+            'crlf.py': source.replace('\n', '\r\n').encode(),
+            'latin.py': ('# -*- coding: latin-1 -*-\n' + source + '# café\n').encode('latin-1'),
+            'tabs.py': source.replace('    ', '\t').encode(),
+            'my file.py': source.encode(),
+            'abs.py': source.encode(),
+        }
+        root = Path(os.path.realpath(tmp_path))
+        directories = [root / label for label in ('a', 'b', 'c')]
+        for directory in directories:
+            directory.mkdir()
+            for name, data in fixtures.items():
+                (directory / name).write_bytes(data)
+        a, b, c = directories
+        operands = [*names[:-1], str(a / 'abs.py')]
+        diff = subprocess.run(
+            [sys.executable, '-m', 'defsort', '--diff', '--color', 'never', *operands],
+            cwd=a,
+            capture_output=True,
+            check=False,
+        )
+        assert diff.returncode == EXIT_CHANGED, process_transcript(diff)
+        assert diff.stdout
+        checked = subprocess.run(
+            ['git', 'apply', '-p0', '--check'],
+            cwd=a,
+            input=diff.stdout,
+            capture_output=True,
+            check=False,
+        )
+        assert checked.returncode == 0, process_transcript(checked)
+        applied = subprocess.run(
+            ['git', 'apply', '-p0'],
+            cwd=a,
+            input=diff.stdout,
+            capture_output=True,
+            check=False,
+        )
+        assert applied.returncode == 0, process_transcript(applied)
+
+        patch_executable = shutil.which('patch')
+        if patch_executable is not None:
+            version = subprocess.run(
+                [patch_executable, '--version'], capture_output=True, check=False
+            )
+            first_line = version.stdout.splitlines()[:1]
+            if version.returncode == 0 and first_line and first_line[0].startswith(b'GNU patch'):
+                # Without --binary, GNU patch on Windows turns CRLF into LF as it reads;
+                # POSIX ignores it.
+                dry_run = subprocess.run(
+                    [patch_executable, '-p0', '--dry-run', '--binary'],
+                    cwd=c,
+                    input=diff.stdout,
+                    capture_output=True,
+                    check=False,
+                )
+                assert dry_run.returncode == 0, process_transcript(dry_run)
+
+        written = subprocess.run(
+            [sys.executable, '-m', 'defsort', '--write', *names],
+            cwd=b,
+            capture_output=True,
+            check=False,
+        )
+        assert written.returncode == EXIT_OK, process_transcript(written)
+        for name in names:
+            assert (b / name).read_bytes() != fixtures[name], name
+            assert (a / name).read_bytes() == (b / name).read_bytes(), name
+
+    @pytest.mark.parametrize(
+        ('args', 'expected'),
+        [
+            (['--diff'], ''),
+            (['--diff', '--verbose'], 'mod.py: already in dependency order\n'),
+            (['--write'], ''),
+        ],
+    )
+    def test_unchanged_source_preserves_noncanonical_bytes(
+        self, tmp_path: Path, args: list[str], expected: str
+    ) -> None:
+        original = b'# coding: iso2022_jp\n#\x1b(B comment\ndef alpha():\n    pass\n'
+        target = tmp_path / 'mod.py'
+        target.write_bytes(original)
+        assert original.decode('iso2022_jp').encode('iso2022_jp') != original
+
+        with patch.object(_cli, 'write_source') as writer:
+            status, stdout, stderr = invoke_cli(
+                [*args, '--color', 'never', 'mod.py'], cwd=tmp_path
+            )
+        assert (status, stdout, stderr) == (EXIT_OK, expected, '')
+        writer.assert_not_called()
+        assert target.read_bytes() == original
+
 
 class TestDiscoverRepoRoots:
     def test_discover_repo_roots_failed_parent_does_not_cover_descendants(
@@ -1193,18 +1464,19 @@ class TestDiscoverRepoRoots:
         descendant = nested / 'c.py'
         calls: list[str] = []
 
-        def fake_root(start: str) -> None:
+        def fake_root(start: str) -> RepoDiscoveryResult:
             calls.append(start)
+            return RepoDiscoveryResult(RepoDiscoveryStatus.NOT_WORKTREE)
 
-        monkeypatch.setattr('defsort._cli.try_get_repo_root', fake_root)
+        monkeypatch.setattr('defsort._cli.discover_repo_root', fake_root)
 
         result = _discover_repo_roots([first, second, descendant])
 
         assert calls == [str(parent), str(nested)]
         assert result == {
-            first.resolve(): None,
-            second.resolve(): None,
-            descendant.resolve(): None,
+            first.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.NOT_WORKTREE),
+            second.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.NOT_WORKTREE),
+            descendant.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.NOT_WORKTREE),
         }
 
     def test_discover_repo_roots_git_file_prevents_outer_root_reuse(
@@ -1220,18 +1492,20 @@ class TestDiscoverRepoRoots:
         nested_file = nested / 'inner.py'
         calls: list[str] = []
 
-        def fake_root(start: str) -> str:
+        def fake_root(start: str) -> RepoDiscoveryResult:
             calls.append(start)
-            return str(nested if Path(start) == nested else outer)
+            return RepoDiscoveryResult(
+                RepoDiscoveryStatus.WORKTREE, str(nested if Path(start) == nested else outer)
+            )
 
-        monkeypatch.setattr('defsort._cli.try_get_repo_root', fake_root)
+        monkeypatch.setattr('defsort._cli.discover_repo_root', fake_root)
 
         result = _discover_repo_roots([outer_file, nested_file])
 
         assert calls == [str(outer), str(nested)]
         assert result == {
-            outer_file.resolve(): outer,
-            nested_file.resolve(): nested,
+            outer_file.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(outer)),
+            nested_file.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(nested)),
         }
 
     def test_discover_repo_roots_marker_inspection_failure_falls_back_to_git(
@@ -1252,17 +1526,19 @@ class TestDiscoverRepoRoots:
                 raise PermissionError('marker access denied')
             return original_lstat(path)
 
-        def fake_root(start: str) -> str:
+        def fake_root(start: str) -> RepoDiscoveryResult:
             calls.append(start)
-            return str(nested if Path(start) == nested else outer)
+            return RepoDiscoveryResult(
+                RepoDiscoveryStatus.WORKTREE, str(nested if Path(start) == nested else outer)
+            )
 
         monkeypatch.setattr(Path, 'lstat', fake_lstat)
-        monkeypatch.setattr('defsort._cli.try_get_repo_root', fake_root)
+        monkeypatch.setattr('defsort._cli.discover_repo_root', fake_root)
 
         result = _discover_repo_roots([outer_file, nested_file])
 
         assert calls == [str(outer), str(nested)]
-        assert result[nested_file.resolve()] == nested
+        assert result[nested_file.resolve()].root == str(nested)
 
     def test_discover_repo_roots_nested_directory_marker_wins_in_both_orders(
         self,
@@ -1278,18 +1554,20 @@ class TestDiscoverRepoRoots:
         outer_file.write_text('', encoding='utf-8')
         nested_file.write_text('', encoding='utf-8')
 
-        def fake_root(start: str) -> str:
-            return str(nested if Path(start) == nested else outer)
+        def fake_root(start: str) -> RepoDiscoveryResult:
+            return RepoDiscoveryResult(
+                RepoDiscoveryStatus.WORKTREE, str(nested if Path(start) == nested else outer)
+            )
 
-        monkeypatch.setattr('defsort._cli.try_get_repo_root', fake_root)
+        monkeypatch.setattr('defsort._cli.discover_repo_root', fake_root)
 
         forward = _discover_repo_roots([outer_file, nested_file])
         reverse = _discover_repo_roots([nested_file, outer_file])
 
-        assert forward[outer_file.resolve()] == outer
-        assert forward[nested_file.resolve()] == nested
-        assert reverse[outer_file.resolve()] == outer
-        assert reverse[nested_file.resolve()] == nested
+        assert forward[outer_file.resolve()].root == str(outer)
+        assert forward[nested_file.resolve()].root == str(nested)
+        assert reverse[outer_file.resolve()].root == str(outer)
+        assert reverse[nested_file.resolve()].root == str(nested)
 
     def test_discover_repo_roots_queries_git_for_uncovered_directory(
         self,
@@ -1304,18 +1582,18 @@ class TestDiscoverRepoRoots:
         second = second_repo / 'b.py'
         calls: list[str] = []
 
-        def fake_root(start: str) -> str:
+        def fake_root(start: str) -> RepoDiscoveryResult:
             calls.append(start)
-            return start
+            return RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, start)
 
-        monkeypatch.setattr('defsort._cli.try_get_repo_root', fake_root)
+        monkeypatch.setattr('defsort._cli.discover_repo_root', fake_root)
 
         result = _discover_repo_roots([first, second])
 
         assert calls == [str(first_repo), str(second_repo)]
         assert result == {
-            first.resolve(): first_repo,
-            second.resolve(): second_repo,
+            first.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(first_repo)),
+            second.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(second_repo)),
         }
 
     def test_discover_repo_roots_reuses_root_for_sibling_directories(
@@ -1332,19 +1610,63 @@ class TestDiscoverRepoRoots:
         second = second_parent / 'b.py'
         calls: list[str] = []
 
-        def fake_root(start: str) -> str:
+        def fake_root(start: str) -> RepoDiscoveryResult:
             calls.append(start)
-            return str(repo)
+            return RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(repo))
 
-        monkeypatch.setattr('defsort._cli.try_get_repo_root', fake_root)
+        monkeypatch.setattr('defsort._cli.discover_repo_root', fake_root)
 
         result = _discover_repo_roots([first, second])
 
         assert calls == [str(first_parent)]
         assert result == {
-            first.resolve(): repo,
-            second.resolve(): repo,
+            first.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(repo)),
+            second.resolve(): RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(repo)),
         }
+
+    @pytest.mark.skipif(os.name == 'nt', reason='requires POSIX path names')
+    @pytest.mark.parametrize('incremental', [True, False], ids=['incremental', 'guard'])
+    def test_root_ending_in_space_matches_an_ordinary_root(
+        self, tmp_path: Path, incremental: bool
+    ) -> None:
+        args = ['--incremental'] if incremental else []
+        results: list[tuple[int, str]] = []
+        for name in ('plain', 'space '):
+            repo = tmp_path / name
+            repo.mkdir()
+            init_git_repo(repo, _SRC_NEEDS_SORT)
+            if not incremental:
+                (repo / 'pyproject.toml').write_text(
+                    '[tool.defsort]\nmax-reorder-count = 0\n', encoding='utf-8'
+                )
+            path = repo / 'test.py'
+            result = run_cli([*args, '--write', str(path)])
+            results.append((result.returncode, path.read_text(encoding='utf-8')))
+            if name == 'space ':
+                assert 'unable to read baseline' not in result.stderr
+
+        assert results == [(EXIT_OK, _SRC_ALREADY_ORDERED)] * 2
+
+    @pytest.mark.skipif(sys.platform != 'linux', reason='requires native Linux byte paths')
+    @pytest.mark.parametrize('incremental', [True, False], ids=['incremental', 'guard'])
+    def test_non_utf8_repo_root_uses_baselines(self, tmp_path: Path, incremental: bool) -> None:
+        args = ['--incremental'] if incremental else []
+        results: list[tuple[int, str]] = []
+        for name in ('plain', os.fsdecode(b'repo-\xff')):
+            repo = tmp_path / name
+            repo.mkdir()
+            init_git_repo(repo, _SRC_NEEDS_SORT)
+            if not incremental:
+                (repo / 'pyproject.toml').write_text(
+                    '[tool.defsort]\nmax-reorder-count = 0\n', encoding='utf-8'
+                )
+            path = repo / 'test.py'
+            result = run_cli([*args, '--write', str(path)])
+            results.append((result.returncode, path.read_text(encoding='utf-8')))
+            if name != 'plain':
+                assert 'unable to read baseline' not in result.stderr
+
+        assert results == [(EXIT_OK, _SRC_ALREADY_ORDERED)] * 2
 
     def test_same_parent_queries_git_once(
         self,
@@ -1357,36 +1679,15 @@ class TestDiscoverRepoRoots:
         second.write_text('', encoding='utf-8')
         calls: list[str] = []
 
-        def fake_root(start: str) -> str:
+        def fake_root(start: str) -> RepoDiscoveryResult:
             calls.append(start)
-            return str(tmp_path)
+            return RepoDiscoveryResult(RepoDiscoveryStatus.WORKTREE, str(tmp_path))
 
-        monkeypatch.setattr('defsort._cli.try_get_repo_root', fake_root)
+        monkeypatch.setattr('defsort._cli.discover_repo_root', fake_root)
 
         _discover_repo_roots([first, second])
 
         assert calls == [str(tmp_path)]
-
-    @pytest.mark.skipif(sys.platform != 'linux', reason='requires native Linux byte paths')
-    @pytest.mark.parametrize('incremental', [True, False], ids=['incremental', 'guard'])
-    def test_surrogate_repo_root_skips_baseline_without_traceback(
-        self, tmp_path: Path, incremental: bool
-    ) -> None:
-        repo = tmp_path / os.fsdecode(b'repo-\xff')
-        repo.mkdir()
-        _init_empty_git_repo(repo)
-        args = ['--incremental'] if incremental else []
-        if not incremental:
-            (repo / 'pyproject.toml').write_text(
-                '[tool.defsort]\nmax-reorder-count = 0\n', encoding='utf-8'
-            )
-        path = repo / 'mod.py'
-        path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-
-        result = run_cli([*args, '--write', str(path)], expect=EXIT_CHANGED)
-        assert 'unable to read baseline' in result.stderr
-        assert 'Traceback' not in result.stderr
-        assert path.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
 
     @pytest.mark.parametrize('incremental', [True, False], ids=['incremental', 'guard'])
     @pytest.mark.parametrize('source', [_SRC_NEEDS_SORT, 'def broken(\n'])
@@ -1407,7 +1708,7 @@ class TestDiscoverRepoRoots:
         path.write_text(source, encoding='utf-8')
 
         def fail_decode(command: list[str], *_args: object, **_kwargs: object) -> None:
-            assert command == ['git', 'rev-parse', '--show-toplevel']
+            assert command[1:] == ['rev-parse', '--show-toplevel']
             raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
 
         monkeypatch.setattr(subprocess, 'run', fail_decode)
@@ -1416,19 +1717,12 @@ class TestDiscoverRepoRoots:
             result = main([*args, mode, str(path)])
 
             captured = capsys.readouterr()
-            record = json.loads(captured.out)['files'][0] if mode == '--json' else None
-            if source == _SRC_NEEDS_SORT:
-                assert result == EXIT_CHANGED
-                if record is not None:
-                    assert record['status'] == 'skipped'
-                    assert 'unable to read baseline' in record['warning']
-                else:
-                    assert 'unable to read baseline' in captured.err
-            else:
-                assert result == EXIT_ERROR
-                if record is not None:
-                    assert record['status'] == 'invalid'
-                assert 'unable to read baseline' not in captured.out + captured.err
+            assert result == EXIT_ERROR
+            assert captured.out == ''
+            modes = 'incremental mode' if incremental else 'the reorder guard'
+            assert captured.err.startswith(f'error: {modes} cannot use Git: ')
+            assert 'invalid start byte' in captured.err
+            assert len(captured.err.splitlines()) == 1
             assert 'Traceback' not in captured.err
             assert path.read_text(encoding='utf-8') == source
 
@@ -1479,14 +1773,6 @@ class TestExitCodes:
     ) -> None:
         assert main([str(tmp_path / 'nonexistent.py')]) == EXIT_ERROR
         assert 'error:' in capsys.readouterr().err
-
-    def test_main_returns_ok_for_empty_directory(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        empty = tmp_path / 'empty'
-        empty.mkdir()
-        assert main([str(empty)]) == EXIT_OK
-        assert capsys.readouterr().err == ''
 
     def test_missing_file_does_not_abort_others(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1559,12 +1845,54 @@ class TestFileHandling:
         assert result_status == 1, result_stderr
         assert 'test.py' in result_stdout
 
-    def test_non_python_file_silently_ignored(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        'mode',
+        [[], ['-v'], ['--write'], ['--diff'], ['--preview'], ['--json'], ['-i'], ['--detect']],
+    )
+    def test_empty_selection_warns_in_every_mode(self, tmp_path: Path, mode: list[str]) -> None:
+        (tmp_path / 'README.md').write_text('readme\n', encoding='utf-8')
+
+        status, stdout, stderr = invoke_cli([*mode, str(tmp_path)])
+
+        assert status == EXIT_OK
+        assert stderr == 'warning: no Python files found under the given paths\n'
+        if mode == ['--json']:
+            assert json.loads(stdout) == {'version': 1, 'files': []}
+
+    def test_ignored_only_selection_warns(self, tmp_path: Path) -> None:
+        init_empty_git_repo(tmp_path)
+        (tmp_path / '.gitignore').write_text('*.py\n', encoding='utf-8')
+        (tmp_path / 'ignored.py').write_text('pass\n', encoding='utf-8')
+
+        status, _stdout, stderr = invoke_cli([str(tmp_path)])
+
+        assert status == EXIT_OK
+        assert stderr == 'warning: no Python files found under the given paths\n'
+
+    def test_missing_operand_is_error_without_empty_warning(self, tmp_path: Path) -> None:
+        readme = tmp_path / 'README.md'
+        readme.write_text('readme\n', encoding='utf-8')
+
+        status, _stdout, stderr = invoke_cli([str(readme), str(tmp_path / 'missing')])
+
+        assert status == EXIT_ERROR
+        assert 'warning: no Python files found under the given paths' not in stderr
+
+    def test_mixed_selection_stays_silent(self, tmp_path: Path) -> None:
+        (tmp_path / 'README.md').write_text('readme\n', encoding='utf-8')
+        (tmp_path / 'source.py').write_text('pass\n', encoding='utf-8')
+
+        status, _stdout, stderr = invoke_cli([str(tmp_path)])
+
+        assert status == EXIT_OK
+        assert stderr == ''
+
+    def test_non_python_file_warns_when_only_operand(self, tmp_path: Path) -> None:
         f = tmp_path / 'readme.txt'
         f.write_text('hello', encoding='utf-8')
         result_status, _result_stdout, result_stderr = invoke_cli([str(f)])
         assert result_status == 0, result_stderr
-        assert result_stderr == ''
+        assert result_stderr == 'warning: no Python files found under the given paths\n'
 
     def test_symlink_file_processed(self, tmp_path: Path) -> None:
         target = tmp_path / 'target.py'
@@ -1585,6 +1913,155 @@ class TestFileHandling:
         result_status, result_stdout, result_stderr = invoke_cli(['-w', str(d)])
         assert result_status == 0, result_stderr
         assert 'link.py' not in result_stdout
+
+
+class TestHardLinkedNames:
+    def test_file_edited_after_its_names_were_checked_is_not_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        sorted_dir = tmp_path / 'sorted'
+        kept_dir = tmp_path / 'kept'
+        sorted_dir.mkdir()
+        kept_dir.mkdir()
+        (kept_dir / 'pyproject.toml').write_text(
+            '[tool.defsort]\ndefinition-order = "none"\n', encoding='utf-8'
+        )
+        a = sorted_dir / 'test.py'
+        a.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
+        b = kept_dir / 'test.py'
+        os.link(a, b)
+        real_read = _cli.read_file_result
+        reads: list[Path] = []
+
+        def read_then_edit(path: Path) -> object:
+            # After both names are read for the agreement check, an editor saves a new version.
+            result = real_read(path)
+            reads.append(path)
+            if len(reads) == 2:
+                a.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+            return result
+
+        monkeypatch.setattr(_cli, 'read_file_result', read_then_edit)
+        main(['-w', str(a), str(b)])
+        capsys.readouterr()
+
+        assert a.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+
+    def test_names_of_one_file_are_written_once(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        a = tmp_path / 'a.py'
+        a.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        b = tmp_path / 'b.py'
+        os.link(a, b)
+        before = a.stat()
+
+        assert main(['-w', str(a), str(b)]) == EXIT_OK
+        capsys.readouterr()
+        assert a.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
+        assert b.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
+        after = b.stat()
+        assert (after.st_ino, after.st_nlink) == (before.st_ino, 2)
+        assert main([str(a), str(b)]) == EXIT_OK
+
+    @pytest.mark.parametrize('source', [_SRC_ALREADY_ORDERED, _SRC_NEEDS_SORT])
+    def test_names_require_identical_bytes_after_a_bom_change(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        source: str,
+    ) -> None:
+        a = tmp_path / 'a.py'
+        a.write_text(source, encoding='utf-8')
+        b = tmp_path / 'b.py'
+        os.link(a, b)
+        real_read = _cli.read_file_result
+
+        def read_then_add_bom(path: Path) -> object:
+            result = real_read(path)
+            if path == a:
+                a.write_bytes(source.encode('utf-8-sig'))
+            return result
+
+        monkeypatch.setattr(_cli, 'read_file_result', read_then_add_bom)
+        assert main([str(a), str(b)]) == EXIT_ERROR
+        assert 'names of one file need different results' in capsys.readouterr().err
+        assert a.read_bytes() == source.encode('utf-8-sig')
+
+    @pytest.mark.parametrize('mode', [[], ['--diff'], ['--json'], ['--write']])
+    def test_names_needing_different_results_are_an_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: list[str]
+    ) -> None:
+        sorted_dir = tmp_path / 'sorted'
+        kept_dir = tmp_path / 'kept'
+        sorted_dir.mkdir()
+        kept_dir.mkdir()
+        (kept_dir / 'pyproject.toml').write_text(
+            '[tool.defsort]\ndefinition-order = "none"\n', encoding='utf-8'
+        )
+        a = sorted_dir / 'test.py'
+        a.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        b = kept_dir / 'test.py'
+        os.link(a, b)
+
+        assert main([*mode, str(a), str(b)]) == EXIT_ERROR
+        captured = capsys.readouterr()
+        assert a.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+        if mode == ['--json']:
+            [record] = json.loads(captured.out)['files']
+            assert record['status'] == 'error'
+            assert str(a) in record['warning']
+            assert str(b) in record['warning']
+        else:
+            assert f'{path_text(a)}, {path_text(b)}: names of one file need different results' in (
+                captured.err
+            )
+
+    def test_names_that_could_not_be_read_are_not_written_later(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        sorted_dir = tmp_path / 'sorted'
+        kept_dir = tmp_path / 'kept'
+        sorted_dir.mkdir()
+        kept_dir.mkdir()
+        (kept_dir / 'pyproject.toml').write_text(
+            '[tool.defsort]\ndefinition-order = "none"\n', encoding='utf-8'
+        )
+        a = sorted_dir / 'test.py'
+        a.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        b = kept_dir / 'test.py'
+        os.link(a, b)
+        real_read = _cli.read_file_result
+        reads: list[Path] = []
+
+        def fail_twice(path: Path) -> object:
+            # Both names' agreement-check reads fail; a later read would succeed.
+            reads.append(path)
+            if len(reads) <= 2:
+                raise OSError('denied')
+            return real_read(path)
+
+        monkeypatch.setattr(_cli, 'read_file_result', fail_twice)
+        assert main(['-w', str(a), str(b)]) == EXIT_ERROR
+        capsys.readouterr()
+
+        assert a.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+
+    def test_names_with_different_incremental_eligibility_are_an_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        init_empty_git_repo(tmp_path)
+        a = tmp_path / 'a.py'
+        a.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        run_setup(['git', '-C', str(tmp_path), 'add', 'a.py'])
+        run_setup(['git', '-C', str(tmp_path), 'commit', '-m', 'init'])
+        b = tmp_path / 'b.py'
+        os.link(a, b)
+
+        assert main(['-w', '-i', str(a), str(b)]) == EXIT_ERROR
+        assert 'names of one file need different results' in capsys.readouterr().err
+        assert a.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
 
 
 class TestHelp:
@@ -1632,338 +2109,16 @@ class TestHelp:
         )
 
 
-class TestHookSubcommandParser:
-    def test_hook_accepts_agent_option(self, registered_hosts: Path) -> None:
-        assert registered_hosts.is_dir()
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['hook', '--agent', 'claude'], stdin='{}'
-        )
-        assert result_status == 0, result_stderr
-
-    def test_hook_accepts_event_for_antigravity(self, registered_hosts: Path) -> None:
-        assert registered_hosts.is_dir()
-        result_status, result_stdout, result_stderr = invoke_cli(
-            ['hook', '--agent', 'agy', '--event', 'PreToolUse'], stdin='{}'
-        )
-        assert result_status == 0, result_stderr
-        assert result_stdout == ''
-
-    def test_hook_conflicting_incremental_exits_2(self) -> None:
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['hook', '--agent', 'claude', '-i', '--no-incremental']
-        )
-        assert result_status == 2, result_stderr
-
-    @pytest.mark.usefixtures('registered_hosts')
-    def test_hook_help_groups_every_option_with_its_help(self) -> None:
-        _status, stdout, _stderr = invoke_cli(['hook', '--help'])
-
-        sections = _help_sections(stdout)
-        assert list(sections) == list(_HOOK_HELP)
-        assert sections == {title: ' '.join(entries) for title, entries in _HOOK_HELP.items()}
-
-    def test_hook_help_lists_agents_from_the_registry(self, registered_hosts: Path) -> None:
-        register_distribution(
-            registered_hosts,
-            'defsort-host-example',
-            {'example': 'tests.hosts_example.adapter:ExampleAdapter'},
-        )
-
-        _status, stdout, _stderr = invoke_cli(['hook', '--help'])
-
-        assert '\n  -a, --agent NAME      coding agent: agy, claude, codex, example\n' in stdout
-
-    def test_hook_help_starts_with_short_usage_and_description(self) -> None:
-        status, stdout, stderr = invoke_cli(['hook', '--help'])
-
-        assert (status, stderr) == (0, '')
-        usage, description, _rest = stdout.split('\n\n', 2)
-        assert usage == 'usage: defsort hook --agent NAME [options]'
-        assert ' '.join(description.split()) == (
-            "Run defsort as a coding-agent hook, reading the agent's hook payload as JSON "
-            'from stdin.'
-        )
-
-    def test_hook_requires_agent(self) -> None:
-        result_status, _result_stdout, result_stderr = invoke_cli(['hook'], stdin='{}')
-        assert result_status == 2, result_stderr
-        assert 'the following arguments are required: -a/--agent' in result_stderr
-
-    def test_hook_short_agent_option_matches_long(self, registered_hosts: Path) -> None:
-        assert registered_hosts.is_dir()
-        short_status, short_stdout, short_stderr = invoke_cli(['hook', '-a', 'claude'], stdin='{}')
-        long_status, long_stdout, long_stderr = invoke_cli(
-            ['hook', '--agent', 'claude'], stdin='{}'
-        )
-        assert (short_status, short_stdout, short_stderr) == (
-            long_status,
-            long_stdout,
-            long_stderr,
-        )
-
-    def test_hook_short_event_option_matches_long(self, registered_hosts: Path) -> None:
-        assert registered_hosts.is_dir()
-        short_status, short_stdout, short_stderr = invoke_cli(
-            ['hook', '-a', 'agy', '-e', 'PreToolUse'], stdin='{}'
-        )
-        long_status, long_stdout, long_stderr = invoke_cli(
-            ['hook', '--agent', 'agy', '--event', 'PreToolUse'], stdin='{}'
-        )
-        assert (short_status, short_stdout, short_stderr) == (
-            long_status,
-            long_stdout,
-            long_stderr,
-        )
-
-    def test_hook_tty_prints_usage(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        fake_stdin = io.StringIO()
-        fake_stdin.isatty = lambda: True
-        monkeypatch.setattr('sys.stdin', fake_stdin)
-        result = main(['hook', '--agent', 'claude'])
-        assert result == 0
-        captured = capsys.readouterr()
-        assert (
-            "defsort hook: reads the coding agent's hook payload as JSON from stdin"
-            in captured.err
-        )
-        assert 'docs/hook.md' in captured.err
-
-    def test_hook_unknown_arg_exits_2(self) -> None:
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['hook', '--agent', 'claude', '--bogus']
-        )
-        assert result_status == 2, result_stderr
-
-    def test_hook_usage_error_prints_short_usage_without_reading_registry(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def unexpected_registry_read() -> list[str]:
-            raise AssertionError('the hook registry was read')
-
-        monkeypatch.setattr('defsort._hosts.registered_host_names', unexpected_registry_read)
-
-        status, stdout, stderr = invoke_cli(['hook'])
-
-        assert (status, stdout) == (2, '')
-        assert stderr == (
-            'usage: defsort hook --agent NAME [options]\n'
-            'defsort hook: error: the following arguments are required: -a/--agent\n'
-        )
-
-
-class TestIncrementalFlag:
-    def test_incremental_diff_shows_changes(self, tmp_path: Path) -> None:
-        _git_init_with_baseline(tmp_path)
-        path = tmp_path / 'mod.py'
-        source = path.read_text(encoding='utf-8').replace('charlie', 'aardvark')
-        path.write_text(source, encoding='utf-8')
-
-        result_status, result_stdout, result_stderr = invoke_cli(
-            ['-i', '--definition-order', 'alphabetical', '-d', str(path)]
-        )
-
-        assert result_status == 1, result_stderr
-        assert '@@' in result_stdout
-        assert '+def aardvark():' in result_stdout
-        assert '-def aardvark():' in result_stdout
-        assert path.read_text(encoding='utf-8') == source
-
-    def test_incremental_infra_error_agrees_with_json(self, tmp_path: Path) -> None:
-        f = tmp_path / 'mod.py'
-        f.write_text('def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n')
-        text_status, _text_stdout, text_stderr = invoke_cli(['-i', str(f)])
-        payload_status, payload_stdout, _payload_stderr = invoke_cli(['-i', '--json', str(f)])
-        record = json.loads(payload_stdout)['files'][0]
-        assert record['status'] == 'skipped'
-        assert text_status == payload_status, text_stderr
-
-    def test_incremental_infra_error_does_not_misreport_definitions(self, tmp_path: Path) -> None:
-        f = tmp_path / 'mod.py'
-        f.write_text('def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n')
-        _result_status, result_stdout, _result_stderr = invoke_cli(['-i', '-v', str(f)])
-        assert 'mod.py' not in result_stdout
-
-    def test_incremental_infra_error_json_preserves_source_totals(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        source = (
-            'def bravo():\n'
-            '    return alpha()\n'
-            '\n'
-            '\n'
-            'def alpha():\n'
-            '    return 1\n'
-            '\n'
-            '\n'
-            'class Charlie:\n'
-            '    def method(self):\n'
-            '        return None\n'
-        )
-        f = tmp_path / 'mod.py'
-        f.write_text(source)
-
-        result_status, result_stdout, result_stderr = invoke_cli(['-i', '--json', str(f)])
-
-        record = json.loads(result_stdout)['files'][0]
-        assert result_status == 1, result_stderr
-        assert record['status'] == 'skipped'
-        assert record['definitions'] == {'moved': 0, 'total': 3}
-        assert record['methods'] == {'moved': 0, 'total': 1}
-        assert record['movements'] == []
-        assert record['method_movements'] == []
-        assert f.read_text() == source
-
-    def test_incremental_infra_error_reports_the_reason(self, tmp_path: Path) -> None:
-        f = tmp_path / 'mod.py'
-        f.write_text('def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n')
-        _result_status, _result_stdout, result_stderr = invoke_cli(['-i', str(f)])
-        assert 'unable to read baseline' in result_stderr
-
-    def test_incremental_infra_error_skips(self, tmp_path: Path) -> None:
-        # Create a file in a non-git directory
-        f = tmp_path / 'mod.py'
-        f.write_text('def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n')
-        result_status, _result_stdout, result_stderr = invoke_cli(['-i', str(f)])
-        assert result_status == 1, result_stderr
-        # File should be skipped, not sorted
-        content = f.read_text()
-        assert content.index('bravo') < content.index('alpha')  # unchanged
-
-    def test_incremental_new_file_no_head(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
-        (tmp_path / 'new.py').write_text(
-            'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
-        )
-        run_setup(['git', 'add', 'new.py'], cwd=tmp_path)
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['-i', '-w', str(tmp_path / 'new.py')]
-        )
-        assert result_status == 0, result_stderr
-        content = (tmp_path / 'new.py').read_text()
-        assert content.index('alpha') < content.index('bravo')
-
-    def test_incremental_noop_no_new_defs(self, tmp_path: Path) -> None:
-        _git_init_no_changes(tmp_path)
-        result_status, _result_stdout, result_stderr = invoke_cli(['-i', str(tmp_path / 'mod.py')])
-        assert result_status == 0, result_stderr
-
-    def test_incremental_untracked_file_full_sort(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
-        # Create file but don't git add it
-        (tmp_path / 'untracked.py').write_text(
-            'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
-        )
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['-i', '-w', str(tmp_path / 'untracked.py')]
-        )
-        assert result_status == 0, result_stderr
-        content = (tmp_path / 'untracked.py').read_text()
-        assert content.index('alpha') < content.index('bravo')
-
-    def test_incremental_write_sorts_new_defs(self, tmp_path: Path) -> None:
-        _git_init_with_baseline(tmp_path)
-        path = tmp_path / 'mod.py'
-        source = path.read_text(encoding='utf-8').replace('charlie', 'aardvark')
-        path.write_text(source, encoding='utf-8')
-        expected = (
-            'def aardvark():\n    return alpha()\n\n\n'
-            'def alpha():\n    return 1\n\n\n'
-            'def bravo():\n    return alpha()\n'
-        )
-
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['-i', '--definition-order', 'alphabetical', '-w', str(path)]
-        )
-
-        assert result_status == 0, result_stderr
-        assert path.read_text(encoding='utf-8') == expected
-
-    @pytest.mark.skipif(sys.platform == 'win32', reason='POSIX byte filename semantics')
-    @pytest.mark.parametrize(
-        ('args', 'config_text'),
-        [
-            (['--incremental'], None),
-            ([], '[tool.defsort]\nmax-reorder-count = 0\n'),
-        ],
-        ids=['incremental', 'reorder-guard'],
-    )
-    def test_unencodable_baseline_path_skips_without_traceback(
-        self,
-        tmp_path: Path,
-        capfd: pytest.CaptureFixture[str],
-        args: list[str],
-        config_text: str | None,
-    ) -> None:
-        _init_empty_git_repo(tmp_path)
-        bad_name = b'bad-\xff.py'.decode('utf-8', errors='surrogateescape')
-        path = tmp_path / bad_name
-        try:
-            path.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
-        except OSError:
-            pytest.skip('filesystem does not support non-UTF-8 filename bytes')
-        run_setup(['git', 'add', '--', path.name], cwd=tmp_path)
-        run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
-        if config_text is not None:
-            (tmp_path / 'pyproject.toml').write_text(config_text, encoding='utf-8')
-        path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-
-        result = main([*args, str(path)])
-
-        captured = capfd.readouterr()
-        assert result == EXIT_CHANGED
-        assert 'unable to read baseline' in captured.err
-        assert 'Traceback' not in captured.err
-        assert path.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
-
-    @pytest.mark.parametrize(
-        'mode_args',
-        [pytest.param(['--write'], id='text-write'), pytest.param(['--json'], id='json')],
-    )
-    def test_unsupported_git_exits_before_output_or_write(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-        mode_args: list[str],
-    ) -> None:
-        source = _SRC_NEEDS_SORT
-        path = tmp_path / 'mod.py'
-        path.write_text(source, encoding='utf-8')
-
-        def reject_git(_paths: list[Path]) -> dict[Path, BlobReadResult]:
-            raise git_module.UnsupportedGitVersionError('2.41.7')
-
-        monkeypatch.setattr('defsort._cli._batch_fetch_cli_baselines', reject_git)
-
-        result = main(['--incremental', *mode_args, str(path)])
-
-        captured = capsys.readouterr()
-        assert result == EXIT_ERROR
-        assert captured.out == ''
-        assert captured.err == (
-            'defsort: Git 2.42 or newer is required for Git-backed sorting (found Git 2.41.7)\n'
-        )
-        assert path.read_text(encoding='utf-8') == source
-
-
 class TestJsonErrorStatus:
-    def test_missing_file_json_exits_2(self, tmp_path: Path) -> None:
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['--json', str(tmp_path / 'missing.py')]
-        )
-        assert result_status == 2, result_stderr
-
     def test_missing_file_json_status_error(self, tmp_path: Path) -> None:
-        _result_status, result_stdout, _result_stderr = invoke_cli(
+        result_status, result_stdout, result_stderr = invoke_cli(
             ['--json', str(tmp_path / 'missing.py')]
         )
         data = json.loads(result_stdout)
         rec = data['files'][0]
         assert rec['status'] == 'error'
         assert rec['warning'] is not None
+        assert result_status == 2, result_stderr
 
 
 class TestJsonOutput:
@@ -1975,6 +2130,23 @@ class TestJsonOutput:
         data = json.loads(result_stdout)
         assert data['version'] == 1
         assert len(data['files']) == 1
+
+    def test_git_exclusion_warning_stays_on_stderr(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / '.git').mkdir()
+        (tmp_path / 'test.py').write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
+        monkeypatch.setenv('PATH', str(tmp_path))
+
+        result_status, result_stdout, result_stderr = invoke_cli(['--json', str(tmp_path)])
+
+        assert result_status == EXIT_OK, result_stderr
+        assert len(json.loads(result_stdout)['files']) == 1
+        assert result_stderr == (
+            f'warning: cannot apply Git exclusions in {path_text(tmp_path)}: '
+            'git could not be run: Git executable not found on PATH; '
+            'keeping every discovered Python file\n'
+        )
 
     def test_json_compile_invalid(self, tmp_path: Path) -> None:
         f = tmp_path / 'bad.py'
@@ -2083,17 +2255,6 @@ class TestJsonOutput:
         assert rec['dep_score'] is None
         assert rec['alpha_score'] is None
 
-    def test_json_incremental_infra_error(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, result_stdout, result_stderr = invoke_cli(['--json', '-i', str(f)])
-        assert result_status == 1, result_stderr
-        data = json.loads(result_stdout)
-        rec = data['files'][0]
-        assert rec['status'] == 'skipped'
-        assert rec['warning'] is not None
-        assert 'incremental' in rec['warning'].lower()
-
     def test_json_incremental_reports_movements(
         self,
         tmp_path: Path,
@@ -2195,155 +2356,6 @@ class TestJsonOutput:
         assert rec['status'] == 'changed'
 
 
-class TestLargeReorderGuard:
-    @staticmethod
-    def _setup_guarded_repo(tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
-        out_of_order = (
-            'def c():\n    pass\n\n\ndef b():\n    pass\n\n\n# --------\n\n\ndef a():\n    pass\n'
-        )
-        (tmp_path / 'mod.py').write_text(out_of_order, encoding='utf-8')
-        run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
-        run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
-        toml = '[tool.defsort]\nmax-reorder-count = 0\n'
-        (tmp_path / 'pyproject.toml').write_text(toml, encoding='utf-8')
-
-    def test_force_bypasses_guard(self, tmp_path: Path) -> None:
-        self._setup_guarded_repo(tmp_path)
-        original = (tmp_path / 'mod.py').read_text(encoding='utf-8')
-        invoke_cli(['--write', '--force', str(tmp_path / 'mod.py')])
-        assert (tmp_path / 'mod.py').read_text(encoding='utf-8') != original
-
-    def test_guard_clone_preserves_class_blockers(self) -> None:
-        class_blocker = ClassBlocker(
-            class_name='C',
-            occurrence=1,
-            blocker='duplicates',
-            message='non-consecutive duplicate definitions',
-        )
-        result = SortResult(
-            original_source='source',
-            new_source='sorted',
-            original_order=[],
-            new_order=[],
-            warning=None,
-            blocking_code=[],
-            class_blockers=(class_blocker,),
-        )
-
-        guarded = _guarded_skip(result, 'guarded')
-
-        assert guarded.class_blockers == (class_blocker,)
-
-    def test_guard_restores_source_with_initial_comment(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
-        source = (
-            '# about zeta\n'
-            'def zeta():\n'
-            '    return 1\n'
-            '\n\n'
-            '# about alpha\n'
-            'def alpha():\n'
-            '    return 2\n'
-        )
-        target = tmp_path / 'mod.py'
-        target.write_text(source, encoding='utf-8')
-        run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
-        run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.defsort]\nmax-reorder-count = 0\n',
-            encoding='utf-8',
-        )
-
-        _result_status, _result_stdout, result_stderr = invoke_cli(
-            ['--write', '-o', 'alphabetical', str(target)]
-        )
-
-        assert target.read_text(encoding='utf-8') == source
-        assert 'would move 2 of 2' in result_stderr
-
-    def test_guarded_class_blocker_survives_text_and_json(self, tmp_path: Path) -> None:
-        _init_empty_git_repo(tmp_path)
-        source = (
-            _SRC_DUP_METHODS
-            + '\n\ndef zed():\n    pass\n\n\ndef beta():\n    pass\n\n\ndef alpha():\n    pass\n'
-        )
-        target = tmp_path / 'mod.py'
-        target.write_text(source, encoding='utf-8')
-        run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
-        run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
-        (tmp_path / 'pyproject.toml').write_text(
-            '[tool.defsort]\nmax-reorder-count = 0\n',
-            encoding='utf-8',
-        )
-
-        text_result_status, _text_result_stdout, text_result_stderr = invoke_cli([str(target)])
-        _json_result_status, json_result_stdout, _json_result_stderr = invoke_cli(
-            ['--json', str(target)]
-        )
-        record = json.loads(json_result_stdout)['files'][0]
-
-        assert text_result_status == EXIT_CHANGED, text_result_stderr
-        assert 'would move' in text_result_stderr
-        assert 'class C: skipped (duplicate method names)' in text_result_stderr
-        assert record['status'] == 'skipped'
-        assert record['class_blockers'] == [
-            {'class': 'C', 'occurrence': 1, 'blocker': 'duplicates'}
-        ]
-
-    def test_json_mode_emits_skipped(self, tmp_path: Path) -> None:
-        self._setup_guarded_repo(tmp_path)
-        _result_status, result_stdout, _result_stderr = invoke_cli(
-            ['--json', str(tmp_path / 'mod.py')]
-        )
-        data = json.loads(result_stdout)
-        assert data['files'][0]['status'] == 'skipped'
-        assert 'would move' in data['files'][0]['warning']
-
-    def test_summary_shows_guard_warning(self, tmp_path: Path) -> None:
-        self._setup_guarded_repo(tmp_path)
-        _result_status, _result_stdout, result_stderr = invoke_cli([str(tmp_path / 'mod.py')])
-        assert 'would move' in result_stderr
-        assert 'sort constrained by 1 banner' in result_stderr
-
-    def test_write_mode_skips_guarded_file(self, tmp_path: Path) -> None:
-        self._setup_guarded_repo(tmp_path)
-        original = (tmp_path / 'mod.py').read_text(encoding='utf-8')
-        _result_status, _result_stdout, result_stderr = invoke_cli(
-            ['--write', str(tmp_path / 'mod.py')]
-        )
-        assert (tmp_path / 'mod.py').read_text(encoding='utf-8') == original
-        assert 'would move' in result_stderr
-
-
-class TestModuleInvocation:
-    @pytest.mark.parametrize('module', ['defsort', 'defsort._cli'])
-    def test_help_via_module(self, module: str) -> None:
-        result = run_setup([sys.executable, '-m', module, '--help'], env=_ENV, check=False)
-        assert result.returncode == EXIT_OK, process_transcript(result)
-        assert 'usage: defsort' in decode_text(result.stdout)
-
-    def test_hook_fast_path_skips_engine_imports(self, tmp_path: Path) -> None:
-        payload = json.dumps(
-            {
-                'session_id': 'budget',
-                'transcript_path': '/dev/null',
-                'cwd': str(tmp_path),
-                'permission_mode': 'default',
-                'hook_event_name': 'PreToolUse',
-                'tool_name': 'Bash',
-                'tool_input': {'command': 'ls -la'},
-                'tool_use_id': 'toolu_budget',
-            }
-        )
-        result = run_setup(
-            [sys.executable, '-c', _BUDGET_SCRIPT], stdin=payload.encode(), env=_ENV, check=False
-        )
-        stderr = result.stderr.decode().replace('\r\n', '\n')
-        assert 'budget-status=0\n' in stderr, stderr
-        assert 'budget-loaded=\n' in stderr, stderr
-
-
 class TestMultiFile:
     def test_multi_file_output(self, tmp_path: Path) -> None:
         f1 = tmp_path / 'a.py'
@@ -2370,46 +2382,6 @@ class TestMultiFilePreview:
                 assert i > 0
                 assert lines[i - 1].strip() == ''  # blank line before
 
-    def test_multi_file_preview_blank_line_after_filename(self, tmp_path: Path) -> None:
-        f1 = tmp_path / 'a.py'
-        f1.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        f2 = tmp_path / 'b.py'
-        f2.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        _result_status, result_stdout, _result_stderr = invoke_cli(['-p', str(f1), str(f2)])
-        lines = result_stdout.splitlines()
-        for i, line in enumerate(lines):
-            if line.rstrip().endswith(':') and line.strip():
-                # Next line should be blank
-                assert i + 1 < len(lines)
-                assert lines[i + 1].strip() == '', f'expected blank after {line!r}'
-
-    def test_multi_file_preview_indents_tables(self, tmp_path: Path) -> None:
-        f1 = tmp_path / 'a.py'
-        f1.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        f2 = tmp_path / 'b.py'
-        f2.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        _result_status, result_stdout, _result_stderr = invoke_cli(['-p', str(f1), str(f2)])
-        lines = [line for line in result_stdout.splitlines() if line.strip()]
-        for line in lines:
-            if line.endswith(':'):
-                # Filename header -- not indented
-                assert not line.startswith('  ')
-            else:
-                # Table content -- indented 2 spaces
-                assert line.startswith('  ')
-
-    def test_multi_file_preview_no_leading_blank_line(self, tmp_path: Path) -> None:
-        f1 = tmp_path / 'a.py'
-        f1.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        f2 = tmp_path / 'b.py'
-        f2.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, result_stdout, result_stderr = invoke_cli(['-p', str(f1), str(f2)])
-        assert result_status == 1, result_stderr
-        assert result_stdout, 'expected non-empty output'
-        assert not result_stdout.startswith('\n'), (
-            f'output starts with blank line: {result_stdout!r}'
-        )
-
     def test_multi_file_preview_shows_tables(self, tmp_path: Path) -> None:
         f1 = tmp_path / 'a.py'
         f1.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
@@ -2419,6 +2391,15 @@ class TestMultiFilePreview:
         assert result_status == 1, result_stderr
         assert 'Current' in result_stdout
         assert 'Proposed' in result_stdout
+        assert not result_stdout.startswith('\n')
+        lines = result_stdout.splitlines()
+        for index, line in enumerate(lines):
+            if line.rstrip().endswith(':') and line.strip():
+                assert not line.startswith('  ')
+                assert index + 1 < len(lines)
+                assert lines[index + 1].strip() == ''
+            elif line.strip():
+                assert line.startswith('  ')
 
     def test_multi_file_preview_skipped_files_are_detailed(self, tmp_path: Path) -> None:
         skipped_a = tmp_path / 'a.py'
@@ -2447,9 +2428,15 @@ class TestMultiFilePreview:
         assert f'{skipped_a.as_posix()}: skipped\n' in result_stderr
         assert f'{skipped_b.as_posix()}: skipped\n' in result_stderr
         assert result_stderr.count('  reason: code between definitions') == 2
-        assert result_stderr.count('  fix: use --force to bypass safety checks') == 2
         assert (
-            '  fix: use --force to bypass safety checks\n\n  Code between definitions:'
+            result_stderr.count(
+                '  fix: move this code above the first definition or below the last one'
+            )
+            == 2
+        )
+        assert (
+            '  override: --force sorts anyway; review the diff first\n\n'
+            '  Code between definitions:'
         ) in result_stderr
         assert result_stderr.count('  Code between definitions:') == 2
         assert '    line 4: registry = {}' in result_stderr
@@ -2530,7 +2517,7 @@ class TestNoIncrementalFlag:
 
     def test_no_incremental_overrides_config(self, tmp_path: Path) -> None:
         # Baseline: defs in wrong dependency order (bravo calls alpha)
-        _init_empty_git_repo(tmp_path)
+        init_empty_git_repo(tmp_path)
         baseline = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
         (tmp_path / 'mod.py').write_text(baseline)
         run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
@@ -2692,10 +2679,6 @@ class TestPerFileConfig:
         assert target.resolve() in {path.resolve() for path in seen}
         assert nested_incremental == [True]
 
-    def test_no_python_files_does_not_crash(self, tmp_path: Path) -> None:
-        (tmp_path / 'notes.txt').write_text('nothing here\n', encoding='utf-8')
-        assert main([str(tmp_path)]) == EXIT_OK
-
     def test_resolver_caches_each_path(
         self,
         tmp_path: Path,
@@ -2719,8 +2702,8 @@ class TestPerFileConfig:
             add_future=True,
         )
 
-        first = resolver._for_path(path)
-        second = resolver._for_path(path)
+        first = resolver.for_path(path)
+        second = resolver.for_path(path)
 
         assert first is second
         assert calls == [path]
@@ -2752,9 +2735,7 @@ class TestPerFileConfig:
 class TestPerFileIncrementalConfig:
     def _make_repo(self, root: Path, incremental: str) -> Path:
         root.mkdir()
-        run_setup(['git', 'init', '-q', str(root)])
-        run_setup(['git', '-C', str(root), 'config', 'user.email', 'a@example.com'])
-        run_setup(['git', '-C', str(root), 'config', 'user.name', 'a'])
+        init_empty_git_repo(root)
         (root / 'pyproject.toml').write_text(
             f'[tool.defsort]\nincremental = {incremental}\n', encoding='utf-8'
         )
@@ -2789,16 +2770,28 @@ class TestPerFileIncrementalConfig:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         clear_config_cache()
-        file_a = self._make_repo(tmp_path / 'repo_a', 'true')
-        file_b = self._make_repo(tmp_path / 'repo_b', 'false')
-        (tmp_path / 'repo_b' / 'pyproject.toml').write_text(
+        paths: list[Path] = []
+        for name in ('project_a', 'project_b'):
+            project = tmp_path / name
+            project.mkdir()
+            (project / 'pyproject.toml').write_text(
+                '[tool.defsort]\nincremental = false\n', encoding='utf-8'
+            )
+            source = project / 'm.py'
+            source.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+            paths.append(source)
+        (tmp_path / 'project_b' / 'pyproject.toml').write_text(
             '[tool.defsort]\nincremental = false\norder = "alphabetical"\ntie-break = "source"\n',
             encoding='utf-8',
         )
         clear_config_cache()
-        main(['-d', str(file_a), str(file_b)])
+        main(['-d', *(str(path) for path in paths)])
         captured = capsys.readouterr()
-        assert 'tie-break has no effect' in captured.err
+        expected = (
+            'warning: [tool.defsort] tie-break has no effect under the resolved '
+            'strategies; ignoring'
+        )
+        assert expected in captured.err
 
 
 class TestPreviewMethodTables:
@@ -2820,19 +2813,6 @@ class TestPreviewMethodTables:
         # Should have definition movement AND method movement
         assert 'zulu' in result_stdout
         assert 'C ' in result_stdout  # class header for method table
-
-    def test_preview_methods_only_no_def_table(self, tmp_path: Path) -> None:
-        src = (
-            'class C:\n    def bravo(self):\n        pass\n\n    def alpha(self):\n        pass\n'
-        )
-        f = tmp_path / 'test.py'
-        f.write_text(src, encoding='utf-8')
-        _result_status, result_stdout, _result_stderr = invoke_cli(['-p', str(f)])
-        # Should have method table but check that we don't show
-        # a definition table with no movement
-        lines = result_stdout.strip().splitlines()
-        # First non-empty line should be the class header, not "Current"
-        assert lines[0].startswith('C ')
 
     def test_preview_shows_method_table(self, tmp_path: Path) -> None:
         src = (
@@ -2941,6 +2921,736 @@ class TestPreviewMode:
         assert 'already in' in result_stdout
 
 
+class TestScopedOrderFlags:
+    def test_definition_order_alphabetical(self, tmp_path: Path) -> None:
+        src = 'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
+        f = tmp_path / 'test.py'
+        f.write_text(src, encoding='utf-8')
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['--definition-order', 'alphabetical', '-w', str(f)]
+        )
+        assert result_status == 0, result_stderr
+        content = f.read_text(encoding='utf-8')
+        assert content.index('alpha') < content.index('bravo')
+
+    def test_definition_order_none(self, tmp_path: Path) -> None:
+        src = (
+            'class Foo:\n'
+            '    def bravo(self) -> None:\n        pass\n\n'
+            '    def alpha(self) -> None:\n        pass\n'
+            '\n\n'
+            'def zeta():\n    pass\n\n\ndef able():\n    pass\n'
+        )
+        f = tmp_path / 'test.py'
+        f.write_text(src, encoding='utf-8')
+        invoke_cli(['--definition-order', 'none', '-w', str(f)])
+        content = f.read_text(encoding='utf-8')
+        # Top-level order preserved: Foo before zeta before able
+        assert content.index('class Foo') < content.index('def zeta')
+        assert content.index('def zeta') < content.index('def able')
+        # Methods sorted: alpha before bravo
+        assert content.index('def alpha') < content.index('def bravo')
+
+    def test_method_order_none(self, tmp_path: Path) -> None:
+        src = (
+            'class Foo:\n'
+            '    def bravo(self) -> None:\n        pass\n\n'
+            '    def alpha(self) -> None:\n        pass\n'
+        )
+        f = tmp_path / 'test.py'
+        f.write_text(src, encoding='utf-8')
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['--method-order', 'none', '-w', str(f)]
+        )
+        assert result_status == 0, result_stderr
+        content = f.read_text(encoding='utf-8')
+        assert content.index('bravo') < content.index('alpha')
+
+    def test_order_with_scoped_override(self, tmp_path: Path) -> None:
+        src = 'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
+        f = tmp_path / 'test.py'
+        f.write_text(src, encoding='utf-8')
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['-o', 'alphabetical', '--method-order', 'dependency', '-w', str(f)]
+        )
+        assert result_status == 0, result_stderr
+        content = f.read_text(encoding='utf-8')
+        assert content.index('alpha') < content.index('bravo')
+
+
+class TestSkipMessageVisibility:
+    def test_config_hide_skips_suppresses_summary_message(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.defsort]\nshow-skips = false\n')
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
+
+        result_status, result_stdout, result_stderr = invoke_cli([str(f)])
+
+        assert result_status == EXIT_CHANGED, result_stderr
+        assert result_stdout == ''
+        assert result_stderr == ''
+
+    def test_hide_skips_does_not_suppress_json_warning(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
+
+        result_status, result_stdout, result_stderr = invoke_cli(
+            ['--hide-skips', '--json', str(f)]
+        )
+
+        assert result_status == EXIT_CHANGED, result_stderr
+        assert result_stderr == ''
+        data = json.loads(result_stdout)
+        rec = data['files'][0]
+        assert rec['status'] == 'skipped'
+        assert rec['warning'] == 'code between definitions'
+
+    def test_hide_skips_does_not_suppress_preview_details(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
+
+        result_status, _result_stdout, result_stderr = invoke_cli(['--hide-skips', '-p', str(f)])
+
+        assert result_status == EXIT_CHANGED, result_stderr
+        assert f'{f.as_posix()}: skipped\n' in result_stderr
+        assert '  reason: code between definitions\n' in result_stderr
+        assert (
+            '  fix: move this code above the first definition or below the last one\n'
+            in result_stderr
+        )
+        assert '  override: --force sorts anyway; review the diff first\n' in result_stderr
+        assert 'Code between definitions:' in result_stderr
+
+    def test_hide_skips_suppresses_diff_message(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
+
+        result_status, result_stdout, result_stderr = invoke_cli(['--hide-skips', '-d', str(f)])
+
+        assert result_status == EXIT_CHANGED, result_stderr
+        assert result_stdout == ''
+        assert result_stderr == ''
+
+    def test_hide_skips_suppresses_write_message(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
+
+        result_status, _result_stdout, result_stderr = invoke_cli(['--hide-skips', '-w', str(f)])
+
+        assert result_status == EXIT_CHANGED, result_stderr
+        assert f.read_text(encoding='utf-8') == _SRC_INTERSTITIAL
+        assert result_stderr == ''
+
+    def test_show_skips_overrides_config_hide(self, tmp_path: Path) -> None:
+        (tmp_path / 'pyproject.toml').write_text('[tool.defsort]\nshow-skips = false\n')
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
+
+        result_status, _result_stdout, result_stderr = invoke_cli(['--show-skips', str(f)])
+
+        assert result_status == EXIT_CHANGED, result_stderr
+        assert result_stderr == f'{f.as_posix()}: skipped (code between definitions)\n'
+
+
+class TestSummaryMode:
+    def test_default_already_ordered_silent(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
+        result_status, result_stdout, result_stderr = invoke_cli([str(f)])
+        assert result_status == 0, result_stderr
+        assert result_stdout.strip() == ''
+
+    def test_default_shows_summary(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        _result_status, result_stdout, _result_stderr = invoke_cli([str(f)])
+        assert 'Name' in result_stdout
+        assert 'Defs' in result_stdout
+        assert '%' in result_stdout
+        assert f.read_text(encoding='utf-8') == _SRC_NEEDS_SORT  # not modified
+
+    def test_directory_one_changed_no_total(self, tmp_path: Path) -> None:
+        changed = tmp_path / 'a.py'
+        changed.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        ordered = tmp_path / 'b.py'
+        ordered.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
+        _result_status, result_stdout, _result_stderr = invoke_cli([str(tmp_path)])
+        assert 'a.py' in result_stdout
+        assert 'TOTAL' not in result_stdout
+
+    def test_skipped_file_excluded_from_summary_totals(self, tmp_path: Path) -> None:
+        sortable = tmp_path / 'a.py'
+        sortable.write_text(
+            'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n', encoding='utf-8'
+        )
+        blocked = tmp_path / 'b.py'
+        blocked.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
+        _result_status, result_stdout, result_stderr = invoke_cli([str(tmp_path)])
+        assert 'b.py' not in result_stdout
+        assert 'skipped' in result_stderr
+        assert '%' in result_stdout
+
+    def test_skipped_shows_reason(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
+        _result_status, _result_stdout, result_stderr = invoke_cli([str(f)])
+        assert 'skipped' in result_stderr
+        assert 'code between definitions' in result_stderr
+
+    def test_verbose_shows_already_ordered(self, tmp_path: Path) -> None:
+        f = tmp_path / 'test.py'
+        f.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
+        _result_status, result_stdout, _result_stderr = invoke_cli(['-v', str(f)])
+        assert '0%' in result_stdout
+
+
+class TestSyntaxErrorHandling:
+    def test_compile_invalid_exits_2(self, tmp_path: Path) -> None:
+        f = tmp_path / 'bad.py'
+        f.write_text('return 1\n', encoding='utf-8')
+        result_status, _result_stdout, result_stderr = invoke_cli([str(f)])
+        assert result_status == EXIT_ERROR, result_stderr
+        assert 'error:' in result_stderr
+
+    def test_syntax_error_does_not_abort_others(self, tmp_path: Path) -> None:
+        bad = tmp_path / 'bad.py'
+        bad.write_text('def foo(:\n', encoding='utf-8')
+        good = tmp_path / 'good.py'
+        good.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        result_status, result_stdout, result_stderr = invoke_cli([str(bad), str(good)])
+        assert result_status == 2, result_stderr
+        assert 'good.py' in result_stdout
+
+    def test_syntax_error_exits_2(self, tmp_path: Path) -> None:
+        f = tmp_path / 'bad.py'
+        f.write_text('def foo(:\n', encoding='utf-8')
+        result_status, _result_stdout, result_stderr = invoke_cli([str(f)])
+        assert result_status == 2, result_stderr
+        assert 'error:' in result_stderr
+
+    def test_syntax_error_exits_2_in_write_mode(self, tmp_path: Path) -> None:
+        bad = tmp_path / 'bad.py'
+        bad.write_text('def foo(:\n', encoding='utf-8')
+        result_status, _result_stdout, result_stderr = invoke_cli(['-w', str(bad)])
+        assert result_status == 2, result_stderr
+
+
+class TestUnrecognizedArguments:
+    def test_hook_help_wins_over_unrecognized_option(self) -> None:
+        status, stdout, stderr = invoke_cli(['hook', '--help', '--agnt', 'claude'])
+        help_status, help_stdout, help_stderr = invoke_cli(['hook', '--help'])
+        assert (status, stdout, stderr) == (help_status, help_stdout, help_stderr)
+        assert (status, stderr) == (0, '')
+        assert stdout.startswith('usage: defsort hook --agent NAME [options]\n')
+
+    @pytest.mark.parametrize(
+        ('argv', 'program', 'arguments'),
+        [
+            (['hook', '--agnt', 'claude'], 'defsort hook', '--agnt (did you mean --agent?)'),
+            (['hook', '--agent', '--evnt', 'x'], 'defsort hook', '--evnt (did you mean --event?)'),
+            (['hook', '--agent', 'claude', 'stray'], 'defsort hook', 'stray'),
+            (['--wirte', '--whatever'], 'defsort', '--wirte (did you mean --write?) --whatever'),
+            (['--diff', '--write', '--verbos'], 'defsort', '--verbos (did you mean --verbose?)'),
+            (['--check'], 'defsort', '--check'),
+        ],
+    )
+    def test_unrecognized_arguments_have_exact_diagnostics(
+        self, argv: list[str], program: str, arguments: str
+    ) -> None:
+        status, stdout, stderr = invoke_cli(argv)
+        usage = '--agent NAME [options]' if program == 'defsort hook' else '[options] [PATH ...]'
+        assert (status, stdout) == (2, '')
+        assert stderr == (
+            f'usage: {program} {usage}\n{program}: error: unrecognized arguments: {arguments}\n'
+        )
+
+    @pytest.mark.parametrize('argv', [['--', '--wirte'], ['--odd name.py']])
+    def test_unrecognized_option_like_paths_remain_operands(self, argv: list[str]) -> None:
+        assert _build_parser().parse_args(argv).paths == [argv[-1]]
+
+
+class TestHookSubcommandParser:
+    def test_hook_accepts_agent_option(self, registered_hosts: Path) -> None:
+        assert registered_hosts.is_dir()
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['hook', '--agent', 'claude'], stdin='{}'
+        )
+        assert result_status == 0, result_stderr
+
+    def test_hook_accepts_event_for_antigravity(self, registered_hosts: Path) -> None:
+        assert registered_hosts.is_dir()
+        result_status, result_stdout, result_stderr = invoke_cli(
+            ['hook', '--agent', 'agy', '--event', 'PreToolUse'], stdin='{}'
+        )
+        assert result_status == 0, result_stderr
+        assert result_stdout == ''
+
+    def test_hook_conflicting_incremental_exits_2(self) -> None:
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['hook', '--agent', 'claude', '-i', '--no-incremental']
+        )
+        assert result_status == 2, result_stderr
+
+    @pytest.mark.usefixtures('registered_hosts')
+    def test_hook_help_groups_every_option_with_its_help(self) -> None:
+        _status, stdout, _stderr = invoke_cli(['hook', '--help'])
+
+        sections = _help_sections(stdout)
+        assert list(sections) == list(_HOOK_HELP)
+        assert sections == {title: ' '.join(entries) for title, entries in _HOOK_HELP.items()}
+
+    def test_hook_help_lists_agents_from_the_registry(self, registered_hosts: Path) -> None:
+        register_distribution(
+            registered_hosts,
+            'defsort-host-example',
+            {'example': 'tests.hosts_example.adapter:ExampleAdapter'},
+        )
+
+        _status, stdout, _stderr = invoke_cli(['hook', '--help'])
+
+        assert '\n  -a, --agent NAME      coding agent: agy, claude, codex, example\n' in stdout
+
+    def test_hook_help_starts_with_short_usage_and_description(self) -> None:
+        status, stdout, stderr = invoke_cli(['hook', '--help'])
+
+        assert (status, stderr) == (0, '')
+        usage, description, _rest = stdout.split('\n\n', 2)
+        assert usage == 'usage: defsort hook --agent NAME [options]'
+        assert ' '.join(description.split()) == (
+            "Run defsort as a coding-agent hook, reading the agent's hook payload as JSON "
+            'from stdin.'
+        )
+
+    def test_hook_requires_agent(self) -> None:
+        result_status, _result_stdout, result_stderr = invoke_cli(['hook'], stdin='{}')
+        assert result_status == 2, result_stderr
+        assert 'the following arguments are required: -a/--agent' in result_stderr
+
+    def test_hook_short_agent_option_matches_long(self, registered_hosts: Path) -> None:
+        assert registered_hosts.is_dir()
+        short_status, short_stdout, short_stderr = invoke_cli(['hook', '-a', 'claude'], stdin='{}')
+        long_status, long_stdout, long_stderr = invoke_cli(
+            ['hook', '--agent', 'claude'], stdin='{}'
+        )
+        assert (short_status, short_stdout, short_stderr) == (
+            long_status,
+            long_stdout,
+            long_stderr,
+        )
+
+    def test_hook_short_event_option_matches_long(self, registered_hosts: Path) -> None:
+        assert registered_hosts.is_dir()
+        short_status, short_stdout, short_stderr = invoke_cli(
+            ['hook', '-a', 'agy', '-e', 'PreToolUse'], stdin='{}'
+        )
+        long_status, long_stdout, long_stderr = invoke_cli(
+            ['hook', '--agent', 'agy', '--event', 'PreToolUse'], stdin='{}'
+        )
+        assert (short_status, short_stdout, short_stderr) == (
+            long_status,
+            long_stdout,
+            long_stderr,
+        )
+
+    @pytest.mark.parametrize('has_url', [True, False])
+    def test_hook_terminal_prints_usage(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        registered_hosts: Path,
+        has_url: bool,
+    ) -> None:
+        if not has_url:
+            metadata_path = registered_hosts / 'defsort-0.0.0.dist-info' / 'METADATA'
+            metadata_path.write_text(
+                metadata_path.read_text(encoding='utf-8').replace(
+                    'Project-URL: Documentation, https://example.invalid/docs\n', ''
+                ),
+                encoding='utf-8',
+            )
+        from defsort._vendor.hookfront._front import _documentation_url  # noqa: PLC0415
+
+        _documentation_url.cache_clear()
+        fake_stdin = io.StringIO()
+        fake_stdin.isatty = lambda: True
+        monkeypatch.setattr('sys.stdin', fake_stdin)
+        try:
+            result = main(['hook', '--agent', 'claude'])
+            captured = capsys.readouterr()
+            assert result == 0
+            assert captured.out == ''
+            second_line = (
+                'See hook.md at https://example.invalid/docs for configuration.'
+                if has_url
+                else 'See the defsort hook guide, hook.md, for configuration.'
+            )
+            assert captured.err == (
+                "defsort hook: reads the coding agent's hook payload as JSON from stdin\n"
+                f'{second_line}\n'
+            )
+        finally:
+            _documentation_url.cache_clear()
+
+    def test_hook_unknown_arg_exits_2(self) -> None:
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['hook', '--agent', 'claude', '--bogus']
+        )
+        assert result_status == 2, result_stderr
+
+    def test_hook_usage_error_prints_short_usage_without_reading_registry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_registry_read() -> list[str]:
+            raise AssertionError('the hook registry was read')
+
+        monkeypatch.setattr(
+            'defsort._vendor.hookfront._loader.registered_host_names', unexpected_registry_read
+        )
+
+        status, stdout, stderr = invoke_cli(['hook'])
+
+        assert (status, stdout) == (2, '')
+        assert stderr == (
+            'usage: defsort hook --agent NAME [options]\n'
+            'defsort hook: error: the following arguments are required: -a/--agent\n'
+        )
+
+
+class TestIncrementalFlag:
+    def test_incremental_diff_shows_changes(self, tmp_path: Path) -> None:
+        _git_init_with_baseline(tmp_path)
+        path = tmp_path / 'mod.py'
+        source = path.read_text(encoding='utf-8').replace('charlie', 'aardvark')
+        path.write_text(source, encoding='utf-8')
+
+        result_status, result_stdout, result_stderr = invoke_cli(
+            ['-i', '--definition-order', 'alphabetical', '-d', str(path)]
+        )
+
+        assert result_status == 1, result_stderr
+        assert '@@' in result_stdout
+        assert '+def aardvark():' in result_stdout
+        assert '-def aardvark():' in result_stdout
+        assert path.read_text(encoding='utf-8') == source
+
+    def test_incremental_infra_error_json_preserves_source_totals(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source = (
+            'def bravo():\n'
+            '    return alpha()\n'
+            '\n'
+            '\n'
+            'def alpha():\n'
+            '    return 1\n'
+            '\n'
+            '\n'
+            'class Charlie:\n'
+            '    def method(self):\n'
+            '        return None\n'
+        )
+        f = tmp_path / 'mod.py'
+        f.write_text(source)
+
+        result_status, result_stdout, result_stderr = invoke_cli(['-i', '--json', str(f)])
+
+        record = json.loads(result_stdout)['files'][0]
+        assert result_status == 1, result_stderr
+        assert record['status'] == 'skipped'
+        assert record['definitions'] == {'moved': 0, 'total': 3}
+        assert record['methods'] == {'moved': 0, 'total': 1}
+        assert record['movements'] == []
+        assert record['method_movements'] == []
+        assert f.read_text() == source
+        assert record['warning'] is not None
+        assert record['warning'] == 'not in a Git repository'
+
+    def test_incremental_infra_error_skips(self, tmp_path: Path) -> None:
+        # Create a file in a non-git directory
+        f = tmp_path / 'mod.py'
+        f.write_text('def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n')
+        result_status, result_stdout, result_stderr = invoke_cli(['-i', '-v', str(f)])
+        assert result_status == 1, result_stderr
+        # File should be skipped, not sorted
+        content = f.read_text()
+        assert content.index('bravo') < content.index('alpha')  # unchanged
+        assert 'not in a Git repository' in result_stderr
+        assert 'mod.py' not in result_stdout
+
+    def test_incremental_new_file_no_head(self, tmp_path: Path) -> None:
+        init_empty_git_repo(tmp_path)
+        (tmp_path / 'new.py').write_text(
+            'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
+        )
+        run_setup(['git', 'add', 'new.py'], cwd=tmp_path)
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['-i', '-w', str(tmp_path / 'new.py')]
+        )
+        assert result_status == 0, result_stderr
+        content = (tmp_path / 'new.py').read_text()
+        assert content.index('alpha') < content.index('bravo')
+
+    def test_incremental_noop_no_new_defs(self, tmp_path: Path) -> None:
+        _git_init_no_changes(tmp_path)
+        result_status, _result_stdout, result_stderr = invoke_cli(['-i', str(tmp_path / 'mod.py')])
+        assert result_status == 0, result_stderr
+
+    def test_incremental_untracked_file_full_sort(self, tmp_path: Path) -> None:
+        init_empty_git_repo(tmp_path)
+        # Create file but don't git add it
+        (tmp_path / 'untracked.py').write_text(
+            'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
+        )
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['-i', '-w', str(tmp_path / 'untracked.py')]
+        )
+        assert result_status == 0, result_stderr
+        content = (tmp_path / 'untracked.py').read_text()
+        assert content.index('alpha') < content.index('bravo')
+
+    def test_incremental_write_sorts_new_defs(self, tmp_path: Path) -> None:
+        _git_init_with_baseline(tmp_path)
+        path = tmp_path / 'mod.py'
+        source = path.read_text(encoding='utf-8').replace('charlie', 'aardvark')
+        path.write_text(source, encoding='utf-8')
+        expected = (
+            'def aardvark():\n    return alpha()\n\n\n'
+            'def alpha():\n    return 1\n\n\n'
+            'def bravo():\n    return alpha()\n'
+        )
+
+        result_status, _result_stdout, result_stderr = invoke_cli(
+            ['-i', '--definition-order', 'alphabetical', '-w', str(path)]
+        )
+
+        assert result_status == 0, result_stderr
+        assert path.read_text(encoding='utf-8') == expected
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason='POSIX byte filename semantics')
+    @pytest.mark.parametrize(
+        ('args', 'config_text'),
+        [
+            (['--incremental'], None),
+            ([], '[tool.defsort]\nmax-reorder-count = 0\n'),
+        ],
+        ids=['incremental', 'reorder-guard'],
+    )
+    def test_unencodable_baseline_path_skips_without_traceback(
+        self,
+        tmp_path: Path,
+        capfd: pytest.CaptureFixture[str],
+        args: list[str],
+        config_text: str | None,
+    ) -> None:
+        init_empty_git_repo(tmp_path)
+        bad_name = b'bad-\xff.py'.decode('utf-8', errors='surrogateescape')
+        path = tmp_path / bad_name
+        try:
+            path.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
+        except OSError:
+            pytest.skip('filesystem does not support non-UTF-8 filename bytes')
+        run_setup(['git', 'add', '--', path.name], cwd=tmp_path)
+        run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
+        if config_text is not None:
+            (tmp_path / 'pyproject.toml').write_text(config_text, encoding='utf-8')
+        path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+
+        result = main([*args, str(path)])
+
+        captured = capfd.readouterr()
+        assert result == EXIT_CHANGED
+        assert 'unable to read baseline' in captured.err
+        assert 'Traceback' not in captured.err
+        assert path.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+
+    @pytest.mark.parametrize(
+        'mode_args',
+        [pytest.param(['--write'], id='text-write'), pytest.param(['--json'], id='json')],
+    )
+    def test_unsupported_git_exits_before_output_or_write(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        mode_args: list[str],
+    ) -> None:
+        source = _SRC_NEEDS_SORT
+        path = tmp_path / 'mod.py'
+        path.write_text(source, encoding='utf-8')
+
+        def reject_git(_paths: list[Path]) -> dict[Path, BlobReadResult]:
+            raise UnsupportedGitVersionError(
+                '2.41.7',
+                tool='defsort',
+                purpose='incremental mode and the reorder guard on working-tree files',
+            )
+
+        monkeypatch.setattr('defsort._cli._batch_fetch_cli_baselines', reject_git)
+
+        result = main(['--incremental', *mode_args, str(path)])
+
+        captured = capsys.readouterr()
+        assert result == EXIT_ERROR
+        assert captured.out == ''
+        assert captured.err == (
+            'defsort: Git 2.42 or newer is required for incremental mode and the reorder guard '
+            'on working-tree files (found Git 2.41.7)\n'
+        )
+        assert path.read_text(encoding='utf-8') == source
+
+
+class TestLargeReorderGuard:
+    @staticmethod
+    def _setup_guarded_repo(tmp_path: Path) -> None:
+        init_empty_git_repo(tmp_path)
+        out_of_order = (
+            'def c():\n    pass\n\n\ndef b():\n    pass\n\n\n# --------\n\n\ndef a():\n    pass\n'
+        )
+        (tmp_path / 'mod.py').write_text(out_of_order, encoding='utf-8')
+        run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
+        run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
+        toml = '[tool.defsort]\nmax-reorder-count = 0\n'
+        (tmp_path / 'pyproject.toml').write_text(toml, encoding='utf-8')
+
+    def test_force_bypasses_guard(self, tmp_path: Path) -> None:
+        self._setup_guarded_repo(tmp_path)
+        original = (tmp_path / 'mod.py').read_text(encoding='utf-8')
+        invoke_cli(['--write', '--force', str(tmp_path / 'mod.py')])
+        assert (tmp_path / 'mod.py').read_text(encoding='utf-8') != original
+
+    def test_guard_clone_preserves_class_blockers(self) -> None:
+        class_blocker = ClassBlocker(
+            class_name='C',
+            occurrence=1,
+            blocker='duplicates',
+            message='non-consecutive duplicate definitions',
+        )
+        result = SortResult(
+            original_source='source',
+            new_source='sorted',
+            original_order=[],
+            new_order=[],
+            warning=None,
+            blocking_code=[],
+            class_blockers=(class_blocker,),
+        )
+
+        guarded = _guarded_skip(result, 'guarded')
+
+        assert guarded.class_blockers == (class_blocker,)
+
+    def test_guard_restores_source_with_initial_comment(self, tmp_path: Path) -> None:
+        init_empty_git_repo(tmp_path)
+        source = (
+            '# about zeta\n'
+            'def zeta():\n'
+            '    return 1\n'
+            '\n\n'
+            '# about alpha\n'
+            'def alpha():\n'
+            '    return 2\n'
+        )
+        target = tmp_path / 'mod.py'
+        target.write_text(source, encoding='utf-8')
+        run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
+        run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.defsort]\nmax-reorder-count = 0\n',
+            encoding='utf-8',
+        )
+
+        _result_status, _result_stdout, result_stderr = invoke_cli(
+            ['--write', '-o', 'alphabetical', str(target)]
+        )
+
+        assert target.read_text(encoding='utf-8') == source
+        assert 'would move 2 of 2' in result_stderr
+
+    def test_guarded_class_blocker_survives_text_and_json(self, tmp_path: Path) -> None:
+        init_empty_git_repo(tmp_path)
+        source = (
+            _SRC_DUP_METHODS
+            + '\n\ndef zed():\n    pass\n\n\ndef beta():\n    pass\n\n\ndef alpha():\n    pass\n'
+        )
+        target = tmp_path / 'mod.py'
+        target.write_text(source, encoding='utf-8')
+        run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
+        run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.defsort]\nmax-reorder-count = 0\n',
+            encoding='utf-8',
+        )
+
+        text_result_status, _text_result_stdout, text_result_stderr = invoke_cli([str(target)])
+        _json_result_status, json_result_stdout, _json_result_stderr = invoke_cli(
+            ['--json', str(target)]
+        )
+        record = json.loads(json_result_stdout)['files'][0]
+
+        assert text_result_status == EXIT_CHANGED, text_result_stderr
+        assert 'would move' in text_result_stderr
+        assert (
+            f'{path_text(target)}: class C: skipped (duplicate method names)' in text_result_stderr
+        )
+        assert record['status'] == 'skipped'
+        assert record['class_blockers'] == [
+            {'class': 'C', 'occurrence': 1, 'blocker': 'duplicates'}
+        ]
+
+    def test_json_mode_emits_skipped(self, tmp_path: Path) -> None:
+        self._setup_guarded_repo(tmp_path)
+        _result_status, result_stdout, _result_stderr = invoke_cli(
+            ['--json', str(tmp_path / 'mod.py')]
+        )
+        data = json.loads(result_stdout)
+        assert data['files'][0]['status'] == 'skipped'
+        assert 'would move' in data['files'][0]['warning']
+
+    def test_summary_shows_guard_warning(self, tmp_path: Path) -> None:
+        self._setup_guarded_repo(tmp_path)
+        _result_status, _result_stdout, result_stderr = invoke_cli([str(tmp_path / 'mod.py')])
+        assert 'would move' in result_stderr
+        assert 'sort constrained by 1 banner' in result_stderr
+
+    def test_write_mode_skips_guarded_file(self, tmp_path: Path) -> None:
+        self._setup_guarded_repo(tmp_path)
+        original = (tmp_path / 'mod.py').read_text(encoding='utf-8')
+        _result_status, _result_stdout, result_stderr = invoke_cli(
+            ['--write', str(tmp_path / 'mod.py')]
+        )
+        assert (tmp_path / 'mod.py').read_text(encoding='utf-8') == original
+        assert 'would move' in result_stderr
+
+
+class TestModuleInvocation:
+    @pytest.mark.parametrize('module', ['defsort', 'defsort._cli'])
+    def test_help_via_module(self, module: str) -> None:
+        result = run_setup([sys.executable, '-m', module, '--help'], env=ENV, check=False)
+        assert result.returncode == EXIT_OK, process_transcript(result)
+        assert 'usage: defsort' in decode_text(result.stdout)
+
+    def test_hook_fast_path_skips_engine_imports(self, tmp_path: Path) -> None:
+        payload = json.dumps(
+            {
+                'session_id': 'budget',
+                'transcript_path': '/dev/null',
+                'cwd': str(tmp_path),
+                'permission_mode': 'default',
+                'hook_event_name': 'PreToolUse',
+                'tool_name': 'Bash',
+                'tool_input': {'command': 'ls -la'},
+                'tool_use_id': 'toolu_budget',
+            }
+        )
+        result = run_setup(
+            [sys.executable, '-c', _BUDGET_SCRIPT], stdin=payload.encode(), env=ENV, check=False
+        )
+        stderr = result.stderr.decode().replace('\r\n', '\n')
+        assert 'budget-status=0\n' in stderr, stderr
+        assert 'budget-loaded=\n' in stderr, stderr
+
+
 class TestSafetySkip:
     def test_diff_skipped_output_stays_compact(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
@@ -2953,6 +3663,18 @@ class TestSafetySkip:
         assert result_stderr == f'{f.as_posix()}: skipped (code between definitions)\n'
         assert 'Proposed reorder:' not in result_stderr
         assert 'Use --force' not in result_stderr
+
+    def test_dynamic_all_remedy_in_preview(self, tmp_path: Path) -> None:
+        path = tmp_path / 'test.py'
+        path.write_text(DYNAMIC_ALL_SOURCE, encoding='utf-8')
+        status, stdout, stderr = invoke_cli(
+            ['--preview', '--no-incremental', '--definition-order', 'alphabetical', str(path)]
+        )
+        assert status == EXIT_CHANGED
+        assert stdout == ''
+        assert DYNAMIC_ALL_WARNING in ' '.join(stderr.split())
+        assert 'fix: write __all__ as one literal list' in stderr
+        assert path.read_text(encoding='utf-8') == DYNAMIC_ALL_SOURCE
 
     def test_force_bypasses(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
@@ -3078,6 +3800,34 @@ class TestSafetySkip:
         assert 'Proposed' in result_stdout
         assert 'skipped' not in result_stdout
 
+    def test_preview_offers_hoist_when_it_clears_the_blocker(self, tmp_path: Path) -> None:
+        source = 'def zeta():\n    pass\n\nREGISTRY = 3\n\ndef alpha():\n    pass\n'
+        path = tmp_path / 'mod.py'
+        path.write_text(source, encoding='utf-8')
+
+        status, _stdout, stderr = invoke_cli(['--preview', str(path)])
+
+        assert status == EXIT_CHANGED, stderr
+        assert (
+            '  fix: run again with --hoist to move these constants to the top of the module'
+            in stderr.replace('\n       ', ' ')
+        )
+        assert '  override: --force sorts anyway; review the diff first' in stderr
+        assert path.read_text(encoding='utf-8') == source
+
+    def test_preview_offers_move_when_hoist_does_not_clear(self, tmp_path: Path) -> None:
+        source = 'def zeta():\n    pass\n\nLIMIT = 3\n\ndef alpha(x=LIMIT):\n    return x\n'
+        path = tmp_path / 'mod.py'
+        path.write_text(source, encoding='utf-8')
+
+        status, _stdout, stderr = invoke_cli(['--preview', str(path)])
+
+        assert status == EXIT_CHANGED, stderr
+        assert '  fix: move this code above the first definition or below the last one' in stderr
+        assert '  override: --force sorts anyway; review the diff first' in stderr
+        assert '--hoist' not in stderr
+        assert path.read_text(encoding='utf-8') == source
+
     def test_preview_reports_line_number_for_leading_code(self, tmp_path: Path) -> None:
         src = (
             'def bravo():\n'
@@ -3099,7 +3849,11 @@ class TestSafetySkip:
         assert result_stdout == ''
         assert f'{f.as_posix()}: skipped\n' in result_stderr
         assert '  reason: code between definitions\n' in result_stderr
-        assert '  fix: use --force to bypass safety checks\n' in result_stderr
+        assert (
+            '  fix: move this code above the first definition or below the last one\n'
+            in result_stderr
+        )
+        assert '  override: --force sorts anyway; review the diff first\n' in result_stderr
         assert 'Proposed reorder:' not in result_stderr
         assert 'Current' in result_stderr
         assert 'Proposed' in result_stderr
@@ -3145,63 +3899,6 @@ class TestSafetySkip:
         assert path.read_text(encoding='utf-8') == source
 
 
-class TestScopedOrderFlags:
-    def test_definition_order_alphabetical(self, tmp_path: Path) -> None:
-        src = 'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
-        f = tmp_path / 'test.py'
-        f.write_text(src, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['--definition-order', 'alphabetical', '-w', str(f)]
-        )
-        assert result_status == 0, result_stderr
-        content = f.read_text(encoding='utf-8')
-        assert content.index('alpha') < content.index('bravo')
-
-    def test_definition_order_none(self, tmp_path: Path) -> None:
-        src = (
-            'class Foo:\n'
-            '    def bravo(self) -> None:\n        pass\n\n'
-            '    def alpha(self) -> None:\n        pass\n'
-            '\n\n'
-            'def zeta():\n    pass\n\n\ndef able():\n    pass\n'
-        )
-        f = tmp_path / 'test.py'
-        f.write_text(src, encoding='utf-8')
-        invoke_cli(['--definition-order', 'none', '-w', str(f)])
-        content = f.read_text(encoding='utf-8')
-        # Top-level order preserved: Foo before zeta before able
-        assert content.index('class Foo') < content.index('def zeta')
-        assert content.index('def zeta') < content.index('def able')
-        # Methods sorted: alpha before bravo
-        assert content.index('def alpha') < content.index('def bravo')
-
-    def test_method_order_none(self, tmp_path: Path) -> None:
-        src = (
-            'class Foo:\n'
-            '    def bravo(self) -> None:\n        pass\n\n'
-            '    def alpha(self) -> None:\n        pass\n'
-        )
-        f = tmp_path / 'test.py'
-        f.write_text(src, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['--method-order', 'none', '-w', str(f)]
-        )
-        assert result_status == 0, result_stderr
-        content = f.read_text(encoding='utf-8')
-        assert content.index('bravo') < content.index('alpha')
-
-    def test_order_with_scoped_override(self, tmp_path: Path) -> None:
-        src = 'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n'
-        f = tmp_path / 'test.py'
-        f.write_text(src, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(
-            ['-o', 'alphabetical', '--method-order', 'dependency', '-w', str(f)]
-        )
-        assert result_status == 0, result_stderr
-        content = f.read_text(encoding='utf-8')
-        assert content.index('alpha') < content.index('bravo')
-
-
 class TestSkipMessageOrdering:
     def test_all_skipped_no_leading_blank(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
@@ -3224,13 +3921,13 @@ class TestSkipMessageOrdering:
         skipped.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
         # Put the skipped input first to exercise deferral as well as flushing.
         process = subprocess.Popen(
-            [*_CLI, *flags, str(skipped), str(sortable)],
+            [*CLI, *flags, str(skipped), str(sortable)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding='utf-8',
-            env=_ENV,
+            env=ENV,
             start_new_session=True,
             creationflags=PROCESS_GROUP_FLAGS,
         )
@@ -3247,185 +3944,6 @@ class TestSkipMessageOrdering:
         assert result_stdout == ''
         assert 'skipped' in result_stderr
         assert not result_stderr.startswith('\n')
-
-
-class TestSkipMessageVisibility:
-    def test_config_hide_skips_suppresses_summary_message(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.defsort]\nshow-skips = false\n')
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
-
-        result_status, result_stdout, result_stderr = invoke_cli([str(f)])
-
-        assert result_status == EXIT_CHANGED, result_stderr
-        assert result_stdout == ''
-        assert result_stderr == ''
-
-    def test_hide_skips_does_not_suppress_json_warning(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
-
-        result_status, result_stdout, result_stderr = invoke_cli(
-            ['--hide-skips', '--json', str(f)]
-        )
-
-        assert result_status == EXIT_CHANGED, result_stderr
-        assert result_stderr == ''
-        data = json.loads(result_stdout)
-        rec = data['files'][0]
-        assert rec['status'] == 'skipped'
-        assert rec['warning'] == 'code between definitions'
-
-    def test_hide_skips_does_not_suppress_preview_details(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
-
-        result_status, _result_stdout, result_stderr = invoke_cli(['--hide-skips', '-p', str(f)])
-
-        assert result_status == EXIT_CHANGED, result_stderr
-        assert f'{f.as_posix()}: skipped\n' in result_stderr
-        assert '  reason: code between definitions\n' in result_stderr
-        assert '  fix: use --force to bypass safety checks\n' in result_stderr
-        assert 'Code between definitions:' in result_stderr
-
-    def test_hide_skips_suppresses_diff_message(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
-
-        result_status, result_stdout, result_stderr = invoke_cli(['--hide-skips', '-d', str(f)])
-
-        assert result_status == EXIT_CHANGED, result_stderr
-        assert result_stdout == ''
-        assert result_stderr == ''
-
-    def test_hide_skips_suppresses_write_message(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
-
-        result_status, _result_stdout, result_stderr = invoke_cli(['--hide-skips', '-w', str(f)])
-
-        assert result_status == EXIT_CHANGED, result_stderr
-        assert f.read_text(encoding='utf-8') == _SRC_INTERSTITIAL
-        assert result_stderr == ''
-
-    def test_show_skips_overrides_config_hide(self, tmp_path: Path) -> None:
-        (tmp_path / 'pyproject.toml').write_text('[tool.defsort]\nshow-skips = false\n')
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
-
-        result_status, _result_stdout, result_stderr = invoke_cli(['--show-skips', str(f)])
-
-        assert result_status == EXIT_CHANGED, result_stderr
-        assert result_stderr == f'{f.as_posix()}: skipped (code between definitions)\n'
-
-
-class TestSummaryMode:
-    def test_default_already_ordered_silent(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
-        result_status, result_stdout, result_stderr = invoke_cli([str(f)])
-        assert result_status == 0, result_stderr
-        assert result_stdout.strip() == ''
-
-    def test_default_shows_summary(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        _result_status, result_stdout, _result_stderr = invoke_cli([str(f)])
-        assert 'Name' in result_stdout
-        assert 'Defs' in result_stdout
-        assert '%' in result_stdout
-        assert f.read_text(encoding='utf-8') == _SRC_NEEDS_SORT  # not modified
-
-    def test_directory_one_changed_no_total(self, tmp_path: Path) -> None:
-        changed = tmp_path / 'a.py'
-        changed.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        ordered = tmp_path / 'b.py'
-        ordered.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
-        _result_status, result_stdout, _result_stderr = invoke_cli([str(tmp_path)])
-        assert 'a.py' in result_stdout
-        assert 'TOTAL' not in result_stdout
-
-    def test_skipped_file_excluded_from_summary_totals(self, tmp_path: Path) -> None:
-        sortable = tmp_path / 'a.py'
-        sortable.write_text(
-            'def bravo():\n    pass\n\n\ndef alpha():\n    pass\n', encoding='utf-8'
-        )
-        blocked = tmp_path / 'b.py'
-        blocked.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
-        _result_status, result_stdout, result_stderr = invoke_cli([str(tmp_path)])
-        assert 'b.py' not in result_stdout
-        assert 'skipped' in result_stderr
-        assert '%' in result_stdout
-
-    def test_skipped_shows_reason(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_INTERSTITIAL, encoding='utf-8')
-        _result_status, _result_stdout, result_stderr = invoke_cli([str(f)])
-        assert 'skipped' in result_stderr
-        assert 'code between definitions' in result_stderr
-
-    def test_summary_retains_rows_only(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        first = tmp_path / 'first.py'
-        first.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        second = tmp_path / 'second.py'
-        second.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        captured: list[SummaryRow] = []
-
-        def capture_rows(
-            rows: list[SummaryRow],
-            *,
-            verbose: bool,
-            color: bool,
-        ) -> str:
-            del verbose, color
-            captured.extend(rows)
-            return ''
-
-        monkeypatch.setattr(_cli, 'format_summary_rows', capture_rows, raising=False)
-        assert main([str(first), str(second)]) == EXIT_CHANGED
-        assert captured
-        assert all(isinstance(row, SummaryRow) for row in captured)
-
-    def test_verbose_shows_already_ordered(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_ALREADY_ORDERED, encoding='utf-8')
-        _result_status, result_stdout, _result_stderr = invoke_cli(['-v', str(f)])
-        assert '0%' in result_stdout
-
-
-class TestSyntaxErrorHandling:
-    def test_compile_invalid_exits_2(self, tmp_path: Path) -> None:
-        f = tmp_path / 'bad.py'
-        f.write_text('return 1\n', encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli([str(f)])
-        assert result_status == EXIT_ERROR, result_stderr
-        assert 'error:' in result_stderr
-
-    def test_syntax_error_does_not_abort_others(self, tmp_path: Path) -> None:
-        bad = tmp_path / 'bad.py'
-        bad.write_text('def foo(:\n', encoding='utf-8')
-        good = tmp_path / 'good.py'
-        good.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, result_stdout, result_stderr = invoke_cli([str(bad), str(good)])
-        assert result_status == 2, result_stderr
-        assert 'good.py' in result_stdout
-
-    def test_syntax_error_exits_2(self, tmp_path: Path) -> None:
-        f = tmp_path / 'bad.py'
-        f.write_text('def foo(:\n', encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli([str(f)])
-        assert result_status == 2, result_stderr
-        assert 'error:' in result_stderr
-
-    def test_syntax_error_exits_2_in_write_mode(self, tmp_path: Path) -> None:
-        bad = tmp_path / 'bad.py'
-        bad.write_text('def foo(:\n', encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(['-w', str(bad)])
-        assert result_status == 2, result_stderr
 
 
 class TestUnavailableStdout:
@@ -3456,12 +3974,6 @@ class TestUnavailableStdout:
 
 
 class TestVersion:
-    def test_help_goes_to_stdout(self) -> None:
-        status, stdout, stderr = invoke_cli(['--help'])
-        assert (status, stderr) == (0, '')
-        assert stdout.startswith('usage: defsort')
-        assert '--version' in stdout
-
     def test_missing_metadata_is_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def missing(name: str) -> str:
             raise importlib.metadata.PackageNotFoundError(name)
@@ -3507,6 +4019,8 @@ class TestWriteFailureSummary:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
+        if sys.platform != 'win32' and os.geteuid() == 0:
+            pytest.skip('root can write read-only files')
         unsorted = 'def b():\n    pass\n\n\ndef a():\n    pass\n'
         read_only = tmp_path / 'ro.py'
         writable = tmp_path / 'ok.py'
@@ -3544,15 +4058,17 @@ class TestWriteMode:
     def test_utf8_file_roundtrip(self, tmp_path: Path) -> None:
         src = (
             '# -*- coding: utf-8 -*-\n# Comment: caf\u00e9 \u2603\n\n'
+            'def a():\n    return b()\n\n\ndef b():\n    pass\n'
+        )
+        expected = (
+            '# -*- coding: utf-8 -*-\n# Comment: caf\u00e9 \u2603\n\n'
             'def b():\n    pass\n\n\ndef a():\n    return b()\n'
         )
         f = tmp_path / 'utf8.py'
-        f.write_text(src, encoding='utf-8')
+        f.write_bytes(src.encode('utf-8'))
         run_result_status, _run_result_stdout, run_result_stderr = invoke_cli(['-w', str(f)])
         assert run_result_status == 0, run_result_stderr
-        content = f.read_text(encoding='utf-8')
-        assert '\u2603' in content
-        assert 'def a' in content
+        assert f.read_bytes() == expected.encode('utf-8')
 
     def test_write_already_ordered_silent(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
@@ -3580,14 +4096,6 @@ class TestWriteMode:
         ast.parse(written)
         assert written.count('# encoding: utf-8 assumed') == 1
 
-    def test_write_long_flag(self, tmp_path: Path) -> None:
-        f = tmp_path / 'test.py'
-        f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
-        result_status, _result_stdout, result_stderr = invoke_cli(['--write', str(f)])
-        assert result_status == 0, result_stderr
-        new_content = f.read_text(encoding='utf-8')
-        assert new_content.index('alpha') < new_content.index('bravo')
-
     def test_write_modifies_file(self, tmp_path: Path) -> None:
         f = tmp_path / 'test.py'
         f.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
@@ -3610,6 +4118,49 @@ class TestWriteMode:
         assert '0%' in result_stdout
 
 
+class TestWriteSnapshotFailures:
+    def test_concurrent_edit_is_kept_and_other_files_continue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        a = tmp_path / 'a.py'
+        b = tmp_path / 'b.py'
+        a.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        b.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+
+        def edit_then_write(path: Path, content: str, *, encoding: str, raw: bytes) -> bytes:
+            if path == a:
+                path.write_bytes(b'edited = True\n')
+            return write_source(path, content, encoding=encoding, raw=raw)
+
+        monkeypatch.setattr('defsort._cli.write_source', edit_then_write)
+
+        assert main(['-w', str(a), str(b)]) == EXIT_ERROR
+        captured = capsys.readouterr()
+        assert a.read_bytes() == b'edited = True\n'
+        assert b.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
+        assert 'changed since it was read' in captured.err
+        assert 'a.py' in captured.err
+        assert 'a.py' not in captured.out
+        assert 'b.py' in captured.out
+
+    def test_failed_restore_reports_saved_original(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        recovery = redirect_recovery(monkeypatch, tmp_path / 'home')
+        target = tmp_path / 'test.py'
+        original = _SRC_NEEDS_SORT.encode('utf-8')
+        target.write_bytes(original)
+        fail_writes_to(monkeypatch, target, restore_fails=True)
+
+        assert main(['-w', str(target)]) == EXIT_ERROR
+        captured = capsys.readouterr()
+        saved = list(recovery.glob('*/*.orig'))
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == original
+        assert str(saved[0]) in captured.err
+        assert captured.out == ''
+
+
 def _closed_stdout_result(case: str, tmp_path: Path) -> subprocess.CompletedProcess[bytes]:
     if case == 'help-before-write':
         return run_with_closed_output(['--help'])
@@ -3622,7 +4173,7 @@ def _closed_stdout_result(case: str, tmp_path: Path) -> subprocess.CompletedProc
 
 
 def _git_init_no_changes(tmp_path: Path) -> None:
-    _init_empty_git_repo(tmp_path)
+    init_empty_git_repo(tmp_path)
     src = 'def alpha():\n    return 1\n\n\ndef bravo():\n    return alpha()\n'
     (tmp_path / 'mod.py').write_text(src)
     run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
@@ -3630,7 +4181,7 @@ def _git_init_no_changes(tmp_path: Path) -> None:
 
 
 def _git_init_with_baseline(tmp_path: Path) -> None:
-    _init_empty_git_repo(tmp_path)
+    init_empty_git_repo(tmp_path)
     baseline = 'def alpha():\n    return 1\n\n\ndef bravo():\n    return alpha()\n'
     (tmp_path / 'mod.py').write_text(baseline)
     run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
@@ -3641,7 +4192,7 @@ def _git_init_with_baseline(tmp_path: Path) -> None:
 
 
 def _git_init_with_duplicate_method_baseline(tmp_path: Path) -> None:
-    _init_empty_git_repo(tmp_path)
+    init_empty_git_repo(tmp_path)
     path = tmp_path / 'mod.py'
     path.write_text(_SRC_DUP_METHODS, encoding='utf-8')
     run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
@@ -3650,22 +4201,6 @@ def _git_init_with_duplicate_method_baseline(tmp_path: Path) -> None:
         _SRC_DUP_METHODS + '\n    def new(self):\n        return 4\n',
         encoding='utf-8',
     )
-
-
-def _help_entries(
-    parser: argparse.ArgumentParser, prefix: str
-) -> Iterator[tuple[str, str | None]]:
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            subparsers = cast('argparse._SubParsersAction[argparse.ArgumentParser]', action)
-            visible = [choice.dest for choice in subparsers._choices_actions]
-            for choice in subparsers._choices_actions:
-                yield f'{prefix} {choice.dest}', choice.help
-            for name in visible:
-                yield from _help_entries(subparsers.choices[name], f'{prefix} {name}')
-        elif action.help is not argparse.SUPPRESS:
-            label = '/'.join(action.option_strings) or action.dest
-            yield f'{prefix} {label}', action.help
 
 
 def _help_sections(help_text: str) -> dict[str, str]:
@@ -3684,15 +4219,37 @@ def _parse_overrides(argv: list[str]) -> SortOverrides:
     return overrides_from_args(args)
 
 
-def _starts_in_lowercase_style(text: str) -> bool:
-    first = text.split(maxsplit=1)[0]
-    is_acronym = first.upper() == first and any(character.isalpha() for character in first)
-    return text[0].islower() or is_acronym
-
-
 def test_abbreviation_rejected(tmp_path: Path) -> None:
     status, _stdout, stderr = invoke_cli(['--method-b', 'ignore', str(tmp_path)])
     assert status == 2, stderr
+
+
+def test_batch_failure_detail_preserves_infra_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    init_empty_git_repo(tmp_path)
+    path = tmp_path / 'mod.py'
+    path.write_text('x = 1\n', encoding='utf-8')
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise GitCommandError('fatal: cannot read objects')
+
+    monkeypatch.setattr(_cli, 'read_head_baselines', refuse)
+    with pytest.raises(GitCommandError, match='fatal: cannot read objects'):
+        _batch_fetch_cli_baselines([path])
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX output encoding regression')
+def test_cli_stdout_is_utf8_on_posix(tmp_path: Path) -> None:
+    target = tmp_path / 'café.py'
+    target.write_text('def zeta():\n    pass\n\n\ndef alpha():\n    pass\n', encoding='utf-8')
+    result = run_setup(
+        [sys.executable, '-m', 'defsort', str(target)],
+        env={**ENV, 'PYTHONIOENCODING': 'latin-1', 'PYTHONUTF8': '0'},
+        check=False,
+    )
+    assert result.returncode == EXIT_CHANGED, process_transcript(result)
+    assert b'caf\xc3\xa9.py' in result.stdout
 
 
 def test_entry_point_escapes_unencodable_stdout_text() -> None:
@@ -3708,7 +4265,7 @@ def test_entry_point_escapes_unencodable_stdout_text() -> None:
     )
     result = run_setup(
         [sys.executable, '-c', script],
-        env={**_ENV, 'PYTHONIOENCODING': 'utf-8:strict'},
+        env={**ENV, 'PYTHONIOENCODING': 'utf-8:strict'},
         check=False,
     )
     assert result.returncode == 0, process_transcript(result)
@@ -3723,24 +4280,6 @@ def test_error_path_and_detail_escape_terminal_controls(tmp_path: Path) -> None:
     assert result_status == 2, result_stderr
     assert r'missing\x1b]2;path\x07\x0a.py' in result_stderr
     assert '\x1b]2;path\x07' not in result_stderr
-
-
-def test_every_visible_option_and_command_has_lowercase_help() -> None:
-    entries = [
-        *_help_entries(_build_parser(), 'defsort'),
-        *_help_entries(_build_hook_parser(), 'defsort hook'),
-        *(
-            (f'defsort {name}', text)
-            for _title, commands in _COMMAND_GROUPS
-            for name, text in commands
-        ),
-    ]
-    problems = [
-        f'{name}: {text!r}'
-        for name, text in entries
-        if not text or not _starts_in_lowercase_style(text) or text.endswith('.')
-    ]
-    assert problems == []
 
 
 def test_invalid_cli_regex_is_usage_error(tmp_path: Path) -> None:
@@ -3762,7 +4301,7 @@ def test_layout_blocker_never_writes(tmp_path: Path, flags: list[str], mode: str
     )
     path = tmp_path / 'test.py'
     if mode == 'incremental':
-        _init_empty_git_repo(tmp_path)
+        init_empty_git_repo(tmp_path)
         path.write_text(baseline, encoding='utf-8')
         run_setup(['git', '-C', str(tmp_path), 'add', '.'])
         run_setup(['git', '-C', str(tmp_path), 'commit', '-m', 'baseline'])
@@ -3854,10 +4393,60 @@ def test_no_banner_pattern_restores_builtin(tmp_path: Path) -> None:
     assert cleared_stdout == ''  # the built-in banner remains a barrier
 
 
+def test_only_effective_git_modes_send_files_to_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    active = tmp_path / 'active'
+    inactive = tmp_path / 'inactive'
+    active.mkdir()
+    inactive.mkdir()
+    init_git_repo(active, _SRC_NEEDS_SORT)
+    (active / 'pyproject.toml').write_text(
+        '[tool.defsort]\nincremental = true\n', encoding='utf-8'
+    )
+    other = inactive / 'other.py'
+    other.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+    queried: list[Path] = []
+    original = _cli.discover_repo_root
+
+    def discover(parent: str) -> RepoDiscoveryResult:
+        queried.append(Path(parent))
+        assert Path(parent) == active
+        return original(parent)
+
+    monkeypatch.setattr(_cli, 'discover_repo_root', discover)
+    assert main(['--write', str(active / 'test.py'), str(other)]) == EXIT_OK
+    assert queried == [active]
+    assert other.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
+    capsys.readouterr()
+
+
 @pytest.mark.parametrize(('argv', 'field', 'expected'), _AXIS_FLAG_CASES)
 def test_policy_flag_maps_to_override(argv: list[str], field: str, expected: object) -> None:
     overrides = _parse_overrides(argv)
     assert getattr(overrides, field) == expected
+
+
+def test_preflight_color_decisions_use_real_streams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / 'm.py'
+    target.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+    streams: list[object] = []
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+
+    def record_stream(stream: object, **_kwargs: object) -> bool:
+        streams.append(stream)
+        return False
+
+    monkeypatch.setattr(_cli, 'should_color', record_stream)
+    assert _cli.run_cli(['-i', str(target)]) == EXIT_CHANGED
+    capsys.readouterr()
+    assert streams == [real_stdout, real_stderr]
 
 
 def test_show_policy_defaults_block(tmp_path: Path) -> None:
@@ -3889,6 +4478,114 @@ def test_show_policy_escapes_source_path_controls(tmp_path: Path) -> None:
     assert result_status == 0, result_stderr
     assert r'bad\x1b]2;path\x07/pyproject.toml' in result_stdout
     assert '\x1b]2;path\x07' not in result_stdout
+
+
+@pytest.mark.parametrize('flags', [['--incremental'], []], ids=['incremental', 'guard'])
+def test_baseline_warning_names_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    flags: list[str],
+) -> None:
+    if not flags:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.defsort]\nmax-reorder-count = 0\n', encoding='utf-8'
+        )
+    path = tmp_path / 'mod.py'
+    path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+
+    def fail_baselines(paths: list[Path]) -> dict[Path, BlobReadResult]:
+        return {
+            item: BlobReadResult(status=BlobReadStatus.INFRA_ERROR, detail='objects unavailable')
+            for item in paths
+        }
+
+    monkeypatch.setattr(_cli, '_batch_fetch_cli_baselines', fail_baselines)
+    assert main(['--json', *flags, str(path)]) == EXIT_CHANGED
+    record = json.loads(capsys.readouterr().out)['files'][0]
+    assert record['status'] == 'skipped'
+    assert 'objects unavailable' in record['warning']
+    assert path.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'method',
+        'method_banner',
+        'future',
+        'duplicates_method',
+        'sectioned_method',
+        'top_level',
+        'duplicates_top_level',
+        'sectioned_top_level',
+        'unchanged',
+        'already_placed',
+        'none',
+        'non_conforming',
+    ],
+)
+def test_incremental_gate_candidate(
+    case: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline, source, banners, definition_order, blocker = incremental_gate_case(case)
+    isolate_git_config(monkeypatch)
+    init_empty_git_repo(tmp_path)
+    path = tmp_path / 'mod.py'
+    path.write_text(baseline, encoding='utf-8')
+    run_setup(['git', 'add', 'mod.py'], cwd=tmp_path)
+    run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
+    source += '# edited\n'
+    path.write_text(source, encoding='utf-8')
+    args = [
+        '--incremental',
+        '--definition-order',
+        definition_order,
+        '--method-order',
+        'alphabetical',
+        '--banners',
+        banners,
+        str(path),
+    ]
+    status, stdout, stderr = invoke_cli(['--json', *args])
+
+    record = json.loads(stdout)['files'][0]
+    assert status == (EXIT_CHANGED if blocker or case == 'none' else EXIT_OK), stderr
+    assert (
+        record['warning']
+        == {
+            None: None,
+            'interstitial': 'code between definitions',
+            'duplicates': 'non-consecutive duplicate definitions',
+            'non_conforming': 'baseline not in target order',
+        }[blocker]
+    )
+    assert record['status'] == (
+        'changed' if case == 'none' else 'skipped' if blocker else 'unchanged'
+    )
+    write_status, _stdout, write_stderr = invoke_cli(['--write', *args])
+    assert write_status == (EXIT_CHANGED if blocker else EXIT_OK), write_stderr
+    if case == 'none':
+        transformed = path.read_text(encoding='utf-8')
+        assert transformed.index('def a(') < transformed.index('def z(')
+    else:
+        assert path.read_text(encoding='utf-8') == source
+
+
+@pytest.mark.parametrize('kind', DEEP_DEFINITIONS)
+@pytest.mark.parametrize('mode', [[], ['-w'], ['--detect'], ['--json']])
+def test_deep_expression_sorts_in_cli(tmp_path: Path, kind: str, mode: list[str]) -> None:
+    source, expected = deep_source_case(kind)
+    path = tmp_path / 'deep.py'
+    path.write_text(source, encoding='utf-8')
+    status, stdout, stderr = invoke_cli([*mode, str(path)], cwd=tmp_path)
+    assert status == (EXIT_OK if mode in (['-w'], ['--detect']) else EXIT_CHANGED), stderr
+    assert 'Traceback' not in stdout + stderr
+    assert path.read_text(encoding='utf-8') == (expected if mode == ['-w'] else source)
+    if mode == ['--json']:
+        assert json.loads(stdout)['files'][0]['status'] == 'changed'
 
 
 def test_show_policy_groups_by_source(tmp_path: Path) -> None:
@@ -3924,11 +4621,6 @@ def test_show_policy_labels_cli_override(tmp_path: Path) -> None:
     )
 
 
-def test_show_policy_rejects_detect(tmp_path: Path) -> None:
-    status, _stdout, stderr = invoke_cli(['--show-policy', '--detect', str(tmp_path)])
-    assert status == 2, stderr
-
-
 def test_show_policy_sectionless_pyproject_reports_defaults(tmp_path: Path) -> None:
     (tmp_path / 'pyproject.toml').write_text('[project]\nname = "x"\n', encoding='utf-8')
     (tmp_path / 'mod.py').write_text('def f():\n    return 1\n', encoding='utf-8')
@@ -3947,6 +4639,349 @@ def test_show_policy_unreadable_path_exits_nonzero(
         result = main(['--show-policy', str(target)])
     assert result == EXIT_ERROR
     assert 'read denied' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('mode', [[], ['-w'], ['--detect'], ['--json'], ['-i']])
+def test_too_deep_source_is_invalid_input(tmp_path: Path, mode: list[str]) -> None:
+    path = tmp_path / 'deep.py'
+    path.write_text(TOO_DEEP, encoding='utf-8')
+    status, stdout, stderr = invoke_cli([*mode, str(path)], cwd=tmp_path)
+    assert status == EXIT_ERROR
+    assert 'Traceback' not in stdout + stderr
+    assert path.read_text(encoding='utf-8') == TOO_DEEP
+    if mode == ['--json']:
+        assert json.loads(stdout)['files'][0]['status'] == 'invalid'
+    else:
+        assert "source nests too deeply for Python's parser on this platform" in stdout + stderr
+
+
+@pytest.mark.parametrize('policy', ['incremental', 'guard'])
+def test_other_capitalization_gets_the_same_result(tmp_path: Path, policy: str) -> None:
+    init_empty_git_repo(tmp_path)
+    path = tmp_path / 'Mod.py'
+    baseline = 'def beta():\n    pass\n\n\ndef alpha():\n    pass\n'
+    path.write_text(baseline, encoding='utf-8')
+    run_setup(['git', 'add', 'Mod.py'], cwd=tmp_path)
+    run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
+    source = (baseline + '\n\ndef gamma():\n    pass\n').encode()
+    path.write_bytes(source)
+    other = tmp_path / 'mod.py'
+    if not other.exists():
+        other.hardlink_to(path)
+    options = ['--definition-order', 'alphabetical']
+    if policy == 'incremental':
+        options += ['-i', '--diff']
+    else:
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.defsort]\nmax-reorder-count = 1\n', encoding='utf-8'
+        )
+    exact = run_cli([*options, str(path)])
+    alternate = run_cli([*options, str(other)])
+    assert alternate.returncode == exact.returncode
+    assert alternate.stdout.replace('mod.py', 'Mod.py') == exact.stdout
+    assert alternate.stderr.replace('mod.py', 'Mod.py') == exact.stderr
+    assert path.read_bytes() == source
+
+
+class TestRenamedBaselines:
+    def test_nonconforming_renamed_baseline_is_skipped(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        case = 'nonconforming'
+        target, source = prepare_renamed_file(tmp_path, case)
+        assert main(['-i', '--write', str(target)]) == EXIT_CHANGED
+        result = target.read_text(encoding='utf-8')
+        captured = capsys.readouterr()
+        assert_renamed_result(result, source, case, captured.out + captured.err)
+
+    @pytest.mark.parametrize('setting', ['false', 'copies'])
+    @pytest.mark.parametrize('case', ['conforming', 'nonconforming', 'guard'])
+    def test_rename_settings_do_not_change_pairing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], case: str, setting: str
+    ) -> None:
+        target, source = prepare_renamed_file(tmp_path, case)
+        run_setup(['git', 'config', 'diff.renames', setting], cwd=tmp_path)
+        args = [] if case == 'guard' else ['-i']
+        assert main([*args, '--write', str(target)]) == (
+            EXIT_OK if case == 'conforming' else EXIT_CHANGED
+        )
+        result = target.read_text(encoding='utf-8')
+        captured = capsys.readouterr()
+        assert_renamed_result(result, source, case, captured.out + captured.err)
+
+    def test_rename_sorts_only_new_definitions(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        case = 'conforming'
+        target, source = prepare_renamed_file(tmp_path, case)
+        assert main(['-i', '--write', str(target)]) == EXIT_OK
+        result = target.read_text(encoding='utf-8')
+        captured = capsys.readouterr()
+        assert_renamed_result(result, source, case, captured.out + captured.err)
+
+    def test_reorder_guard_measures_renamed_files_against_their_source(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        case = 'guard'
+        target, source = prepare_renamed_file(tmp_path, case)
+        assert main(['--write', str(target)]) == EXIT_CHANGED
+        result = target.read_text(encoding='utf-8')
+        captured = capsys.readouterr()
+        assert_renamed_result(result, source, case, captured.out + captured.err)
+
+
+def test_two_tracked_spellings_skip_the_file(tmp_path: Path) -> None:
+    init_empty_git_repo(tmp_path)
+    path = tmp_path / 'MOD.py'
+    baseline = b'def beta():\n    pass\n\n\ndef alpha():\n    pass\n'
+    path.write_bytes(baseline)
+    blob = run_setup(['git', 'hash-object', '-w', 'MOD.py'], cwd=tmp_path).stdout.decode().strip()
+    for name in ('Mod.py', 'mod.py'):
+        run_setup(
+            ['git', 'update-index', '--add', '--cacheinfo', f'100644,{blob},{name}'],
+            cwd=tmp_path,
+        )
+        other = tmp_path / name
+        if not other.exists():
+            other.hardlink_to(path)
+    run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
+    source = baseline + b'\n\ndef gamma():\n    pass\n'
+    path.write_bytes(source)
+
+    result = run_cli(['-i', '--definition-order', 'alphabetical', str(path)])
+
+    assert (
+        'incremental: unable to read baseline from git: '
+        'cannot match the file to a single path in Git'
+    ) in result.stderr
+    assert path.read_bytes() == source
+
+
+@pytest.mark.parametrize('pairing', ['unstaged', 'below-threshold'])
+def test_unpaired_rename_is_new(tmp_path: Path, pairing: str) -> None:
+    init_empty_git_repo(tmp_path)
+    old = tmp_path / 'old.py'
+    baseline = _SRC_NEEDS_SORT if pairing == 'unstaged' else '# unrelated baseline\n' * 20
+    old.write_text(baseline, encoding='utf-8')
+    run_setup(['git', 'add', 'old.py'], cwd=tmp_path)
+    run_setup(['git', 'commit', '-m', 'baseline'], cwd=tmp_path)
+    target = old.rename(tmp_path / 'new.py')
+    target.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+    if pairing == 'below-threshold':
+        run_setup(['git', 'add', '-A'], cwd=tmp_path)
+    paired = run_setup(['git', 'diff', '--name-status', '-M', 'HEAD'], cwd=tmp_path).stdout
+    assert not paired.startswith(b'R')
+    assert main(['-i', '--write', str(target)]) == EXIT_OK
+    assert target.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
+
+
+class TestGitRequiredModes:
+    def test_forced_guard_needs_no_git(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        path = tmp_path / 'm.py'
+        path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        (tmp_path / 'pyproject.toml').write_text(
+            '[tool.defsort]\nmax-reorder-count = 0\n', encoding='utf-8'
+        )
+        monkeypatch.setenv('PATH', str(tmp_path / 'no-git'))
+        assert main(['--force', '--write', str(path)]) == EXIT_OK
+        assert capsys.readouterr().err == ''
+        assert path.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
+
+    def test_nonfatal_discovery_warnings_stay_visible(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        init_git_repo(tmp_path, _SRC_NEEDS_SORT)
+        monkeypatch.setenv('PATH', str(tmp_path / 'no-git'))
+        assert main(['--write', str(tmp_path)]) == EXIT_OK
+        assert 'Git executable not found on PATH' in capsys.readouterr().err
+        assert (tmp_path / 'test.py').read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
+
+    @pytest.mark.skipif(os.name == 'nt', reason='Git ownership simulation is POSIX-only')
+    @pytest.mark.parametrize('mode', ['explicit', 'configured', 'guard', 'both'])
+    @pytest.mark.parametrize('json_mode', [False, True])
+    def test_untrusted_repository_stops_configured_incremental_mode(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        mode: str,
+        *,
+        json_mode: bool,
+    ) -> None:
+        init_git_repo(tmp_path, _SRC_NEEDS_SORT)
+        config = '[tool.defsort]\n'
+        if mode in ('configured', 'both'):
+            config += 'incremental = true\n'
+        if mode in ('guard', 'both'):
+            config += 'max-reorder-count = 0\n'
+        (tmp_path / 'pyproject.toml').write_text(config, encoding='utf-8')
+        path = tmp_path / 'test.py'
+        monkeypatch.setenv('GIT_TEST_ASSUME_DIFFERENT_OWNER', '1')
+        args = ['-i'] if mode == 'explicit' else []
+        result = main([*args, '--json' if json_mode else '--write', str(path)])
+        captured = capsys.readouterr()
+        modes = {
+            'explicit': 'incremental mode',
+            'configured': 'incremental mode',
+            'guard': 'the reorder guard',
+            'both': 'incremental mode and the reorder guard',
+        }
+        suggestion = (
+            '; pass --no-incremental to process whole files'
+            if mode in ('explicit', 'configured')
+            else ''
+        )
+        assert result == EXIT_ERROR
+        assert captured.out == ''
+        assert captured.err == (
+            f'error: {modes[mode]} cannot use Git: '
+            f"fatal: detected dubious ownership in repository at '{tmp_path}'{suggestion}\n"
+        )
+        assert path.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+
+    @pytest.mark.parametrize('operand', ['file', 'directory'])
+    @pytest.mark.parametrize('mode', ['write', 'json', 'detect-json'])
+    def test_missing_git_stops(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        operand: str,
+        mode: str,
+    ) -> None:
+        init_git_repo(tmp_path, _SRC_NEEDS_SORT)
+        path = tmp_path / 'test.py'
+        monkeypatch.setenv('PATH', str(tmp_path / 'no-git'))
+        flags = ['--detect', '--json'] if mode == 'detect-json' else ['--' + mode]
+        result = main(['-i', *flags, str(path if operand == 'file' else tmp_path)])
+        captured = capsys.readouterr()
+        assert result == EXIT_ERROR
+        assert captured.out == ''
+        assert captured.err == (
+            'error: incremental mode cannot use Git: git could not be run: '
+            'Git executable not found on PATH; '
+            'pass --no-incremental to process whole files\n'
+        )
+        assert path.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+
+    @pytest.mark.skipif(os.name == 'nt', reason='POSIX stand-in executable')
+    @pytest.mark.parametrize('failure', ['diff', 'ls-files'])
+    def test_failed_listing_stops(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        failure: str,
+    ) -> None:
+        init_git_repo(tmp_path, _SRC_ALREADY_ORDERED)
+        path = tmp_path / 'new.py'
+        path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        install_stand_in_git(monkeypatch, tmp_path, fail=failure)
+        assert main(['-i', '--write', str(path)]) == EXIT_ERROR
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert captured.err == (
+            'error: incremental mode cannot use Git: fatal: simulated failure; '
+            'pass --no-incremental to process whole files\n'
+        )
+        assert path.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
+
+    @pytest.mark.parametrize('mode', ['incremental', 'guard', 'both'])
+    def test_outside_repository_skips_each_file(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mode: str,
+    ) -> None:
+        config = '[tool.defsort]\n'
+        if mode != 'guard':
+            config += 'incremental = true\n'
+        if mode != 'incremental':
+            config += 'max-reorder-count = 0\n'
+        (tmp_path / 'pyproject.toml').write_text(config, encoding='utf-8')
+        paths = [tmp_path / name for name in ('a.py', 'b.py')]
+        for path in paths:
+            path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        assert main(['--write', *map(str, paths)]) == EXIT_CHANGED
+        captured = capsys.readouterr()
+        assert captured.out == ''
+        assert captured.err == ''.join(
+            f'{path.as_posix()}: skipped (not in a Git repository)\n' for path in paths
+        )
+        assert all(path.read_text(encoding='utf-8') == _SRC_NEEDS_SORT for path in paths)
+
+    @pytest.mark.parametrize('mode', ['incremental', 'guard', 'both', 'forced-both'])
+    def test_outside_repository_remedy_matches_effective_modes(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        mode: str,
+    ) -> None:
+        config = '[tool.defsort]\n'
+        if mode != 'guard':
+            config += 'incremental = true\n'
+        if mode != 'incremental':
+            config += 'max-reorder-count = 0\n'
+        (tmp_path / 'pyproject.toml').write_text(config, encoding='utf-8')
+        path = tmp_path / 'm.py'
+        path.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+        args = ['--force'] if mode == 'forced-both' else []
+        assert main(['--preview', *args, str(path)]) == EXIT_CHANGED
+        stderr = capsys.readouterr().err
+        assert 'run inside a Git repository' in stderr
+        assert ('--no-incremental' in stderr) == (mode in ('incremental', 'forced-both'))
+        assert '--force' not in stderr
+
+    @pytest.mark.parametrize('outside_first', [False, True])
+    def test_hardlink_outside_skip_names_only_the_outside_alias(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        *,
+        outside_first: bool,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        init_git_repo(repo, _SRC_ALREADY_ORDERED)
+        inside = repo / 'test.py'
+        outside = tmp_path / 'outside.py'
+        os.link(inside, outside)
+        paths = [outside, inside] if outside_first else [inside, outside]
+        assert main(['-i', '--write', *map(str, paths)]) == EXIT_CHANGED
+        captured = capsys.readouterr()
+        assert captured.err == f'{outside.as_posix()}: skipped (not in a Git repository)\n'
+        assert inside.read_text(encoding='utf-8') == _SRC_ALREADY_ORDERED
+
+
+@pytest.mark.parametrize('outside_first', [False, True])
+def test_outside_hardlink_does_not_authorize_an_inside_write(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    outside_first: bool,
+) -> None:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    init_git_repo(repo, _SRC_ALREADY_ORDERED)
+    inside = repo / 'new.py'
+    inside.write_text(_SRC_NEEDS_SORT, encoding='utf-8')
+    outside = tmp_path / 'outside.py'
+    os.link(inside, outside)
+    paths = [outside, inside] if outside_first else [inside, outside]
+    assert main(['-i', '--write', *map(str, paths)]) == EXIT_ERROR
+    stderr = capsys.readouterr().err
+    assert f'{outside.as_posix()}: skipped (not in a Git repository)' in stderr
+    assert f'{inside.as_posix()}: skipped (not in a Git repository)' not in stderr
+    assert 'names of one file need different results' in stderr
+    assert inside.read_text(encoding='utf-8') == _SRC_NEEDS_SORT
 
 
 def test_unsafe_banner_pattern_is_usage_error_before_write(tmp_path: Path) -> None:

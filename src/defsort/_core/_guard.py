@@ -105,6 +105,9 @@ def build_guard_params(
     Returns:
         Guard parameters, or `None` when the baseline has no parseable
         definitions.
+
+    Raises:
+        ValueError: If the baseline contains a lone Unicode surrogate.
     """
     bl_defs = parse_definitions(baseline_content).definitions
     if not bl_defs:
@@ -117,22 +120,18 @@ def build_guard_params(
 
 
 def evaluate_reorder_guard(
-    params: ReorderGuardParams | None,
+    params: ReorderGuardParams,
     sorted_defs: Sequence[Definition],
 ) -> _ReorderGuardResult:
     """Evaluate the reorder guard, returning whether thresholds are exceeded.
 
     Args:
         params: Guard configuration with baseline definitions and thresholds.
-            None means guard disabled.
         sorted_defs: The proposed sorted definitions to evaluate.
 
     Returns:
         Movement totals and any exceeded-threshold reasons.
     """
-    if params is None:
-        return _ReorderGuardResult(0, 0)
-
     moved, total = _count_reorder_moves(params.baseline_defs, sorted_defs)
     if total == 0:
         return _ReorderGuardResult(0, 0)

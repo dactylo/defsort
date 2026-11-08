@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 from itertools import pairwise
+from typing import NamedTuple
 
 from defsort._core._analysis import (
     BLOCKING_CODE_PREVIEW_LEN,
@@ -11,6 +12,7 @@ from defsort._core._analysis import (
 from defsort._core._ordering import group_consecutive_same_name, has_duplicate_group_names
 from defsort._source import split_physical_lines
 from defsort._types import (
+    DYNAMIC_ALL_MESSAGE,
     Blocker,
     BlockingCode,
     Definition,
@@ -18,7 +20,19 @@ from defsort._types import (
     MethodDefinition,
     MethodSortInfo,
     SortPolicy,
+    blocker_message,
 )
+
+
+class SafetyVerdict(NamedTuple):
+    """Carry a safety blocker, its cause, and any blocking source previews.
+
+    `blocker` and `message` are `None` when the candidate is safe.
+    """
+
+    blocker: Blocker | None
+    message: str | None
+    blocking_code: list[BlockingCode]
 
 
 def _eager_definition_order_changed(new_order: Sequence[Definition]) -> bool:
@@ -28,27 +42,15 @@ def _eager_definition_order_changed(new_order: Sequence[Definition]) -> bool:
 
 
 def _eager_method_order_changed(method_sorts: Sequence[MethodSortInfo]) -> bool:
-    """Return whether eager method groups left their source relative order."""
+    """Return whether eager methods left their source relative order."""
     for method_sort in method_sorts:
-        eager_by_group: dict[str, bool] = {}
-        source_groups: list[str] = []
-        for method in method_sort.original_order:
-            group = method.property_group or method.name
-            if group not in eager_by_group:
-                eager_by_group[group] = False
-                source_groups.append(group)
-            eager_by_group[group] = eager_by_group[group] or method.has_eager_evaluation
-
-        source_eager = [group for group in source_groups if eager_by_group[group]]
-        candidate_eager: list[str] = []
-        seen: set[str] = set()
-        for method in method_sort.new_order:
-            group = method.property_group or method.name
-            if group in seen or not eager_by_group.get(group, False):
-                continue
-            seen.add(group)
-            candidate_eager.append(group)
-        if candidate_eager != source_eager:
+        source_eager = [
+            method.index for method in method_sort.original_order if method.has_eager_evaluation
+        ]
+        candidate_eager = [
+            method.index for method in method_sort.new_order if method.has_eager_evaluation
+        ]
+        if source_eager != candidate_eager:
             return True
     return False
 
@@ -106,28 +108,6 @@ def _has_new_order_violation(
     )
 
 
-def _has_eager_order_hazard(
-    definitions: Sequence[Definition],
-    new_order: Sequence[Definition],
-    method_sorts: Sequence[MethodSortInfo],
-) -> bool:
-    """Return whether either scope has a new eager-order violation."""
-    if _has_new_order_violation(
-        definitions,
-        new_order,
-        {definition.index: definition.eager_refs for definition in definitions},
-    ):
-        return True
-    return any(
-        _has_new_order_violation(
-            method_sort.original_order,
-            method_sort.new_order,
-            {method.index: method.eager_reads for method in method_sort.original_order},
-        )
-        for method_sort in method_sorts
-    )
-
-
 def _is_safe_trailing_line(line: str) -> bool:
     """Return whether one trailing source line is safe to move."""
     return bool(SAFE_TRAILING_PATTERN.match(line)) and not DIRECTIVE_PATTERN.search(line)
@@ -136,6 +116,48 @@ def _is_safe_trailing_line(line: str) -> bool:
 def _physical_line_count(text: str) -> int:
     """Return the number of physical source lines represented by text."""
     return len(split_physical_lines(text))
+
+
+def _pinned_unit_moved(
+    original: Sequence[Definition | MethodDefinition],
+    candidate: Sequence[Definition | MethodDefinition],
+) -> bool:
+    """Return whether any pinned unit has a different set of preceding units."""
+    preceding_by_index: dict[int, set[int]] = {}
+    preceding: set[int] = set()
+    for unit in original:
+        if unit.binds_other_names:
+            preceding_by_index[unit.index] = preceding.copy()
+        preceding.add(unit.index)
+    preceding = set()
+    for unit in candidate:
+        if unit.index in preceding_by_index and preceding_by_index[unit.index] != preceding:
+            return True
+        preceding.add(unit.index)
+    return False
+
+
+def _has_eager_order_hazard(
+    definitions: Sequence[Definition],
+    new_order: Sequence[Definition],
+    method_sorts: Sequence[MethodSortInfo],
+) -> bool:
+    """Return whether either scope has a new eager-order violation."""
+    if _pinned_unit_moved(definitions, new_order) or _has_new_order_violation(
+        definitions,
+        new_order,
+        {definition.index: definition.eager_refs for definition in definitions},
+    ):
+        return True
+    return any(
+        _pinned_unit_moved(method_sort.original_order, method_sort.new_order)
+        or _has_new_order_violation(
+            method_sort.original_order,
+            method_sort.new_order,
+            {method.index: method.eager_reads for method in method_sort.original_order},
+        )
+        for method_sort in method_sorts
+    )
 
 
 def _truncate_blocking_text(text: str) -> str:
@@ -187,7 +209,7 @@ def has_anchored_main_annotation_hazard(
         policy: Concrete ordering policy.
 
     Returns:
-        True when a definition above an anchored `main` annotates against it.
+        `True` when a definition above an anchored `main` annotates against it.
     """
     if policy.main != 'last':
         return False
@@ -248,7 +270,7 @@ def check_reorder_hazards(  # noqa: PLR0913
     add_future: bool,
     dynamic_all: bool = False,
     evaluation_order: EvaluationOrder = 'preserve',
-) -> Blocker | None:
+) -> tuple[Blocker, str] | None:
     """Classify hard hazards across actual top-level and method candidates.
 
     Args:
@@ -263,18 +285,18 @@ def check_reorder_hazards(  # noqa: PLR0913
             execution order. Binding and annotation checks always apply.
 
     Returns:
-        The hard blocker, or `None` when the candidate has no hard hazard.
+        The hard blocker and its cause, or `None` when there is no hard hazard.
     """
     top_changed = [unit.index for unit in definitions] != [unit.index for unit in new_order]
     if top_changed and dynamic_all:
-        return 'eager_order'
+        return 'eager_order', DYNAMIC_ALL_MESSAGE
     if evaluation_order == 'preserve':
         if _eager_definition_order_changed(new_order):
-            return 'eager_order'
+            return 'eager_order', blocker_message('eager_order')
         if _eager_method_order_changed(method_sorts):
-            return 'eager_order'
+            return 'eager_order', blocker_message('eager_order')
     if _has_eager_order_hazard(definitions, new_order, method_sorts):
-        return 'eager_order'
+        return 'eager_order', blocker_message('eager_order')
     if (
         has_annotation_order_hazard(
             definitions,
@@ -285,7 +307,7 @@ def check_reorder_hazards(  # noqa: PLR0913
         and not has_future
         and not add_future
     ):
-        return 'forward_refs'
+        return 'forward_refs', blocker_message('forward_refs')
     return None
 
 
@@ -336,8 +358,8 @@ def check_sort_safety(  # noqa: PLR0913
     check_top_level: bool = True,
     dynamic_all: bool = False,
     evaluation_order: EvaluationOrder = 'preserve',
-) -> tuple[bool, Blocker | None, list[BlockingCode]]:
-    """Run safety checks and return (skipped, blocker, blocking_code).
+) -> SafetyVerdict:
+    """Run safety checks and report the blocker, cause, and source previews.
 
     Args:
         definitions: Original definitions.
@@ -354,16 +376,16 @@ def check_sort_safety(  # noqa: PLR0913
             execution order. Other safety checks remain in force.
 
     Returns:
-        Whether sorting is skipped, the blocker when present, and any blocking
-        source previews.
+        The blocker and its cause when sorting is unsafe, with any blocking
+        source previews. A safe candidate has no blocker or message.
     """
     # Interstitial code prevents moving top-level definitions.
     if check_top_level and not force:
         blocking = _collect_blocking_code(definitions)
         if any(definition.had_interstitial_code for definition in definitions) or blocking:
-            return True, 'interstitial', blocking
+            return SafetyVerdict('interstitial', blocker_message('interstitial'), blocking)
 
-    blocker = check_reorder_hazards(
+    hazard = check_reorder_hazards(
         definitions,
         new_order,
         method_sorts,
@@ -373,14 +395,14 @@ def check_sort_safety(  # noqa: PLR0913
         dynamic_all=dynamic_all,
         evaluation_order=evaluation_order,
     )
-    if blocker is not None:
-        return True, blocker, []
+    if hazard is not None:
+        return SafetyVerdict(*hazard, [])
 
     # Non-consecutive duplicate names cannot be grouped safely.
     if check_top_level and has_nonconsecutive_duplicates(definitions):
-        return True, 'duplicates', []
+        return SafetyVerdict('duplicates', blocker_message('duplicates'), [])
 
-    return False, None, []
+    return SafetyVerdict(None, None, [])
 
 
 def has_sectioned_duplicates(definitions: list[Definition]) -> bool:

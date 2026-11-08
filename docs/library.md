@@ -17,7 +17,9 @@ Import the sorting API from `defsort`. The separate [hook adapter contract](#def
 integrations with additional coding agents. See [concepts and safety](design.md) for ordering
 choices and limits before enabling transformations in an application.
 
-## `defsort.sort(source, *, baseline=None, config=None) -> str`
+## Source operations
+
+### `defsort.sort(source, *, baseline=None, config=None) -> str`
 
 `sort()` returns source with definitions and methods sorted under `config`. A hard file-level
 safety blocker returns the original source. A soft top-level incremental blocker can retain
@@ -28,7 +30,7 @@ discarded and the exact original source is returned. Call `check()` for blocker 
 
 Ordinary sorting moves complete definition and method blocks with their decorators and owned
 comments while preserving source layout. It does not enforce blank-line style. The exact
-[source-preservation rules](cli.md#source-preservation) also cover grouped definitions, trailing
+[source-preservation rules](design.md#source-preservation) also cover grouped definitions, trailing
 comments, mixed line endings, and final-newline state.
 
 The library has two explicit non-goals: it does not hoist constants, and it does not add or remove
@@ -63,11 +65,12 @@ Raises:
 
 Configuration validation precedes source parsing.
 
-## `defsort.check(source, *, baseline=None, config=None) -> SortCheckResult`
+### `defsort.check(source, *, baseline=None, config=None) -> SortCheckResult`
 
 `check()` reports what `sort()` would do without modifying source. It returns four statuses:
 
-- `changed` -- `sort()` would change source.
+- `changed` -- `sort()` would change source. In incremental mode, this can include a soft
+  file-level `blocker` and `blocker_message` for the part left unchanged.
 - `invalid` -- Source analysis failed because source is invalid Python, contains a null byte, or
   contains a lone Unicode surrogate.
 - `skipped` -- A safety check blocks a change, or blocked class methods are the only proposed
@@ -101,7 +104,7 @@ elif result.status == 'skipped':
 `baseline` and `config` follow the `sort()` rules. Configuration errors raise the same `TypeError`
 or `ValueError` as `sort()`. Source-analysis failures return `status='invalid'` instead of raising.
 
-## `defsort.detect(source, *, banners='barriers', banner_pattern=None) -> DetectResult | None`
+### `defsort.detect(source, *, banners='barriers', banner_pattern=None) -> DetectResult | None`
 
 `detect()` classifies the current top-level definition order without modifying source. It returns
 `None` when no section contains at least two definitions. Otherwise, `DetectResult.order` is:
@@ -137,7 +140,9 @@ Raises:
 
 Argument and pattern validation precedes source parsing in every banner mode.
 
-## `defsort.resolve_config(path) -> DefsortConfig`
+## Configuration
+
+### `defsort.resolve_config(path) -> DefsortConfig`
 
 `resolve_config()` accepts `str | os.PathLike[str]`. An existing directory starts discovery at
 itself. Every other path starts discovery at its parent, including a file that does not exist yet.
@@ -149,9 +154,17 @@ For invalid, unreadable, or unknown file content, defsort emits `DefsortConfigWa
 applicable default. defsort does not explicitly raise these diagnostics; a caller's warning filters
 can promote them to exceptions.
 
-Results are cached per resolved directory for the process lifetime. A long-running embedder must
-call `clear_config_cache()` after editing a `pyproject.toml`; otherwise, later calls for the same
-directory keep returning the cached result.
+Key-level messages name the governing `pyproject.toml`, the key, the invalid value, the accepted
+values or range, and the fallback actually used. Unknown keys also name the file. For example,
+`<file>: [tool.defsort].banners: invalid value 'bogus'; expected barriers, ignore, strip; using barriers`.
+An invalid scoped order uses the resolved `order` value; an invalid `color` uses `auto`.
+Ineffective policy values use
+`[tool.defsort] <key> has no effect under the resolved strategies; ignoring` in library warnings.
+
+Results are cached per resolved directory and governing resolved file for the process lifetime.
+Symlinked paths to one `pyproject.toml` share a file cache entry and its warnings. A long-running
+embedder must call `clear_config_cache()` after editing a `pyproject.toml`; otherwise, later calls
+keep returning the cached result.
 
 ```python
 from pathlib import Path
@@ -161,7 +174,7 @@ import defsort
 config = defsort.resolve_config(Path('src/mylib/module.py'))
 ```
 
-## `defsort.clear_config_cache() -> None`
+### `defsort.clear_config_cache() -> None`
 
 `clear_config_cache()` clears all configuration-resolution caches. Later `resolve_config()` calls
 then read configuration from disk again. It also clears defsort's own warning registry, so a repeat
@@ -176,24 +189,7 @@ defsort.clear_config_cache()
 config = defsort.resolve_config('src/mylib/module.py')
 ```
 
-## Banner patterns
-
-`banner_pattern` adds regular-expression full-match recognition to the built-in banner rule. It
-matches each scope-relative logical comment line, including the leading `#` and excluding the line
-ending. `sort()`, `check()`, `detect()`, and `DefsortConfig` all accept the same bounded subset:
-
-- literals, character classes, `.`, and escaped atoms other than decimal backreferences;
-- an optional leading `^` and optional trailing `$`; and
-- at most one `*` or `+` repetition, attached to an atom, in the entire expression.
-
-For example, `^# Section: .+$` is supported. Grouping, alternation, lookaround, counted repetition,
-`?`, backreferences, misplaced anchors, unattached repetition, and multiple repetitions are
-rejected. A literal `{` or `}` must be written as `\{` or `\}`, or placed inside a character class,
-even though `re` alone would read a lone brace literally. A pattern that does not compile raises
-`ValueError` and chains the original `re.error`. A pattern that compiles but uses unsupported
-syntax raises `ValueError` without an `re.error` cause.
-
-## `defsort.DefsortConfig`
+### `defsort.DefsortConfig`
 
 `DefsortConfig` is a frozen, slotted, keyword-only dataclass shared by `sort()` and `check()`.
 Construction accepts these eleven fields:
@@ -242,31 +238,65 @@ When a non-default transformation value has no effect, `sort()` and `check()` em
 
 An explicitly supplied default value does not warn.
 
-## `defsort.DefsortConfigWarning`
+### Banner patterns
 
-`DefsortConfigWarning` is a `UserWarning` subclass for configuration diagnostics.
-`resolve_config()` emits it for invalid, unreadable, or unknown configuration input that falls back
-to defaults. `sort()` and `check()` emit it for ineffective non-default transformation values.
-Library calls use Python's `warnings` machinery and do not print these diagnostics directly.
-Filters installed by the caller control whether Python ignores, renders, or promotes them. Python's
-default warning renderer writes displayed warnings to stderr.
+`banner_pattern` uses the [CLI banner-pattern grammar](cli.md#banner-handling): scope-relative
+comment lines, including `#`, are matched in full without their line ending. `sort()`, `check()`,
+`detect()`, and `DefsortConfig` accept the same subset. Compilation failures raise `ValueError`
+with the original `re.error` as the cause; unsupported syntax raises `ValueError` without that
+cause. Validation applies even when banner recognition is disabled.
 
-Use standard warning filters to ignore or promote the category:
+## Results
 
-```python
-import warnings
+### `defsort.SortCheckResult`
 
-from defsort import DefsortConfigWarning
+`SortCheckResult` is a frozen, slotted, keyword-only dataclass with these fields:
 
-warnings.filterwarnings('ignore', category=DefsortConfigWarning)
-# Or make matching warnings exceptions.
-warnings.filterwarnings('error', category=DefsortConfigWarning)
-```
+| Field                | Type                       | Default  |
+| -------------------- | -------------------------- | -------- |
+| `status`             | `SortStatus`               | required |
+| `blocker`            | `Blocker \| None`          | `None`   |
+| `blocker_message`    | `str \| None`              | `None`   |
+| `banner_constrained` | `bool`                     | `False`  |
+| `class_blockers`     | `tuple[ClassBlocker, ...]` | `()`     |
 
-The CLI and hook capture this category and render `Warning: <message>` even when an external
-filter, such as `PYTHONWARNINGS=ignore`, would silence a library warning.
+`blocker` and `blocker_message` are populated together for a file-level safety blocker. A
+class-only skip has `status='skipped'` and records in `class_blockers`, but both file-level fields
+remain `None`. A `layout` blocker refuses the whole file, including independent changes already
+calculated in memory; `blocker` is then `'layout'` and the exact original source is preserved.
 
-## Vocabulary aliases
+`banner_constrained` is true when at least one recognized banner prevents the unconstrained target
+order. It can be true for any non-invalid status. `class_blockers` can be non-empty with
+`status='changed'` because independent best-effort changes still apply. When blocked class work is
+the only proposed change, the status is `skipped`.
+
+### `defsort.DetectResult`
+
+`DetectResult` is a frozen, slotted, keyword-only dataclass with three required fields:
+
+| Field         | Type        | Meaning                                         |
+| ------------- | ----------- | ----------------------------------------------- |
+| `order`       | `OrderKind` | Detected order classification                   |
+| `dep_score`   | `float`     | Dependency-order Kendall tau from -1.0 to 1.0   |
+| `alpha_score` | `float`     | Alphabetical-order Kendall tau from -1.0 to 1.0 |
+
+### `defsort.ClassBlocker`
+
+`ClassBlocker` is a frozen, slotted, keyword-only dataclass with four required fields:
+
+| Field        | Type      | Meaning                                              |
+| ------------ | --------- | ---------------------------------------------------- |
+| `class_name` | `str`     | Name of the class whose methods stayed in place      |
+| `occurrence` | `int`     | One-based occurrence among same-named classes        |
+| `blocker`    | `Blocker` | Reason the class body could not be sorted            |
+| `message`    | `str`     | Human-readable explanation of `blocker`, for display |
+
+A blocked class keeps its methods in source order. Use `check()` to inspect these records; `sort()`
+returns only best-effort source text.
+
+## Vocabulary and warnings
+
+### Vocabulary aliases
 
 The eight vocabulary exports are `Literal` aliases. Callers pass plain strings; these names are
 type annotations, not enum classes.
@@ -289,12 +319,12 @@ scopes. `method_bodies` controls body-derived method edges. `method_visibility` 
 `tie_break` controls ready-item order during dependency sorting. `banners` preserves barriers,
 ignores recognition, or removes recognized banner spans.
 
-## `defsort.SortStatus`
+### `defsort.SortStatus`
 
 `SortStatus` is the literal alias `Literal['changed', 'invalid', 'skipped', 'unchanged']`.
 `SortCheckResult.status` uses the four outcomes documented under `check()`.
 
-## `defsort.Blocker`
+### `defsort.Blocker`
 
 `Blocker` is the `Literal` string alias:
 
@@ -311,16 +341,20 @@ Blocker = Literal[
 ]
 ```
 
-| Value                   | Meaning                                                                       |
-| ----------------------- | ----------------------------------------------------------------------------- |
-| `'duplicates'`          | Non-consecutive duplicate definitions block sorting                           |
-| `'forward_refs'`        | Sorting would create an unresolved annotation read                            |
-| `'interstitial'`        | Code between definitions blocks ordinary sorting                              |
-| `'layout'`              | The requested reorder cannot preserve source layout and comment ownership     |
-| `'non_conforming'`      | The incremental baseline misses its target order                              |
-| `'target_incompatible'` | Existing positions conflict with the target order                             |
-| `'user_reordered'`      | Existing definitions moved relative to the baseline                           |
-| `'eager_order'`         | Sorting would change a covered binding, or eager-group order under `preserve` |
+| Value                   | Meaning                                                                                                                          |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `'duplicates'`          | Non-consecutive duplicate definitions block sorting                                                                              |
+| `'forward_refs'`        | Sorting would create an unresolved annotation read                                                                               |
+| `'interstitial'`        | Code between definitions blocks ordinary sorting                                                                                 |
+| `'layout'`              | The requested reorder cannot preserve source layout and comment ownership                                                        |
+| `'non_conforming'`      | The incremental baseline misses its target order                                                                                 |
+| `'target_incompatible'` | Existing positions conflict with the target order                                                                                |
+| `'user_reordered'`      | Existing definitions moved relative to the baseline                                                                              |
+| `'eager_order'`         | Sorting would change a covered binding, eager-group order under `preserve`, or definitions used by a dynamically built `__all__` |
+
+For a dynamically built `__all__`, the message is
+`sort would reorder definitions that a dynamically built __all__ may depend on`. Write `__all__` as
+one literal list to enable sorting.
 
 `layout` is a hard whole-file blocker in full and incremental modes, even when top-level definition
 IDs are unchanged. Neither `force` nor hook `allow-on-failure` bypasses it. Separate attached
@@ -332,59 +366,39 @@ the classification value, for example `result.blocker == 'interstitial'`. Do not
 text; it is not a stable machine-readable interface. `Blocker` exposes no public forceability,
 policy, or severity properties.
 
-## `defsort.OrderKind`
+### `defsort.OrderKind`
 
 `OrderKind` is the `Literal` string alias
 `Literal['alphabetical', 'both', 'dependency', 'unordered']`. `DetectResult.order` carries one of
 these plain strings, so `result.order == 'dependency'` is the intended comparison.
 
-## `defsort.SortCheckResult`
+### `defsort.DefsortConfigWarning`
 
-`SortCheckResult` is a frozen, slotted, keyword-only dataclass with these fields:
+`DefsortConfigWarning` is a `UserWarning` subclass for configuration diagnostics.
+`resolve_config()` emits it for invalid, unreadable, or unknown configuration input that falls back
+to defaults. `sort()` and `check()` emit it for ineffective non-default transformation values.
+Library calls use Python's `warnings` machinery and do not print these diagnostics directly.
+Filters installed by the caller control whether Python ignores, renders, or promotes them. Python's
+default warning renderer writes displayed warnings to stderr.
 
-| Field                | Type                       | Default  |
-| -------------------- | -------------------------- | -------- |
-| `status`             | `SortStatus`               | required |
-| `blocker`            | `Blocker \| None`          | `None`   |
-| `blocker_message`    | `str \| None`              | `None`   |
-| `banner_constrained` | `bool`                     | `False`  |
-| `class_blockers`     | `tuple[ClassBlocker, ...]` | `()`     |
+Use standard warning filters to ignore or promote the category:
 
-`blocker` and `blocker_message` are populated together for a file-level safety blocker. A
-class-only skip has `status='skipped'` and records in `class_blockers`, but both file-level fields
-remain `None`. A `layout` blocker refuses the whole file, including independent changes already
-calculated in memory; `blocker` is then `'layout'` and the exact original source is preserved.
+```python
+import warnings
 
-`banner_constrained` is true when at least one recognized banner prevents the unconstrained target
-order. It can be true for any non-invalid status. `class_blockers` can be non-empty with
-`status='changed'` because independent best-effort changes still apply. When blocked class work is
-the only proposed change, the status is `skipped`.
+from defsort import DefsortConfigWarning
 
-## `defsort.DetectResult`
+warnings.filterwarnings('ignore', category=DefsortConfigWarning)
+# Or make matching warnings exceptions.
+warnings.filterwarnings('error', category=DefsortConfigWarning)
+```
 
-`DetectResult` is a frozen, slotted, keyword-only dataclass with three required fields:
+The CLI and hook render `warning: <message>` even when an external filter, such as
+`PYTHONWARNINGS=ignore`, would silence a library warning.
 
-| Field         | Type        | Meaning                                         |
-| ------------- | ----------- | ----------------------------------------------- |
-| `order`       | `OrderKind` | Detected order classification                   |
-| `dep_score`   | `float`     | Dependency-order Kendall tau from -1.0 to 1.0   |
-| `alpha_score` | `float`     | Alphabetical-order Kendall tau from -1.0 to 1.0 |
+## Hook adapters
 
-## `defsort.ClassBlocker`
-
-`ClassBlocker` is a frozen, slotted, keyword-only dataclass with four required fields:
-
-| Field        | Type      | Meaning                                              |
-| ------------ | --------- | ---------------------------------------------------- |
-| `class_name` | `str`     | Name of the class whose methods stayed in place      |
-| `occurrence` | `int`     | One-based occurrence among same-named classes        |
-| `blocker`    | `Blocker` | Reason the class body could not be sorted            |
-| `message`    | `str`     | Human-readable explanation of `blocker`, for display |
-
-A blocked class keeps its methods in source order. Use `check()` to inspect these records; `sort()`
-returns only best-effort source text.
-
-## `defsort.hooks`
+### `defsort.hooks`
 
 The public host adapter contract for `defsort hook`, versioned by `defsort.hooks.API_VERSION`
 (currently `1`). `HookInput`, `HookResult`, `HookResponse`, and `HookAdapter` are structural
@@ -409,10 +423,11 @@ records.
 - `payload_cwd(payload, key='cwd')`: return the post-tool event directory, or the process
   directory; never a `command_cwd`.
 - `absolute_directory(fields, key)`: return a non-empty absolute path string at `key`, else `None`.
+  On Windows, MSYS paths such as `/c/repo` count as absolute; the original spelling is returned.
 
 Adapters are discovered through the `defsort.hook_adapters` entry-point group, each entry point
 naming an adapter class, and selected by `defsort hook --agent NAME`. See the
-[hook reference](hook.md#agent-adapters) for installation, `--event`, and the failure tiers.
+[hook guide](hook.md#agent-adapters) for installation, `--event`, and the failure tiers.
 
 ```python
 from collections.abc import Mapping
@@ -447,3 +462,35 @@ class MyHostAdapter:
 
     def render_failure(self, reason: str) -> MyResponse: ...
 ```
+
+#### Register an adapter
+
+`command_cwd` is the absolute directory a pre-tool command executes in, or `None` when the host
+contract does not establish it. An adapter must never derive it from the process directory, a
+workspace root, or the session directory; `defsort.hooks.absolute_directory` returns a payload
+field only when it is a non-empty absolute path. On Windows, MSYS paths such as `/c/repo` count as
+absolute, and the original spelling is returned. An empty, relative, or non-string `command_cwd` is
+an adapter failure that exits 2 without repository access. Post-tool input sets `command_cwd=None`
+and uses `cwd` as event context.
+
+To add a host, package a class that satisfies `defsort.hooks.HookAdapter`, set `api_version` to
+`defsort.hooks.API_VERSION`, and register it:
+
+```toml
+[project.entry-points."defsort.hook_adapters"]
+myhost = "defsort_host_myhost.adapter:MyHostAdapter"
+```
+
+Install the adapter package in the same Python environment as defsort, then register
+`defsort hook --agent myhost`. A host whose payload carries no event name sets `requires_event` and
+receives `--event`. defsort refuses an adapter whose `api_version` differs from its own and a name
+registered by two distributions.
+
+Failure tiers:
+
+1. Every deny, including safety blockers and infrastructure failures under fail-closed
+   configuration, is rendered by the selected adapter's `render` or `render_failure`. The adapter
+   encodes the host's real enforcement protocol; the core never chooses an exit code.
+2. [Usage errors and last-resort failures](hook-reference.md#exit-codes) exit 2 before a host
+   response can be rendered. Exit 2 blocks on Claude Code and Codex and does not block on
+   Antigravity. defsort cannot protect a chain from the failure of its own adapter.

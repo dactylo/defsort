@@ -1,23 +1,13 @@
 # Incremental mode
 
-By default, defsort fully sorts every file -- no config needed. Incremental mode is an opt-in way
-to limit later churn after a file's committed baseline already follows the configured order. For an
-unsorted legacy file, use a full sort to establish that baseline or let the hook's `full-sort`
-fallback adopt the file when it is first touched.
+Use incremental mode to place new definitions while preserving existing order in a codebase with
+sorted baselines. This guide covers adoption, fallback choices, and limits on reordering.
 
 ## When to use incremental mode
 
-You have a large codebase where sorting every file in one commit would produce disruptive diffs.
-You want to establish sorted baselines file by file, then keep existing definitions stable while
-placing new definitions.
-
-On its normal path, incremental mode sorts only *new* definitions -- those added since git HEAD --
-and preserves the relative order of existing definitions. The committed baseline must already
-conform to the current policy. Incremental insertion does not repair or gradually converge an
-unsorted baseline; such a baseline is skipped or sent through the hook's configured fallback.
-
-If you don't have this problem, you don't need incremental mode. The default (full sort) is what
-you want.
+Full sorting is the default. Incremental mode is opt-in and requires a committed baseline that
+already follows your policy; it does not gradually repair an unsorted baseline. Establish one with
+a full sort, or use the hook's full-sort fallback to adopt files as they are touched.
 
 ## Adoption workflow
 
@@ -34,82 +24,26 @@ To adopt defsort file by file in an existing codebase:
    incremental-fallback = "full-sort"
    ```
 
-3. **Hook integration**: register the PreToolUse hook. A non-conforming file is fully sorted on its
-   first eligible supported commit under `full-sort`. Later commits use incremental insertion while
-   the baseline remains conforming.
+3. **Hook integration**: register the [PreToolUse hook](hook.md#configuration). A non-conforming
+   file is fully sorted on its first eligible supported commit under `full-sort`. Later commits use
+   incremental insertion while the baseline remains conforming.
 
 4. **Optional bulk adoption**: when ready, run `defsort --no-incremental -w .` to override the
    configured incremental mode and sort every remaining file in one reordering commit. You can add
    that commit to `.git-blame-ignore-revs`.
 
-## Range of conservativeness
+## Choose the scope
 
-defsort offers a spectrum from aggressive (sort everything) to conservative (sort as little as
-possible). Each level adds one more safety net.
+| Mode                                   | What changes                                   | Unsuitable baseline                                             |
+| -------------------------------------- | ---------------------------------------------- | --------------------------------------------------------------- |
+| Full sort (default)                    | All eligible definitions and methods           | No conforming baseline needed.                                  |
+| Incremental, `full-sort` fallback      | New definitions on the normal path             | Hook fully sorts non-conforming or target-incompatible files.   |
+| Incremental, `warn` fallback (default) | New definitions on the normal path             | Warn and skip.                                                  |
+| Either mode with a reorder guard       | As above, within the configured movement limit | Skip when a usable baseline exists and a threshold is exceeded. |
 
-### Full sort (default)
-
-Every file is fully sorted on every supported commit. Zero config. Use this unless you have a
-reason not to.
-
-### Incremental with full-sort fallback
-
-New definitions are sorted into place when the baseline conforms. Files that cannot be handled
-incrementally because the baseline is non-conforming or target-incompatible fall back to a full
-sort. This supports file-at-a-time adoption, but each fallback fully reorders that file.
-
-The full-sort fallback is a hook feature. The CLI skips blocked files and reports the reason.
-
-```toml
-[tool.defsort]
-incremental = true
-incremental-fallback = "full-sort"
-```
-
-### Incremental with warn (skip)
-
-New definitions are sorted when the baseline conforms. Non-conforming or target-incompatible files
-are skipped with a warning rather than adopted. Existing definitions stay in place on the normal
-path. Without a current-path `HEAD` baseline, defsort treats a file as new and full-sorts it unless
-PreToolUse detects and skips a staged rename. This is the most conservative incremental setting
-without the reorder guard.
-
-```toml
-[tool.defsort]
-incremental = true
-# incremental-fallback defaults to "warn" (skip)
-```
-
-### Incremental with reorder guard
-
-The reorder guard limits how many existing top-level definitions may move during full sorting or an
-incremental full-sort fallback when a usable `HEAD` baseline exists. If sorting would exceed the
-configured count or percentage, the file is skipped. The guard does not measure changed lines or
-method movement, so it does not guarantee a small diff or unchanged blame attribution.
-
-```toml
-[tool.defsort]
-incremental = true
-incremental-fallback = "full-sort"
-max-reorder-count = 5              # skip if more than 5 existing definitions would move
-max-reorder-percent = 50           # skip if more than 50% would move
-```
-
-Either threshold can be set independently. When both are set, either being exceeded triggers the
-guard (OR logic). Default: neither set (guard disabled).
-
-"Existing definitions" means top-level definitions present in both git HEAD and the sorted output.
-New definitions added since HEAD and deleted definitions are excluded from the count. Method-level
-reorders within classes are not counted.
-
-When a usable `HEAD` baseline exists, the guard applies to both full sort mode and incremental
-full-sort fallback. New files, unborn repositories, and renamed current paths without a baseline
-are full-sorted without guard protection, except that PreToolUse skips a detected staged rename.
-The guard does not apply to incremental mode's normal path (existing definitions are not reordered
-there).
-
-The CLI's `--force` flag bypasses the guard. The hook has no `--force` equivalent -- guarded files
-are skipped with a stderr warning.
+The full-sort fallback is a hook feature. The CLI skips unsuitable baselines. New files and
+unpaired renames are fully sorted even with `warn`; see
+[baselines and renames](#baselines-and-renames).
 
 ## Configuration
 
@@ -143,7 +77,7 @@ CLI flags always override `pyproject.toml`. The resolution chain:
 3. `[tool.defsort].incremental` -- use config value.
 4. Context default -- full mode for both CLI and hooks.
 
-### Policy changes and baselines
+## Baselines and renames
 
 Incremental mode tests the committed baseline against the current effective ordering policy. A
 policy change can therefore invalidate a baseline that conformed under the previous policy. This
@@ -158,6 +92,100 @@ remains the canonical way to establish a baseline for the new policy.
 Changing `evaluation-order` does not make incremental mode reorder definitions or methods already
 present in the baseline. Incremental output therefore need not match a whole-file sort under the
 new value. Run `defsort --no-incremental -w .` when you want to apply it to every eligible item.
+
+A rename paired by Git uses the source file's HEAD baseline. A plain unstaged move or a move below
+Git's similarity threshold may not be paired; it is then treated as a new file and fully sorted.
+New files and repositories with no commits do not need a conforming baseline.
+
+## Reorder guard
+
+The reorder guard limits how many existing top-level definitions may move during full sorting or an
+incremental full-sort fallback when a usable `HEAD` baseline exists. If sorting would exceed the
+configured count or percentage, the file is skipped. The guard does not measure changed lines or
+method movement, so it does not guarantee a small diff or unchanged blame attribution.
+
+```toml
+[tool.defsort]
+incremental = true
+incremental-fallback = "full-sort"
+max-reorder-count = 5              # skip if more than 5 existing definitions would move
+max-reorder-percent = 50           # skip if more than 50% would move
+```
+
+Either threshold can be set independently. When both are set, either being exceeded triggers the
+guard (OR logic). Default: neither set (guard disabled).
+
+An effective guard requires a Git worktree. Files outside one are skipped with
+`not in a Git repository`. A repository-level Git failure stops the CLI with exit 2 before output
+or writes and names Git's reason. `--force` bypasses the guard and this requirement; incremental
+mode still requires Git when enabled.
+
+"Existing definitions" means top-level definitions present in both git HEAD and the sorted output.
+New definitions added since HEAD and deleted definitions are excluded from the count. Method-level
+reorders within classes are not counted.
+
+When a usable `HEAD` baseline exists, the guard applies to both full sort mode and incremental
+full-sort fallback. Renames paired by Git use the source file's baseline for the guard. New files,
+unborn repositories, and files Git does not pair as renames are full-sorted without guard
+protection. The guard does not apply to incremental mode's normal path (existing definitions are
+not reordered there).
+
+The CLI's `--force` flag bypasses the guard. The hook has no `--force` equivalent -- guarded files
+are skipped with a stderr warning.
+
+## Skip conditions
+
+Incremental mode skips or falls back for certain files:
+
+Baseline validation requires executable module syntax, not only an AST. Constructs that
+`ast.parse()` accepts but module compilation rejects, such as a top-level `return`, `break`, or
+`nonlocal`, are treated as non-conforming baselines. Incremental sorting leaves the current source
+unchanged so users can commit a repair.
+
+| Condition                  | CLI behavior                                                             | Hook behavior                                                                                                                            |
+| -------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| New file (not in HEAD)     | Falls back to full sort                                                  | Falls back to full sort                                                                                                                  |
+| Unborn repo (no commits)   | Falls back to full sort                                                  | Falls back to full sort                                                                                                                  |
+| Not a git repo             | File is skipped with `not in a Git repository`                           | PostToolUse leaves the file unchanged and reports `not in a Git repository`                                                              |
+| Non-conforming baseline    | Warned + skipped                                                         | Warned + skipped; full-sort fallback if configured                                                                                       |
+| Target order incompatible  | Warned + skipped                                                         | Warned + skipped; full-sort fallback if configured                                                                                       |
+| User reordered from HEAD   | Warned + skipped                                                         | Warned + skipped                                                                                                                         |
+| Renamed file               | Uses the source file's baseline when Git pairs the rename; otherwise new | Uses the source file's baseline when Git pairs the rename; otherwise new                                                                 |
+| Git older than 2.42        | Exit 2 before output or writes                                           | Staged-index sorting works; path-based modes fail (see below).                                                                           |
+| Repository-level Git error | Exit 2 before output or writes, with Git's reason                        | PreToolUse denies by default or warns and allows with `allow-on-failure`; PostToolUse leaves the file unchanged and reports Git's reason |
+
+defsort finds a file's baseline under Git's spelling of it, so a path written with different
+capital letters uses the same baseline. A spelling that `HEAD` holds exactly is used as given. If
+`HEAD` lacks the spelling given and Git tracks more than one spelling that is this file, defsort
+skips it, as it does a baseline it cannot read.
+
+When a file is skipped, the CLI reports the reason in its output. The hook emits a warning to
+stderr for blocker-based skips (non-conforming, target incompatible, user reordered).
+Repository-level PostToolUse baseline failures report
+`defsort: PostToolUse skipped NAME: incremental mode cannot use Git: DETAIL`, naming the reorder
+guard instead or in addition when effective. Individual unreadable or ambiguous baselines retain
+their per-file skip policy. A file whose Git repository cannot be determined is skipped with a note
+on stderr; see the [hook guide](hook.md).
+
+**Note:** When a file has top-level drift (e.g., non-conforming baseline) but also has new methods
+that can be sorted, the CLI applies the method sorts and reports the top-level skip as a warning.
+The hook's default `warn` handling emits a stderr warning and clears the candidate, leaving the
+entire file unchanged. In `"full-sort"` fallback mode, the hook replaces the incremental attempt
+with a full sort.
+
+### Repository failures
+
+A repository-level failure reports Git's reason on stderr as
+`error: incremental mode cannot use Git: DETAIL; pass --no-incremental to process whole files`. A
+guard alone reports `error: the reorder guard cannot use Git: DETAIL`; when both modes apply, the
+line names `incremental mode and the reorder guard` and offers no disabling flag. Missing Git,
+untrusted repositories, and failed baseline or file-list queries all stop the run. Individual
+unreadable or ambiguous baselines still skip only their files.
+
+Git 2.42 or newer is required for path-based baselines in CLI, PostToolUse, and working-tree commit
+modes; staged-index commits read by hash and work with older Git. On POSIX, a filename without a
+strict UTF-8 representation has an unavailable baseline and is skipped, while other encodable files
+continue. See [platform requirements](platform.md#requirements).
 
 ## Banner boundaries
 
@@ -190,37 +218,6 @@ method order and contributes a `class_blockers` record, but it never blocks safe
 or work in another class. Layout-only transformations still run the shared structural gates:
 hoisting or stripping cannot bypass interstitial-code or duplicate checks. In `strip` mode, a class
 with one method also removes its recognized method banner in both modes.
-
-## Skip conditions
-
-Incremental mode skips or falls back for certain files:
-
-Baseline validation requires executable module syntax, not only an AST. Constructs that
-`ast.parse()` accepts but module compilation rejects, such as a top-level `return`, `break`, or
-`nonlocal`, are treated as non-conforming baselines. Incremental sorting leaves the current source
-unchanged so users can commit a repair.
-
-| Condition                 | CLI behavior                            | Hook behavior                                                                                                           |
-| ------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| New file (not in HEAD)    | Falls back to full sort                 | Falls back to full sort                                                                                                 |
-| Unborn repo (no commits)  | Falls back to full sort                 | Falls back to full sort                                                                                                 |
-| Not a git repo            | File is skipped                         | Not applicable                                                                                                          |
-| Non-conforming baseline   | Warned + skipped                        | Warned + skipped; full-sort fallback if configured                                                                      |
-| Target order incompatible | Warned + skipped                        | Warned + skipped; full-sort fallback if configured                                                                      |
-| User reordered from HEAD  | Warned + skipped                        | Warned + skipped                                                                                                        |
-| Renamed file              | Treated as new; falls back to full sort | PreToolUse skips staged rename; PostToolUse treats missing current-path baseline as new and full-sorts                  |
-| Git older than 2.42       | Exit 2 before output or writes          | See [hook infrastructure policy](hook.md#infrastructure-failures)                                                       |
-| Infrastructure error      | Skipped                                 | PreToolUse denies by default or warns and allows with `allow-on-failure`; PostToolUse skips transient baseline failures |
-
-When a file is skipped, the CLI reports the reason in its output. The hook emits a warning to
-stderr for blocker-based skips (non-conforming, target incompatible, user reordered). Transient
-PostToolUse infrastructure skips remain silent.
-
-**Note:** When a file has top-level drift (e.g., non-conforming baseline) but also has new methods
-that can be sorted, the CLI applies the method sorts and reports the top-level skip as a warning.
-The hook's default `warn` handling emits a stderr warning and clears the candidate, leaving the
-entire file unchanged. In `"full-sort"` fallback mode, the hook replaces the incremental attempt
-with a full sort.
 
 ## Actual-candidate safety
 
@@ -259,21 +256,16 @@ order did not change. Incremental hook sorting never adds the import. It removes
 standalone annotations-only import only from an annotation-free module. Public `defsort.sort()` and
 `defsort.check()` with a baseline neither add nor remove it.
 
-## Blockers
-
-Some conditions that block full sorting also block incremental sorting:
-
-| Blocker           | Description                                                                |
-| ----------------- | -------------------------------------------------------------------------- |
-| Interstitial code | Code between definitions prevents safe sorting                             |
-| Eager order       | Candidate changes a covered binding, or eager-group order under `preserve` |
-| Forward refs      | Forward annotation references; add `from __future__ import annotations`    |
-| Duplicates        | Non-consecutive definitions with the same name                             |
-
-These blockers apply in both full and incremental mode. `--force` can bypass interstitial blockers,
-but it does not select `allow-reordering` and never bypasses duplicate names, applicable eager
-order, or unresolved forward annotations.
+Full-mode safety checks also apply. See the [safety model](design.md#safety-model) for blockers,
+force limits, and annotation behavior.
 
 With `banners = "barriers"`, duplicate detection is section-aware in both modes. Consecutive
 same-name definitions form groups only within one section; repeating the name in another section
 still creates separate duplicate groups and blocks sorting.
+
+## Hook integration
+
+Use one event mode and serialize modifying hooks under one registration; see
+[hook composition](hook.md#composing-with-other-hooks). Normal staged commits preserve partial
+staging through the [working-tree synchronization rules](hook-reference.md#working-tree-sync).
+Commit pathspecs use the separate [working-tree path](hook-reference.md#working-tree-path).

@@ -3,9 +3,9 @@
 import sys
 from collections.abc import Sequence
 
-from defsort._downstream import closable_stdout, ensure_utf8_stdio
 from defsort._hook_front import run_hook_command
 from defsort._types import EXIT_ERROR
+from defsort._vendor.hookfront._streams import closable_stdout, ensure_utf8_stdio
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -17,10 +17,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     the exit status reflects the work completed before the closure.
 
     Args:
-        argv: Arguments to parse, or `None` to use `sys.argv`.
+        argv: Arguments to parse, or `None` to use `sys.argv[1:]`.
 
     Returns:
         The process exit status.
+
+    Raises:
+        SystemExit: After displaying help or rejecting command-line arguments.
     """
     if sys.stdout is None:
         # Started with standard output closed: nothing can be delivered, and the

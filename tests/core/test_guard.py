@@ -1,3 +1,5 @@
+import pytest
+
 from defsort._core._guard import (
     ReorderGuardParams,
     _count_reorder_moves,
@@ -96,19 +98,18 @@ class TestCountReorderMoves:
             'def f(x: int | str) -> int | str:\n    return x\n\n\n'
             'def g():\n    pass\n'
         )
-        defs = _parse_defs(baseline)
-        assert _count_reorder_moves(defs, defs) == (0, 4)
+        current = (
+            'from typing import overload\n\n\n'
+            '@overload\ndef f(x: int) -> int: ...\n\n\n'
+            'def f(x: int | str) -> int | str:\n    return x\n\n\n'
+            'def g():\n    pass\n'
+        )
+        assert _count_reorder_moves(_parse_defs(baseline), _parse_defs(current)) == (0, 3)
 
     def test_partial_reorder(self) -> None:
         baseline = 'def a():\n    pass\n\n\ndef b():\n    pass\n\n\ndef c():\n    pass\n'
         sorted_src = 'def c():\n    pass\n\n\ndef a():\n    pass\n\n\ndef b():\n    pass\n'
         assert _count_reorder_moves(_parse_defs(baseline), _parse_defs(sorted_src)) == (3, 3)
-
-    def test_syntax_error_baseline(self) -> None:
-        broken_defs = _parse_defs('def broken(\n')
-        assert broken_defs == ()
-        sorted_defs = _parse_defs('def a():\n    pass\n')
-        assert _count_reorder_moves(broken_defs, sorted_defs) == (0, 0)
 
 
 class TestEvaluateReorderGuard:
@@ -132,10 +133,20 @@ class TestEvaluateReorderGuard:
         result = evaluate_reorder_guard(params, defs)
         assert result.triggered is False
 
-    def test_none_params_returns_not_triggered(self) -> None:
-        defs = _parse_defs('def a():\n    pass\n')
-        result = evaluate_reorder_guard(None, defs)
+    @pytest.mark.parametrize(('max_count', 'max_percent'), [(2, None), (None, 50)])
+    def test_exact_threshold_not_triggered(
+        self, max_count: int | None, max_percent: int | None
+    ) -> None:
+        baseline = 'def a(): ...\ndef b(): ...\ndef c(): ...\ndef d(): ...\n'
+        sorted_source = 'def b(): ...\ndef a(): ...\ndef c(): ...\ndef d(): ...\n'
+        params = ReorderGuardParams(
+            baseline_defs=_parse_defs(baseline),
+            max_reorder_count=max_count,
+            max_reorder_percent=max_percent,
+        )
+        result = evaluate_reorder_guard(params, _parse_defs(sorted_source))
         assert result.triggered is False
+        assert (result.moved, result.total) == (2, 4)
 
     def test_over_count_threshold_triggered(self) -> None:
         baseline = 'def a():\n    pass\n\n\ndef b():\n    pass\n'
@@ -162,18 +173,6 @@ class TestEvaluateReorderGuard:
         result = evaluate_reorder_guard(params, sorted_defs)
         assert result.triggered is True
         assert 'max-reorder-percent = 50' in result.reasons
-
-    def test_under_threshold_not_triggered(self) -> None:
-        baseline = 'def a():\n    pass\n\n\ndef b():\n    pass\n'
-        bl_defs = _parse_defs(baseline)
-        sorted_defs = _parse_defs(baseline)  # same order
-        params = ReorderGuardParams(
-            baseline_defs=bl_defs,
-            max_reorder_count=5,
-        )
-        result = evaluate_reorder_guard(params, sorted_defs)
-        assert result.triggered is False
-        assert result.moved == 0
 
 
 class TestReorderGuardResult:

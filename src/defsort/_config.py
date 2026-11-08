@@ -12,7 +12,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
-from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import (
     BANNER_MODE_VALUES,
     COLOR_MODE_VALUES,
@@ -38,6 +37,7 @@ from defsort._types import (
     TieBreak,
     validate_banner_pattern,
 )
+from defsort._vendor.hookfront._terminal import escape_terminal_text, path_text
 
 _KNOWN_KEYS: frozenset[str] = frozenset(
     {
@@ -63,7 +63,6 @@ _KNOWN_KEYS: frozenset[str] = frozenset(
 )
 _MAX_PERCENT = 100
 _RENDER_CONFIG_WARNINGS = ContextVar('render_config_warnings', default=False)
-_SCOPE_ORDER_LABEL = "'dependency', 'alphabetical', or 'none'"
 
 
 class DefsortConfigWarning(UserWarning):
@@ -122,7 +121,7 @@ def _nearest_pyproject(directory: Path) -> Path | None:
     for candidate_dir in (directory, *directory.parents):
         candidate = candidate_dir / 'pyproject.toml'
         if candidate.is_file():
-            return candidate
+            return candidate.resolve()
         if (candidate_dir / '.git').exists():
             break
     return None
@@ -131,7 +130,7 @@ def _nearest_pyproject(directory: Path) -> Path | None:
 def _warn_config(message: str) -> None:
     """Emit one configuration diagnostic with the public category."""
     if _RENDER_CONFIG_WARNINGS.get():
-        print(f'Warning: {escape_terminal_text(message)}', file=sys.stderr)
+        print(f'warning: {escape_terminal_text(message)}', file=sys.stderr)
     else:
         warnings.warn(message, DefsortConfigWarning, stacklevel=2)
 
@@ -167,14 +166,15 @@ def _load_toml(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _parse_boolean(section: dict[str, object], key: str, *, default: bool) -> bool:
+def _parse_boolean(section: dict[str, object], key: str, path: Path, *, default: bool) -> bool:
     """Parse a boolean config key, warning on invalid values."""
     raw = section.get(key)
     if raw is None:
         return default
     if not isinstance(raw, bool):
         _warn_config(
-            f'Invalid [tool.defsort] {key}: {raw!r} (expected true or false), using default'
+            f'{path_text(path)}: [tool.defsort].{key}: invalid value {raw!r}; '
+            f'expected true or false; using {str(default).lower()}'
         )
         return default
     return raw
@@ -183,37 +183,41 @@ def _parse_boolean(section: dict[str, object], key: str, *, default: bool) -> bo
 def _parse_bounded_int(
     section: dict[str, object],
     key: str,
+    path: Path,
     *,
-    min_val: int = 0,
+    default: int | None,
     max_val: int | None = None,
 ) -> int | None:
     """Parse an integer config key with range validation."""
     raw = section.get(key)
     if raw is None:
-        return None
-    if type(raw) is not int:
-        label = f'integer {min_val}-{max_val}' if max_val is not None else 'non-negative integer'
-        _warn_config(f'Invalid [tool.defsort] {key}: {raw!r} (expected {label}), using default')
-        return None
-    if raw < min_val or (max_val is not None and raw > max_val):
-        bound = f'{min_val}-{max_val}' if max_val is not None else f'>= {min_val}'
-        _warn_config(f'Invalid [tool.defsort] {key}: {raw} (must be {bound}), using default')
-        return None
-    return raw
+        return default
+    if type(raw) is int and raw >= 0 and (max_val is None or raw <= max_val):
+        return raw
+    label = f'an integer from 0 to {max_val}' if max_val is not None else 'a non-negative integer'
+    _warn_config(
+        f'{path_text(path)}: [tool.defsort].{key}: invalid value {raw!r}; '
+        f'expected {label}; using {"no limit" if default is None else default}'
+    )
+    return default
 
 
 def _parse_string_literal(
     section: dict[str, object],
     key: str,
-    valid: frozenset[str],
-    label: str,
+    allowed: tuple[str, ...],
+    default: str,
+    path: Path,
 ) -> str | None:
     """Parse a string-literal config key, warning on invalid values."""
     raw = section.get(key)
     if raw is None:
         return None
-    if not isinstance(raw, str) or raw not in valid:
-        _warn_config(f'Invalid [tool.defsort] {key}: {raw!r} (expected {label}), using default')
+    if not isinstance(raw, str) or raw not in allowed:
+        _warn_config(
+            f'{path_text(path)}: [tool.defsort].{key}: invalid value {raw!r}; '
+            f'expected {", ".join(allowed)}; using {default}'
+        )
         return None
     return raw
 
@@ -222,116 +226,130 @@ def _parse_vocabulary[T: str](
     section: dict[str, object],
     key: str,
     allowed: tuple[T, ...],
-    label: str,
     default: T,
+    path: Path,
 ) -> T:
     """Parse one closed-vocabulary key, warning and defaulting on bad input."""
-    raw = _parse_string_literal(section, key, frozenset(allowed), label)
+    raw = _parse_string_literal(section, key, allowed, default, path)
     for value in allowed:
         if raw == value:
             return value
     return default
 
 
-def _parse_section(section: dict[str, object]) -> ResolvedConfig:
+def _parse_section(section: dict[str, object], path: Path) -> ResolvedConfig:
     """Parse a [tool.defsort] section dict into ResolvedConfig."""
+    defaults = ResolvedConfig()
+    transform_defaults = defaults.transform
     for key in sorted(set(section) - _KNOWN_KEYS):
-        _warn_config(f'Unknown [tool.defsort] key: {key}, ignoring')
+        _warn_config(f'{path_text(path)}: [tool.defsort]: unknown key {key}; ignoring')
 
-    allow_on_failure = _parse_boolean(section, 'allow-on-failure', default=False)
-
-    banners: BannerMode = _parse_vocabulary(
-        section, 'banners', BANNER_MODE_VALUES, "'barriers', 'ignore', or 'strip'", 'barriers'
+    allow_on_failure = _parse_boolean(
+        section, 'allow-on-failure', path, default=defaults.allow_on_failure
     )
 
-    banner_pattern: str | None = None
+    banners: BannerMode = _parse_vocabulary(
+        section, 'banners', BANNER_MODE_VALUES, transform_defaults.banners, path
+    )
+
+    banner_pattern = transform_defaults.banner_pattern
     pattern_raw = section.get('banner-pattern')
     if pattern_raw is not None:
         if not isinstance(pattern_raw, str):
             _warn_config(
-                f'Invalid [tool.defsort] banner-pattern: {pattern_raw!r}'
-                ' (expected string), using built-in detection'
+                f'{path_text(path)}: [tool.defsort].banner-pattern: '
+                f'invalid value {pattern_raw!r}; expected a string; using built-in detection'
             )
         else:
             try:
                 validate_banner_pattern(pattern_raw)
             except ValueError as exc:
                 _warn_config(
-                    f'Invalid [tool.defsort] banner-pattern: {exc} (using built-in detection)'
+                    f'{path_text(path)}: [tool.defsort].banner-pattern: '
+                    f'invalid value {pattern_raw!r}; expected a valid banner pattern ({exc}); '
+                    'using built-in detection'
                 )
             else:
                 banner_pattern = pattern_raw
 
     order: SortScopeOrder = _parse_vocabulary(
-        section, 'order', SORT_SCOPE_ORDER_VALUES, _SCOPE_ORDER_LABEL, 'dependency'
+        section, 'order', SORT_SCOPE_ORDER_VALUES, transform_defaults.definition_order, path
     )
     definition_order: SortScopeOrder = _parse_vocabulary(
-        section, 'definition-order', SORT_SCOPE_ORDER_VALUES, _SCOPE_ORDER_LABEL, order
+        section, 'definition-order', SORT_SCOPE_ORDER_VALUES, order, path
     )
     method_order: SortScopeOrder = _parse_vocabulary(
-        section, 'method-order', SORT_SCOPE_ORDER_VALUES, _SCOPE_ORDER_LABEL, order
+        section, 'method-order', SORT_SCOPE_ORDER_VALUES, order, path
     )
     evaluation_order: EvaluationOrder = _parse_vocabulary(
         section,
         'evaluation-order',
         EVALUATION_ORDER_VALUES,
-        "'preserve' or 'allow-reordering'",
-        'preserve',
+        transform_defaults.evaluation_order,
+        path,
     )
     main: MainPlacement = _parse_vocabulary(
-        section, 'main', MAIN_PLACEMENT_VALUES, "'last' or 'sorted'", 'last'
+        section, 'main', MAIN_PLACEMENT_VALUES, transform_defaults.main, path
     )
     method_bodies: MethodBodies = _parse_vocabulary(
         section,
         'method-bodies',
         METHOD_BODIES_VALUES,
-        "'within-categories', 'ignore', or 'across-categories'",
-        'within-categories',
+        transform_defaults.method_bodies,
+        path,
     )
     method_dunders: MethodDunders = _parse_vocabulary(
         section,
         'method-dunders',
         METHOD_DUNDERS_VALUES,
-        "'before-regular' or 'after-regular'",
-        'before-regular',
+        transform_defaults.method_dunders,
+        path,
     )
     method_visibility: MethodVisibility = _parse_vocabulary(
         section,
         'method-visibility',
         METHOD_VISIBILITY_VALUES,
-        "'mixed' or 'public-first'",
-        'mixed',
+        transform_defaults.method_visibility,
+        path,
     )
     tie_break: TieBreak = _parse_vocabulary(
         section,
         'tie-break',
         TIE_BREAK_VALUES,
-        "'alphabetical' or 'source'",
-        'alphabetical',
+        transform_defaults.tie_break,
+        path,
     )
 
     incremental = section.get('incremental')
     if incremental is not None and not isinstance(incremental, bool):
         _warn_config(
-            f'Invalid [tool.defsort] incremental: {incremental!r}'
-            ' (expected true or false), using default'
+            f'{path_text(path)}: [tool.defsort].incremental: invalid value {incremental!r}; '
+            'expected true or false; using full mode'
         )
-        incremental = None
+        incremental = defaults.incremental
 
     incremental_fallback: FallbackMode = _parse_vocabulary(
-        section, 'incremental-fallback', FALLBACK_MODE_VALUES, "'warn' or 'full-sort'", 'warn'
+        section, 'incremental-fallback', FALLBACK_MODE_VALUES, defaults.incremental_fallback, path
     )
 
     color_raw = _parse_string_literal(
-        section, 'color', frozenset(COLOR_MODE_VALUES), "'auto', 'always', or 'never'"
+        section, 'color', COLOR_MODE_VALUES, defaults.color or 'auto', path
     )
     color: ColorMode | None = next(
         (value for value in COLOR_MODE_VALUES if value == color_raw), None
     )
 
-    max_reorder_count = _parse_bounded_int(section, 'max-reorder-count')
-    max_reorder_percent = _parse_bounded_int(section, 'max-reorder-percent', max_val=_MAX_PERCENT)
-    show_skips = _parse_boolean(section, 'show-skips', default=True)
+    max_reorder_count = _parse_bounded_int(
+        section, 'max-reorder-count', path, default=defaults.max_reorder_count
+    )
+    max_reorder_percent = _parse_bounded_int(
+        section,
+        'max-reorder-percent',
+        path,
+        default=defaults.max_reorder_percent,
+        max_val=_MAX_PERCENT,
+    )
+    show_skips = _parse_boolean(section, 'show-skips', path, default=defaults.show_skips)
 
     return ResolvedConfig(
         allow_on_failure=allow_on_failure,
@@ -362,7 +380,7 @@ def _resolve_config_source(candidate: Path) -> tuple[ResolvedConfig, Path | None
     section = _defsort_section(_load_toml(candidate), candidate)
     if section is None:
         return ResolvedConfig(), None
-    return _parse_section(section), candidate
+    return _parse_section(section, candidate), candidate
 
 
 @functools.cache
@@ -377,7 +395,9 @@ def _resolve_config_sourced(directory: Path) -> tuple[ResolvedConfig, Path | Non
 def clear_config_cache() -> None:
     """Clear cached configuration so later reads observe edited files.
 
-    Configuration is cached per resolved directory for the life of the process,
+    Discovery results are cached per resolved directory, and parsed and
+    validated settings are cached per resolved configuration file. Directories
+    sharing a file also share its warnings. Both caches last for the process,
     which suits a CLI invocation but not a long-running caller. Call this after
     changing a `pyproject.toml` in the same process. This also drops this
     module's warning registry, so a rereading caller sees the configuration
@@ -449,6 +469,11 @@ def effective_config(cfg: ResolvedConfig, overrides: SortOverrides) -> ResolvedC
         else cfg.incremental_fallback,
         show_skips=overrides.show_skips if overrides.show_skips is not None else cfg.show_skips,
     )
+
+
+def ineffective_policy_message(key: str) -> str:
+    """Describe one configured policy value that cannot affect the sort."""
+    return f'[tool.defsort] {key} has no effect under the resolved strategies; ignoring'
 
 
 def ineffective_policy_values(policy: DefsortConfig) -> list[str]:
@@ -554,9 +579,15 @@ def resolve_config(path: str | os.PathLike[str]) -> DefsortConfig:
     Discovery starts at `path` when it is an existing directory and at `path`'s
     parent otherwise, including when `path` names a file that does not exist
     yet, then searches upward for the nearest `pyproject.toml`, stopping
-    inclusively at the git repository root. Results are cached per resolved
-    directory for the process lifetime; call `clear_config_cache()` after
-    editing a `pyproject.toml` in the same process.
+    inclusively at the git repository root. Discovery results are cached per
+    resolved directory, while parsed and validated settings are cached per
+    resolved configuration file. Directories sharing a file also share its
+    warnings. Call `clear_config_cache()` after editing a `pyproject.toml` in
+    the same process.
+
+    Invalid, unreadable, or unknown configuration emits `DefsortConfigWarning`
+    and uses the applicable defaults. Standard warning filters can promote
+    these diagnostics to exceptions.
 
     Args:
         path: File or directory path, as a string or path-like object.
@@ -576,6 +607,6 @@ def warn_ineffective_policy(cfg: DefsortConfig) -> None:
     """
     for key in ineffective_policy_values(cfg):
         print(
-            f'Warning: [tool.defsort] {key} has no effect under the resolved strategies, ignoring',
+            f'warning: {escape_terminal_text(ineffective_policy_message(key))}',
             file=sys.stderr,
         )

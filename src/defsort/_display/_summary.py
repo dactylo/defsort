@@ -3,12 +3,13 @@
 from collections.abc import Collection
 from typing import NamedTuple
 
-from defsort._color import BOLD, YELLOW, colorize
+from defsort._display._color import YELLOW
 from defsort._display._movement import count_moved_split
 from defsort._display._types import SummaryRow
 from defsort._display._width import display_width, pad_cells
-from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import SortResult
+from defsort._vendor.hookfront._color import BOLD, colorize
+from defsort._vendor.hookfront._terminal import escape_terminal_text, path_text
 
 _MIN_FILES_FOR_TOTAL = 2
 _SUMMARY_HEADERS = ('Name', 'Defs', 'Methods', 'Total', 'Move', 'Move%')

@@ -773,7 +773,8 @@
       "id": "data-heredoc-prose",
       "command": "cat <<'EOF'\nplain text about commits\nEOF",
       "outcome": "unrelated",
-      "detected": false
+      "detected": false,
+      "note": "2026-10-22: quoted file-writing chains also exempt data bodies when every command and target satisfies the documented form and collision checks."
     },
     {
       "id": "data-python-hello",
@@ -1365,6 +1366,408 @@
     {
       "id": "deny-commit-after-data-sink",
       "command": "cat > notes.md <<'EOF' && git commit -m x\nbody\nEOF",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "data-sink-chain-reader",
+      "command": "mkdir -p notes && cat > notes/review.md <<'EOF'\nSee `docs/operations.md` (commit `e2e6dc8`).\nEOF\nwc -l notes/review.md",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-three-bodies",
+      "command": "cat > notes0 <<'EOF'\ngit commit -m x\nEOF\ncat > notes1 <<'EOF'\ngit commit -m x\nEOF\ncat > notes2 <<'EOF'\ngit commit -m x\nEOF\nwc -l notes0 notes1 notes2",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-long-body",
+      "command": "mkdir -p notes && cat > notes/review.md <<'EOF'\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nordinary prose\nSee `docs/operations.md` (commit `e2e6dc8`).\nEOF\nwc -l notes/review.md",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "deny-heredoc-overwrites-path-command",
+      "command": "cp /bin/echo DIR/ls && cat > DIR/ls <<'EOF'\n#!/bin/sh\ngit commit -m x\nEOF\nls",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-equals-expansion-redirect",
+      "command": "cat > =ls <<'EOF'\n#!/bin/sh\ngit commit -m x\nEOF\nls",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-equals-expansion-cp",
+      "command": "cat > notes <<'EOF'\n#!/bin/sh\ngit commit -m x\nEOF\ncp notes =ls; ls",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-equals-expansion-mv",
+      "command": "cat > notes <<'EOF'\n#!/bin/sh\ngit commit -m x\nEOF\nmv notes =ls; ls",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-directory-move",
+      "command": "cat > stage/ls <<'EOF'\ngit commit -m x\nEOF\nmv stage bin; ls",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-chmod-executable",
+      "command": "cat > DIR/ls <<'EOF'\ngit commit -m x\nEOF\nchmod +x DIR/ls; ls",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-link-ln",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\nln notes shortcut; wc -l notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-link-cplong-l",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\ncp -l notes shortcut; wc -l notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-link-cplong--link",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\ncp --link notes shortcut; wc -l notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-link-cplong-s",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\ncp -s notes shortcut; wc -l notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-link-cplong--symbolic-link",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\ncp --symbolic-link notes shortcut; wc -l notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-mv-helper-cp",
+      "command": "cat > DIR/cp <<'EOF'\ngit commit -m x\nEOF\nmv stage bin",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-mv-helper-rm",
+      "command": "cat > DIR/rm <<'EOF'\ngit commit -m x\nEOF\nmv stage bin",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-execute-sh",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\nsh notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-execute-bash",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\nbash notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-execute-dot",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\n. notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-execute-source",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\nsource notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-execute-exec",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\nexec notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-execute-python",
+      "command": "cat > notes <<'EOF'\nimport subprocess\nsubprocess.run(['git', 'commit', '-m', 'x'])\nEOF\npython notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-consumer-make",
+      "command": "cat > Makefile <<'EOF'\nall:\n\tgit commit -m x\nEOF\nmake",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-consumer-npm",
+      "command": "cat > package.json <<'EOF'\n{\"scripts\": {\"build\": \"git commit -m x\"}}\nEOF\nnpm run build",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-consumer-pytest",
+      "command": "cat > pytest.ini <<'CONFIG'\n[pytest]\naddopts = --doctest-glob=notes.txt\nCONFIG\ncat > notes.txt <<'DOC'\n>>> import subprocess\n>>> subprocess.run(['git', 'commit', '-m', 'x'])\nDOC\npytest",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-consumer-git-add",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\ngit add notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-consumer-git-global-add",
+      "command": "cat > .gitattributes <<'EOF'\ngit commit -m x\nEOF\ngit -C repo add notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-consumer-git-config",
+      "command": "cat > .git/config <<'CONFIG'\n[filter \"demo\"]\nclean = sh -c 'git commit -m x'\nCONFIG\ncat > .gitattributes <<'ATTR'\n*.txt filter=demo\nATTR\ngit add notes.txt",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-function",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\nf() { true; }; f",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-substitution",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\necho $(true)",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-process-substitution",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\ncat <(true)",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-printf-variable",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\nprintf -v 'a[$(true)]' %s x",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-test-variable",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\ntest -v 'a[$(true)]'",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-zsh-evaluation",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\necho ${(e)x}",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-bash-prompt",
+      "command": "cat > notes <<'EOF'\ngit commit -m x\nEOF\necho ${x@P}",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-execute-expanded-command",
+      "command": "cat > notes <<'EOF'\n$GIT commit\nEOF\nsh notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-execute-quoted-command",
+      "command": "cat > notes <<'EOF'\ng\"\"it com\"\"mit\nEOF\nsh notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-unquoted-chain",
+      "command": "cat > notes <<EOF\ngit commit -m x\nEOF\nwc -l notes",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "data-sink-chain-variable-prose",
+      "command": "mkdir -p notes && cat > notes/review.md <<'EOF'\nThe $X value can change before commit.\nEOF\nwc -l notes/review.md",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-chain-copy-to-variable-dir",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\ncp n.md \"$TMPDIR/\" && echo \"Saved to $TMPDIR/n.md\"",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-chain-copy-to-parent",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\ncp n.md ../",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "deny-data-sink-variable-target",
+      "command": "cat > \"$OUT\" <<'EOF'\ngit commit -m x\nEOF\nwc -l n.md",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-variable-destination",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\ncp n.md \"$DEST\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-variable-command-file",
+      "command": "cat > \"$HOME/bin/ls\" <<'EOF'\ngit commit -m x\nEOF\nls",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "data-sink-chain-tmpdir",
+      "command": "cat > \"$TMPDIR/notes.md\" <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$TMPDIR/notes.md\"",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-chain-home",
+      "command": "mkdir -p ~/notes && cat > ~/notes/review.md <<'EOF'\ngit commit -m x\nEOF\n",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-chain-braced-cd",
+      "command": "cd \"$CLAUDE_PROJECT_DIR\" && cat > \"${TMPDIR}/n.md\" <<'EOF'\ngit commit -m x\nEOF\n",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-chain-quote-then-slash",
+      "command": "cat > \"$TMPDIR\"/n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$TMPDIR\"/n.md",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-chain-home-variable",
+      "command": "cat > ~/\"$DIR/n.md\" <<'EOF'\ngit commit -m x\nEOF\nwc -l ~/\"$DIR/n.md\"",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "data-sink-chain-pwd",
+      "command": "cd sub && cat > \"$PWD/n.md\" <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$OLDPWD/sub/n.md\"",
+      "outcome": "unrelated",
+      "detected": false
+    },
+    {
+      "id": "deny-data-sink-unquoted-variable",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l $TMPDIR/n.md",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-lowercase-variable",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$tmp/n.md\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-last-argument-variable",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$_\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-bash-command-variable",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$BASH_COMMAND\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-lineno-variable",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$LINENO/n.md\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-pipestatus-variable",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$PIPESTATUS/n.md\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-random-variable",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$RANDOM/n.md\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-zsh-subscript",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$TMPDIR[1]/n.md\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-zsh-modifier",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$TMPDIR:h/n.md\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-default-value",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"${TMPDIR:-/tmp}/n.md\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-substituted-path",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l \"$(pwd)/n.md\"",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-glob-path",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l *.md",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-other-home",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l ~root/n.md",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-stack-home",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nwc -l ~+/n.md",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-quoted-option-variable",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nsort \"--compress-program=$PWD/n.md\" n.md",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-unquoted-option-value",
+      "command": "cat > n.md <<'EOF'\ngit commit -m x\nEOF\nhead -n $N n.md",
+      "outcome": "unsupported",
+      "detected": true
+    },
+    {
+      "id": "deny-data-sink-variable-exec",
+      "command": "cat > \"$TMPDIR/s.sh\" <<'EOF'\ngit commit -m x\nEOF\nsh \"$TMPDIR/s.sh\"",
       "outcome": "unsupported",
       "detected": true
     },

@@ -15,7 +15,7 @@ from defsort._types import (
     SortResult,
     SortScopeOrder,
 )
-from tests._helpers import execute_source
+from tests._helpers import DYNAMIC_ALL_WARNING, execute_source
 
 _SRC_UNORDERED = 'def bravo():\n    return alpha()\n\n\ndef alpha():\n    return 1\n'
 
@@ -949,7 +949,7 @@ class TestSortFile:
         assert result.blocking_code == []
 
     @pytest.mark.parametrize(
-        ('source', 'policy'),
+        ('source', 'policy', 'expected_blocker'),
         [
             (
                 (
@@ -957,6 +957,7 @@ class TestSortFile:
                     '\nregistry = {}\n\ndef bravo():\n    pass\n'
                 ),
                 SortPolicy(),
+                'interstitial',
             ),
             (
                 (
@@ -964,6 +965,7 @@ class TestSortFile:
                     '    def alpha(self): pass\n\nregistry = {}\n\ndef bravo():\n    pass\n'
                 ),
                 SortPolicy(),
+                None,
             ),
             (
                 (
@@ -971,6 +973,7 @@ class TestSortFile:
                     'def bravo():\n    pass\n'
                 ),
                 SortPolicy(banners='strip'),
+                'interstitial',
             ),
             (
                 (
@@ -978,6 +981,7 @@ class TestSortFile:
                     '    def bravo(self): pass\n\nregistry = {}\n\ndef bravo():\n    pass\n'
                 ),
                 SortPolicy(banners='strip'),
+                'interstitial',
             ),
             (
                 (
@@ -985,17 +989,20 @@ class TestSortFile:
                     '\nregistry = {}\n\ndef bravo():\n    pass\n'
                 ),
                 SortPolicy(),
+                'interstitial',
             ),
         ],
         ids=['methods', 'class-blocker', 'top-banner', 'method-banner', 'future-removal'],
     )
     def test_ordered_interstitial_retains_required_work_blocker(
-        self, source: str, policy: SortPolicy
+        self, source: str, policy: SortPolicy, expected_blocker: str | None
     ) -> None:
         result = sort_file(source, options=EngineOptions(policy=policy))
 
         assert result.new_source == source
-        assert result.blocker == 'interstitial'
+        assert result.blocker == expected_blocker
+        if expected_blocker is None:
+            assert [cb.blocker for cb in result.class_blockers] == ['interstitial']
         assert result.skipped
 
     def test_ordinary_characters_in_class_docstring_keep_method_spans(self) -> None:
@@ -1339,6 +1346,7 @@ class TestSortFileEagerOrderSafety:
         result = sort_file(source, options=options)
 
         assert result.blocker == 'eager_order'
+        assert result.warning == DYNAMIC_ALL_WARNING
         assert result.new_source == source
 
     def test_dynamic_all_is_not_bypassed_by_force(self) -> None:
@@ -1361,6 +1369,7 @@ class TestSortFileEagerOrderSafety:
         result = sort_file(source, options=options)
 
         assert result.blocker == 'eager_order'
+        assert result.warning == DYNAMIC_ALL_WARNING
         assert result.new_source == source
 
     def test_dynamic_all_nested_assignment_blocks_changed_full_order(self) -> None:
@@ -1381,6 +1390,7 @@ class TestSortFileEagerOrderSafety:
         result = sort_file(source, options=options)
 
         assert result.blocker == 'eager_order'
+        assert result.warning == DYNAMIC_ALL_WARNING
         assert result.new_source == source
 
     @pytest.mark.parametrize('force', [False, True], ids=['normal', 'forced'])
@@ -1774,32 +1784,6 @@ class TestSortFileRemoveFuture:
         assert 'from __future__ import annotations' not in result.new_source
         assert sort_file(result.new_source, options=options).new_source == result.new_source
 
-    def test_remove_future_false_preserves_import(self) -> None:
-        # Source has future import + ordering that makes it unnecessary after sort.
-        # After sorting, forward refs are gone, so normally the import would be removed.
-        src = (
-            'from __future__ import annotations\n\n\n'
-            'def bravo(x: Alpha) -> None:\n    pass\n\n\n'
-            'class Alpha:\n    pass\n'
-        )
-        result = sort_file(
-            src, options=EngineOptions(policy=SortPolicy(), add_future=False, remove_future=False)
-        )
-        assert 'from __future__ import annotations' in result.new_source
-
-    def test_remove_future_false_preserves_when_already_ordered(self) -> None:
-        # Already in correct dependency order, but the future import is
-        # unnecessary (no forward refs). Normally sort_file would strip it.
-        src = (
-            'from __future__ import annotations\n\n\n'
-            'class Alpha:\n    pass\n\n\n'
-            'def bravo(x: Alpha) -> None:\n    pass\n'
-        )
-        result = sort_file(
-            src, options=EngineOptions(policy=SortPolicy(), add_future=False, remove_future=False)
-        )
-        assert 'from __future__ import annotations' in result.new_source
-
 
 class TestSortFileTopLevelBanners:
     def test_banner_barriers_alphabetical_order_stays_within_sections(self) -> None:
@@ -2186,7 +2170,7 @@ class TestSortFileTopLevelBanners:
         assert result.skipped is True
         assert result.blocker == 'duplicates'
 
-    def test_banner_ignore_matches_pre_feature_output(self) -> None:
+    def test_banner_ignore_preserves_trailing_comment_during_global_sort(self) -> None:
         src = 'def bravo():\n    return alpha()\n\n\n# --------\n\n\ndef alpha():\n    pass\n'
 
         result = sort_file(

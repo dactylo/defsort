@@ -1,4 +1,4 @@
-"""Terminal-safe rendering for repository-controlled text."""
+"""Escape terminal controls and display paths for CLI output."""
 
 from pathlib import PurePath, PureWindowsPath
 
@@ -7,19 +7,23 @@ _C1_MAX = 0x9F
 _DEL = 0x7F
 
 
-def escape_terminal_text(value: str) -> str:
+def escape_terminal_text(value: str, *, preserve_lf: bool = False) -> str:
     r"""Replace terminal control code points with visible ASCII escapes.
 
     Args:
         value: Repository-controlled text to render for a human.
+        preserve_lf: Whether to retain LF as a structural newline.
 
     Returns:
-        Text with every C0, DEL, and C1 code point rendered as `\xNN`.
+        Text with C0, DEL, and C1 controls rendered as `\xNN`, except LF when
+        `preserve_lf` is true.
     """
     escaped: list[str] = []
     for character in value:
         codepoint = ord(character)
-        if codepoint < _C0_LIMIT or _DEL <= codepoint <= _C1_MAX:
+        if character == '\n' and preserve_lf:
+            escaped.append(character)
+        elif codepoint < _C0_LIMIT or _DEL <= codepoint <= _C1_MAX:
             escaped.append(f'\\x{codepoint:02x}')
         else:
             escaped.append(character)

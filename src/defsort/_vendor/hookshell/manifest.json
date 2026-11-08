@@ -2,17 +2,21 @@
   "version": "0.1.0",
   "files": {
     "src/defsort/_vendor/hookshell/__init__.py": "516598ef67153f17dc3b41b98aac5efe1842030b225ef56fdbcbb51e279015c5",
-    "src/defsort/_vendor/hookshell/_classify.py": "5233343ed2628fa8345915101d9b187261622438b9fd15996b971dbfd4781b44",
-    "src/defsort/_vendor/hookshell/_detector.py": "3e5a174b816a50c1f9e475cb9a6c0628592b13cda8264982f0e18662e53da0c0",
-    "src/defsort/_vendor/hookshell/_grammar.py": "402b222a1304527fdccd1734486f9736da6b6d89fbc103f1ca8cc468be5b2f30",
-    "src/defsort/_vendor/hookshell/_shell.py": "950948efc2c7791a3db2589f6bcee286404bac14067c5e0cf3e447d1c327b9e1",
-    "src/defsort/_vendor/hookshell/_shellparse.py": "afb8ac434c28b4949fd3a6e0a954ce1eb6539922b9448adbf4af38e3a03728b4",
+    "src/defsort/_vendor/hookshell/_classify.py": "afd1d68e378ea66ea685ffaf458046090cddd23e799f7016d9d06603bc8800e0",
+    "src/defsort/_vendor/hookshell/_detector.py": "8e0c75b977eaac32ef6b111c421cf340cbf04488a8a2f048fc81a06e4509e424",
+    "src/defsort/_vendor/hookshell/_forms.py": "53e5a836cd51db9c577577c7cd67c097181ee340b33457e3868ece09eb4ab1ca",
+    "src/defsort/_vendor/hookshell/_grammar.py": "916b057ef388d487b7a4dca4029032ec0499b399c7c78c1e1e65008afaa98803",
+    "src/defsort/_vendor/hookshell/_shell.py": "493f1487af648d573f448fe95452fa5890264b52230b3da8c7cc3f81a137f5b1",
+    "src/defsort/_vendor/hookshell/_shellparse.py": "aeaf911427105ee67ce619082b482082ec9ebe64179afa2e2b64247855e9f273",
+    "src/defsort/_vendor/hookshell/_source.py": "bf1f6d709dada4db9b4ee4e9f9092e1ebf990845f70499c3dceb1e9a607f4006",
     "tests/hookshell/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "tests/hookshell/data/commit_classification.json": "afca44b4f6b583007aa22b430c100bfe4682f6072412e1787faec0ee06c4eb75",
-    "tests/hookshell/test_classify.py": "112f30ef3ff3823c7a11d67aba73ecdca585f2a63bb3f5d7762be022440038fe",
-    "tests/hookshell/test_detector.py": "81909fd37349f41843dae7df0168a7384ccc63d0274c01c10b0e44af6801efb0",
+    "tests/hookshell/data/commit_classification.json": "02d8618329b69895d73631a80c2ff06024e66f22e270ad15d8afa8c5832e641b",
+    "tests/hookshell/test_classify.py": "ceb84ace233da1daa53b5c02d66e9562333931734f8199bfb5699fe133d97d08",
+    "tests/hookshell/test_detector.py": "412d22e0eea72aeeda8d95fea3f17a02a6c9bf4cfe3305cabc90dc0cefe4ff91",
+    "tests/hookshell/test_forms.py": "93d9e92fa48b9afec636669804f39f26e0586e51dbb8f842a1d05964769ce3fe",
     "tests/hookshell/test_grammar.py": "4a1a84b6d997dd7161dbcb7ef402391985dd920808e6fc81b0c43afeee38fc8b",
     "tests/hookshell/test_shell.py": "775d3a4d54ee3db951ed3ef5f1beaadd51d1c57a9e81766cfcb03a0d93aa6f42",
-    "tests/hookshell/test_shellparse.py": "c056d853705f1c08e893cfe60a530936686021e0b9fe42df91b172259189c0d4"
+    "tests/hookshell/test_shellparse.py": "bb58c60950eacd59354f35974c68de54d782b7d3d260b43495a546aa8933a760",
+    "tests/hookshell/test_source.py": "73680896d6485f5da9e76263a2e18129eb130bf08bbcfd2d4084dc5c3cf72c57"
   }
 }

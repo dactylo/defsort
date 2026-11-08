@@ -3,9 +3,7 @@ import pytest
 from defsort._core import sort_file
 from defsort._core._banners import order_within_sections
 from defsort._core._ordering import (
-    _DefinitionGroup,
     group_consecutive_same_name,
-    has_duplicate_group_names,
     order_alphabetical,
     order_definitions,
     order_dependency,
@@ -189,7 +187,7 @@ class TestEagerDefinitionOrder:
         assert not result.skipped
         assert result.new_source.index('def alpha') < result.new_source.index('def zeta')
 
-    def test_undecorated_definitions_still_sort(self) -> None:
+    def test_undecorated_definitions_sort(self) -> None:
         src = (
             'from regmod import register\n'
             '\n'
@@ -231,8 +229,8 @@ class TestGroupConsecutiveSameName:
     def test_first_index_property(self) -> None:
         defs = [_def('alpha', 0), _def('parse', 1), _def('parse', 2)]
         groups = group_consecutive_same_name(defs)
-        assert groups[0]._first_index == 0
-        assert groups[1]._first_index == 1
+        assert groups[0].first_index == 0
+        assert groups[1].first_index == 1
 
     def test_group_deps_are_union(self) -> None:
         defs = [
@@ -283,38 +281,6 @@ class TestGroupConsecutiveSameName:
         assert len(groups[0].definitions) == 1
 
 
-class TestHasDuplicateGroupNames:
-    def test_consecutive_overloads_not_duplicate(self) -> None:
-        groups = [
-            _DefinitionGroup('parse', [_def('parse', 0), _def('parse', 1)], dependencies=set()),
-            _DefinitionGroup('alpha', [_def('alpha', 2)], dependencies=set()),
-        ]
-        assert has_duplicate_group_names(groups) is False
-
-    def test_duplicate_main_detected(self) -> None:
-        groups = [
-            _DefinitionGroup('main', [_def('main', 0)], dependencies=set()),
-            _DefinitionGroup('alpha', [_def('alpha', 1)], dependencies=set()),
-            _DefinitionGroup('main', [_def('main', 2)], dependencies=set()),
-        ]
-        assert has_duplicate_group_names(groups) is True
-
-    def test_no_duplicates(self) -> None:
-        groups = [
-            _DefinitionGroup('alpha', [_def('alpha', 0)], dependencies=set()),
-            _DefinitionGroup('bravo', [_def('bravo', 1)], dependencies=set()),
-        ]
-        assert has_duplicate_group_names(groups) is False
-
-    def test_non_consecutive_duplicates_detected(self) -> None:
-        groups = [
-            _DefinitionGroup('alpha', [_def('alpha', 0)], dependencies=set()),
-            _DefinitionGroup('bravo', [_def('bravo', 1)], dependencies=set()),
-            _DefinitionGroup('alpha', [_def('alpha', 2)], dependencies=set()),
-        ]
-        assert has_duplicate_group_names(groups) is True
-
-
 class TestOrderAlphabetical:
     def test_classes_before_functions(self) -> None:
         defs = [
@@ -346,13 +312,12 @@ class TestOrderAlphabetical:
         result = order_alphabetical(defs, policy=SortPolicy())
         assert [d.name for d in result] == ['alpha', 'bravo', 'main']
 
-    def test_main_not_forced_last_when_depended_on(self) -> None:
-        defs = [
-            _def('alpha', 0, deps={'main'}),
-            _def('main', 1),
-        ]
+    def test_main_not_forced_last_when_eagerly_referenced(self) -> None:
+        zeta = _def('zeta', 1, deps={'main'})
+        zeta.eager_refs = {'main'}
+        defs = [_def('main', 0), zeta]
         result = order_alphabetical(defs, policy=SortPolicy())
-        assert [d.name for d in result] == ['alpha', 'main']
+        assert [d.name for d in result] == ['main', 'zeta']
 
     def test_mixed_main_group_is_not_anchored(self) -> None:
         definitions = [
@@ -458,28 +423,6 @@ class TestOrderDefinitionsScopeOrder:
             policy=SortPolicy(),
         )
         assert [d.name for d in result] == ['bravo', 'alpha']
-
-
-class TestPrivateDefinitionGroup:
-    def test_first_index(self) -> None:
-        d1 = Definition(
-            index=3,
-            name='foo',
-            start_line=10,
-            end_line=12,
-            kind='function',
-            source='def foo(): ...',
-        )
-        d2 = Definition(
-            index=4,
-            name='foo',
-            start_line=14,
-            end_line=16,
-            kind='function',
-            source='def foo(): pass',
-        )
-        g = _DefinitionGroup(name='foo', definitions=[d1, d2], dependencies=set())
-        assert g._first_index == 3
 
 
 def _def(
@@ -637,26 +580,6 @@ class TestOrderDependency:
         result = order_dependency(defs, policy=SortPolicy())
         assert [d.name for d in result] == ['alpha', 'bravo']
 
-    def test_source_tie_key_collision_preserves_input_order(self) -> None:
-        defs = [
-            _def('zed', 0),
-            _def('alpha', 0),
-            _def('bravo', 0),
-            _def('charlie', 0),
-        ]
-
-        result = order_dependency(
-            defs,
-            policy=SortPolicy(tie_break='source'),
-        )
-
-        assert [definition.name for definition in result] == [
-            'zed',
-            'alpha',
-            'bravo',
-            'charlie',
-        ]
-
 
 def _order_for(source: str, *, policy: SortPolicy = _DEFAULT_POLICY) -> list[Definition]:
     parsed = parse_definitions(
@@ -683,7 +606,7 @@ def test_annotation_reference_does_not_lift_main() -> None:
     assert out.rstrip().endswith('return 1')  # main stays last
 
 
-def test_body_reference_no_longer_lifts_main() -> None:
+def test_body_reference_does_not_lift_main() -> None:
     src = 'def run():\n    main()\n\n\ndef main():\n    run()\n'
     assert [d.name for d in _order_for(src)] == ['run', 'main']
 

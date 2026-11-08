@@ -13,15 +13,11 @@ from defsort._core._analysis import (
     ENCODING_PATTERN,
     SAFE_TRAILING_PATTERN,
     _analyze_class_deps,
-    _analyze_signature_deps,
+    _analyze_eager_refs,
     _collect_all_names,
-    _get_import_names,
-    _get_with_names,
     _is_generator_function,
-    _names_from_target,
     analyze_annotation_refs,
     analyze_dependencies,
-    analyze_eager_refs,
     collect_body_refs,
     collect_name_references,
     extract_postamble_names,
@@ -34,6 +30,7 @@ from defsort._core._analysis import (
 )
 from defsort._core._parse import parse_definitions
 from defsort._types import EngineOptions, SortPolicy
+from tests._deep_input import DEEP_DEFINITIONS, deep_source_case
 from tests._helpers import execute_source
 
 if TYPE_CHECKING:
@@ -321,10 +318,7 @@ def a(self):
 
 class TestAggregateScore:
     def test_sums_within_section_discordant_and_total_pairs(self) -> None:
-        aggregate_score = getattr(analysis, 'aggregate_score', None)
-
-        assert callable(aggregate_score)
-        assert aggregate_score([[1, 0], [0, 1, 2]]) == 0.5
+        assert analysis.aggregate_score([[1, 0], [0, 1, 2]]) == 0.5
 
 
 class TestAnalyzeAnnotationRefs:
@@ -440,11 +434,11 @@ class TestAnalyzeDependenciesClass:
         assert deps == set()
 
     def test_async_method_signature_scanned(self) -> None:
-        src = 'class Foo:\n    async def m(self, x: Alpha): pass'
+        src = 'class Foo:\n    async def m(self, x: Alpha) -> Bravo: pass'
         node = _parse_stmt(src)
         assert isinstance(node, ast.ClassDef)
-        deps = analyze_dependencies(node, {'Alpha'})
-        assert deps == {'Alpha'}
+        deps = analyze_dependencies(node, {'Alpha', 'Bravo'})
+        assert deps == {'Alpha', 'Bravo'}
 
     def test_base_class_creates_dep(self) -> None:
         node = _parse_stmt('class Derived(Base): pass')
@@ -460,7 +454,7 @@ class TestAnalyzeDependenciesClass:
             '    value = helper()\n'
         )
         assert isinstance(node, ast.ClassDef)
-        eager_refs = analyze_eager_refs(node)
+        eager_refs = _analyze_eager_refs(node)
 
         deps = analyze_dependencies(node, {'Alpha', 'zeta_compute'}, eager_refs=eager_refs)
 
@@ -560,7 +554,7 @@ class TestAnalyzeDependenciesClass:
         )
         assert isinstance(node, ast.ClassDef)
         analyzed: list[ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef] = []
-        original_analyze_eager_refs = analysis.analyze_eager_refs
+        original_analyze_eager_refs = analysis._analyze_eager_refs
 
         def spy_analyze_eager_refs(
             definition: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
@@ -568,8 +562,8 @@ class TestAnalyzeDependenciesClass:
             analyzed.append(definition)
             return original_analyze_eager_refs(definition)
 
-        monkeypatch.setattr(analysis, 'analyze_eager_refs', spy_analyze_eager_refs)
-        eager_refs = analysis.analyze_eager_refs(node)
+        monkeypatch.setattr(analysis, '_analyze_eager_refs', spy_analyze_eager_refs)
+        eager_refs = analysis._analyze_eager_refs(node)
 
         deps = analysis.analyze_dependencies(
             node,
@@ -593,10 +587,10 @@ class TestAnalyzeDependenciesClass:
         deps = analyze_dependencies(node, {'Foo'})
         assert deps == set()
 
-    def test_uncalled_method_body_still_creates_no_dependency(self) -> None:
+    def test_uncalled_method_body_creates_no_dependency(self) -> None:
         node = _parse_stmt('class Alpha:\n    def helper():\n        return zeta_compute()\n')
         assert isinstance(node, ast.ClassDef)
-        eager_refs = analyze_eager_refs(node)
+        eager_refs = _analyze_eager_refs(node)
 
         assert (
             analyze_dependencies(
@@ -685,7 +679,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        refs = analyze_eager_refs(node)
+        refs = _analyze_eager_refs(node)
         assert 'compute' in refs
         assert 'deferred' not in refs
 
@@ -695,7 +689,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        assert analyze_eager_refs(node) == {'compute', 'helper'}
+        assert _analyze_eager_refs(node) == {'compute', 'helper'}
 
     @pytest.mark.parametrize(
         ('source', 'expected'),
@@ -728,7 +722,7 @@ class TestAnalyzeEagerRefs:
         node = _parse_stmt(source)
         assert isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
 
-        assert analyze_eager_refs(node) == expected
+        assert _analyze_eager_refs(node) == expected
 
     @pytest.mark.parametrize(
         'definition',
@@ -742,7 +736,7 @@ class TestAnalyzeEagerRefs:
         node = _parse_stmt(f'class Alpha:\n    {definition}\n    value = helper()\n')
         assert isinstance(node, ast.ClassDef)
 
-        assert 'compute' not in analyze_eager_refs(node)
+        assert 'compute' not in _analyze_eager_refs(node)
 
     def test_duplicate_sibling_names_union_called_body_reads(self) -> None:
         node = _parse_stmt(
@@ -755,7 +749,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        assert {'first', 'second'} <= analyze_eager_refs(node)
+        assert {'first', 'second'} <= _analyze_eager_refs(node)
 
     @pytest.mark.parametrize(
         'call_site',
@@ -772,7 +766,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        assert 'compute' not in analyze_eager_refs(node)
+        assert 'compute' not in _analyze_eager_refs(node)
 
     def test_nested_class_does_not_use_outer_sibling_map(self) -> None:
         node = _parse_stmt(
@@ -784,7 +778,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        assert 'leaked' not in analyze_eager_refs(node)
+        assert 'leaked' not in _analyze_eager_refs(node)
 
     def test_nested_class_uses_its_own_sibling_map(self) -> None:
         node = _parse_stmt(
@@ -796,7 +790,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        assert 'inner_dependency' in analyze_eager_refs(node)
+        assert 'inner_dependency' in _analyze_eager_refs(node)
 
     def test_nested_default_yield_makes_called_outer_function_lazy(self) -> None:
         node = _parse_stmt(
@@ -809,7 +803,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        assert analyze_eager_refs(node) == {'helper'}
+        assert _analyze_eager_refs(node) == {'helper'}
 
     def test_nested_yield_does_not_make_called_outer_function_a_generator(self) -> None:
         node = _parse_stmt(
@@ -822,7 +816,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        refs = analyze_eager_refs(node)
+        refs = _analyze_eager_refs(node)
         assert 'compute' in refs
         assert 'later' not in refs
 
@@ -836,7 +830,7 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        assert analyze_eager_refs(node) == {'compute', 'helper'}
+        assert _analyze_eager_refs(node) == {'compute', 'helper'}
 
     def test_staticmethod_body_is_eager_when_class_suite_calls_it(self) -> None:
         node = _parse_stmt(
@@ -848,13 +842,13 @@ class TestAnalyzeEagerRefs:
         )
         assert isinstance(node, ast.ClassDef)
 
-        assert {'compute', 'helper', 'staticmethod'} <= analyze_eager_refs(node)
+        assert {'compute', 'helper', 'staticmethod'} <= _analyze_eager_refs(node)
 
     def test_uncalled_sibling_body_stays_lazy(self) -> None:
         node = _parse_stmt('class Alpha:\n    def helper():\n        return compute()\n')
         assert isinstance(node, ast.ClassDef)
 
-        assert analyze_eager_refs(node) == set()
+        assert _analyze_eager_refs(node) == set()
 
     def test_uncalled_sibling_is_not_generator_classified(
         self,
@@ -884,80 +878,38 @@ class TestAnalyzeEagerRefs:
 
         monkeypatch.setattr(analysis, '_is_generator_function', spy_is_generator_function)
 
-        assert analysis.analyze_eager_refs(node) == {'called', 'compute'}
+        assert analysis._analyze_eager_refs(node) == {'called', 'compute'}
         assert classified == [functions['called']]
 
 
-class TestAnalyzeSignatureDeps:
+class TestAnalyzeMethodSignatureDependencies:
     def test_annotation_on_kwarg(self) -> None:
         src = 'def f(**kw: Alpha): pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'Alpha'}, exclude='Cls')
+        cls = _parse_stmt('class Cls:\n' + textwrap.indent(src, '    '))
+        assert isinstance(cls, ast.ClassDef)
+        refs = analyze_dependencies(cls, {'Alpha'})
         assert refs == {'Alpha'}
 
     def test_annotation_on_vararg(self) -> None:
         src = 'def f(*args: Alpha): pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'Alpha'}, exclude='Cls')
+        cls = _parse_stmt('class Cls:\n' + textwrap.indent(src, '    '))
+        assert isinstance(cls, ast.ClassDef)
+        refs = analyze_dependencies(cls, {'Alpha'})
         assert refs == {'Alpha'}
-
-    def test_async_def_signature_scanned(self) -> None:
-        src = 'async def m(self, x: Alpha) -> Bravo: pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.AsyncFunctionDef)
-        refs = _analyze_signature_deps(func, {'Alpha', 'Bravo'}, exclude='Cls')
-        assert refs == {'Alpha', 'Bravo'}
-
-    def test_body_not_scanned(self) -> None:
-        src = 'def m(self):\n    return helper()'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'helper'}, exclude='Cls')
-        assert refs == set()
-
-    def test_decorator_scanned(self) -> None:
-        src = '@wrapper\ndef m(self): pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'wrapper'}, exclude='Cls')
-        assert refs == {'wrapper'}
-
-    def test_default_arg_scanned(self) -> None:
-        src = 'def m(self, x=default_val): pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'default_val'}, exclude='Cls')
-        assert refs == {'default_val'}
 
     def test_excludes_self_name(self) -> None:
         src = '@Cls\ndef m(self): pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'Cls'}, exclude='Cls')
+        cls = _parse_stmt('class Cls:\n' + textwrap.indent(src, '    '))
+        assert isinstance(cls, ast.ClassDef)
+        refs = analyze_dependencies(cls, {'Cls'})
         assert refs == set()
 
     def test_kw_default_scanned(self) -> None:
         src = 'def m(self, *, x=default_val): pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'default_val'}, exclude='Cls')
+        cls = _parse_stmt('class Cls:\n' + textwrap.indent(src, '    '))
+        assert isinstance(cls, ast.ClassDef)
+        refs = analyze_dependencies(cls, {'default_val'})
         assert refs == {'default_val'}
-
-    def test_param_annotation_scanned(self) -> None:
-        src = 'def m(self, x: Alpha) -> Bravo: pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'Alpha', 'Bravo'}, exclude='Cls')
-        assert refs == {'Alpha', 'Bravo'}
-
-    def test_return_annotation_scanned(self) -> None:
-        src = 'def m(self) -> RetType: pass'
-        func = _parse_stmt(src)
-        assert isinstance(func, ast.FunctionDef)
-        refs = _analyze_signature_deps(func, {'RetType'}, exclude='Cls')
-        assert refs == {'RetType'}
 
 
 class TestBoundedEagerExpansion:
@@ -991,7 +943,7 @@ class TestBoundedEagerExpansion:
         )
         node = ast.parse(src).body[0]
         assert isinstance(node, ast.ClassDef)
-        refs = analyze_eager_refs(node)
+        refs = _analyze_eager_refs(node)
         assert 'zed' not in refs
 
     def test_consumed_sibling_generator_body_is_eager(self) -> None:
@@ -1024,7 +976,7 @@ class TestBoundedEagerExpansion:
         )
         node = ast.parse(src).body[1]
         assert isinstance(node, ast.ClassDef)
-        refs = analyze_eager_refs(node)
+        refs = _analyze_eager_refs(node)
         assert 'zed' not in refs
 
     def test_generator_expression_first_iterator_is_eager(self) -> None:
@@ -1033,7 +985,7 @@ class TestBoundedEagerExpansion:
         )
         node = ast.parse(src).body[0]
         assert isinstance(node, ast.ClassDef)
-        refs = analyze_eager_refs(node)
+        refs = _analyze_eager_refs(node)
         assert 'zed' in refs
 
     def test_later_comprehension_iterators_are_consumed(self) -> None:
@@ -1046,14 +998,14 @@ class TestBoundedEagerExpansion:
         )
         node = ast.parse(src).body[0]
         assert isinstance(node, ast.ClassDef)
-        refs = analyze_eager_refs(node)
+        refs = _analyze_eager_refs(node)
         assert 'zed' in refs
 
     def test_preamble_shadowed_consumer_stays_deferred(self) -> None:
         src = 'class alpha:\n    def gen():\n        yield from zed()\n\n    ITEMS = list(gen())\n'
         node = ast.parse(src).body[0]
         assert isinstance(node, ast.ClassDef)
-        refs = analyze_eager_refs(
+        refs = _analyze_eager_refs(
             node,
             module_shadowed=frozenset({'list'}),
         )
@@ -1070,7 +1022,7 @@ class TestBoundedEagerExpansion:
         )
         node = ast.parse(src).body[0]
         assert isinstance(node, ast.ClassDef)
-        refs = analyze_eager_refs(node)
+        refs = _analyze_eager_refs(node)
         assert 'zed' in refs
 
     def test_unconsumed_sibling_generator_stays_lazy(self) -> None:
@@ -1087,7 +1039,7 @@ class TestBoundedEagerExpansion:
         )
         node = ast.parse(src).body[0]
         assert isinstance(node, ast.ClassDef)
-        refs = analyze_eager_refs(node)
+        refs = _analyze_eager_refs(node)
         assert 'zed' not in refs
 
 
@@ -1242,7 +1194,7 @@ class TestClassCreationProtocols:
         trigger = ast.parse('class alpha(Base):\n    pass\n').body[0]
         assert isinstance(trigger, ast.ClassDef)
 
-        refs = analyze_eager_refs(trigger, module_classes={'Base': base})
+        refs = _analyze_eager_refs(trigger, module_classes={'Base': base})
 
         assert 'zed' in refs
 
@@ -1997,50 +1949,29 @@ class TestGetBoundNames:
 class TestGetImportNames:
     def test_aliased_import(self) -> None:
         node = _parse_stmt('import numpy as np')
-        assert isinstance(node, ast.Import)
-        assert _get_import_names(node) == ['np']
+        assert get_bound_names(node) == ['np']
 
     def test_dotted_import(self) -> None:
         node = _parse_stmt('import os.path')
-        assert isinstance(node, ast.Import)
-        assert _get_import_names(node) == ['os']
-
-    def test_from_import(self) -> None:
-        node = _parse_stmt('from os import path')
-        assert isinstance(node, ast.ImportFrom)
-        assert _get_import_names(node) == ['path']
+        assert get_bound_names(node) == ['os']
 
     def test_from_import_alias(self) -> None:
         node = _parse_stmt('from os import path as p')
-        assert isinstance(node, ast.ImportFrom)
-        assert _get_import_names(node) == ['p']
+        assert get_bound_names(node) == ['p']
 
     def test_multiple_from_imports(self) -> None:
         node = _parse_stmt('from os import path, getcwd')
-        assert isinstance(node, ast.ImportFrom)
-        assert _get_import_names(node) == ['path', 'getcwd']
-
-    def test_simple_import(self) -> None:
-        node = _parse_stmt('import os')
-        assert isinstance(node, ast.Import)
-        assert _get_import_names(node) == ['os']
+        assert get_bound_names(node) == ['path', 'getcwd']
 
 
 class TestGetWithNames:
     def test_multiple_items(self) -> None:
         node = _parse_stmt('with open("a") as a, open("b") as b: pass')
-        assert isinstance(node, ast.With)
-        assert _get_with_names(node) == ['a', 'b']
+        assert get_bound_names(node) == ['a', 'b']
 
     def test_no_as_clause(self) -> None:
         node = _parse_stmt('with open("f"): pass')
-        assert isinstance(node, ast.With)
-        assert _get_with_names(node) == []
-
-    def test_simple_with(self) -> None:
-        node = _parse_stmt('with open("f") as fh: pass')
-        assert isinstance(node, ast.With)
-        assert _get_with_names(node) == ['fh']
+        assert get_bound_names(node) == []
 
 
 class TestHasFutureAnnotationsImport:
@@ -2154,35 +2085,25 @@ class TestModuleContainsAnnotations:
 class TestNamesFromTarget:
     def test_list_unpack(self) -> None:
         node = _parse_stmt('[a, b] = [1, 2]')
-        assert isinstance(node, ast.Assign)
-        assert _names_from_target(node.targets[0]) == ['a', 'b']
+        assert get_bound_names(node) == ['a', 'b']
 
     def test_nested_unpack(self) -> None:
         node = _parse_stmt('a, (b, c) = 1, (2, 3)')
-        assert isinstance(node, ast.Assign)
-        assert _names_from_target(node.targets[0]) == ['a', 'b', 'c']
+        assert get_bound_names(node) == ['a', 'b', 'c']
 
     def test_non_name_target(self) -> None:
         node = _parse_stmt('obj.attr = 1')
-        assert isinstance(node, ast.Assign)
-        assert _names_from_target(node.targets[0]) == []
-
-    def test_simple_name(self) -> None:
-        node = _parse_stmt('x = 1')
-        assert isinstance(node, ast.Assign)
-        assert _names_from_target(node.targets[0]) == ['x']
+        assert get_bound_names(node) == []
 
     def test_starred(self) -> None:
         node = _parse_stmt('first, *rest = items')
-        assert isinstance(node, ast.Assign)
-        result = _names_from_target(node.targets[0])
+        result = get_bound_names(node)
         assert 'first' in result
         assert 'rest' in result
 
     def test_tuple_unpack(self) -> None:
         node = _parse_stmt('a, b = 1, 2')
-        assert isinstance(node, ast.Assign)
-        assert _names_from_target(node.targets[0]) == ['a', 'b']
+        assert get_bound_names(node) == ['a', 'b']
 
 
 class TestSafeTrailingPattern:
@@ -2239,3 +2160,12 @@ class TestTypeParamDefaults:
 
 def _parse_stmt(code: str) -> ast.AST:
     return ast.parse(code).body[0]
+
+
+@pytest.mark.parametrize('kind', DEEP_DEFINITIONS)
+def test_deep_expression_analysis(kind: str) -> None:
+    source, _expected = deep_source_case(kind)
+    node = ast.parse(source).body[-1]
+    assert isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    assert _analyze_eager_refs(node) == ({'a', 'decorate'} if kind == 'decorator' else {'a'})
+    assert analyze_annotation_refs(node) == set()

@@ -8,6 +8,7 @@ from defsort._core._analysis import (
     has_future_annotations_import,
     module_contains_annotations,
 )
+from defsort._core._syntax import parse_source
 from defsort._source import (
     is_layout_blank,
     join_physical,
@@ -112,11 +113,7 @@ def _node_owns_span(lines: list[str], node: ast.ImportFrom) -> bool:
 def _remove_future_annotations_import(source: str) -> str:
     """Remove the first exclusively owned future annotations import."""
     try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return source
-    try:
-        compile(tree, '<unknown>', 'exec')
+        tree = parse_source(source, check=True)
     except SyntaxError:
         return source
 
@@ -156,7 +153,7 @@ def ensure_future_annotations(source: str) -> str:
 
     Insertion respects (in order): shebang lines, PEP 263 encoding cookies, the
     AST-owned module docstring span, and regular comments. If the import
-    already exists or the source cannot be parsed, the source is returned
+    already exists or parsing raises `SyntaxError`, the source is returned
     unchanged.
 
     Args:
@@ -165,9 +162,12 @@ def ensure_future_annotations(source: str) -> str:
     Returns:
         Source with the future import inserted, or the unchanged source when
         insertion is unnecessary or unsafe.
+
+    Raises:
+        ValueError: If source contains a lone Unicode surrogate.
     """
     try:
-        tree = ast.parse(source)
+        tree = parse_source(source)
     except SyntaxError:
         return source
     if has_future_annotations_import(source, _tree=tree):
@@ -209,7 +209,7 @@ def remove_unused_future_annotations(source: str, *, _tree: ast.Module | None = 
     occurrences.
     The first-only editor preserves ineligible spans and surrounding source;
     repeated removal reaches a fixed point in one automatic cleanup operation.
-    Invalid source is returned unchanged.
+    Source that raises `SyntaxError` is returned unchanged.
 
     Args:
         source: The Python source code.
@@ -218,10 +218,13 @@ def remove_unused_future_annotations(source: str, *, _tree: ast.Module | None = 
     Returns:
         Source with all eligible unused import spans removed, or the unchanged
         source when cleanup is unnecessary or unsafe.
+
+    Raises:
+        ValueError: If source parsing encounters a lone Unicode surrogate.
     """
     if _tree is None:
         try:
-            _tree = ast.parse(source)
+            _tree = parse_source(source)
         except SyntaxError:
             return source
     if not can_remove_future_annotations(_tree):

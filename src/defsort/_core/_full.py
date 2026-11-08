@@ -28,15 +28,15 @@ from defsort._core._parse import (
 )
 from defsort._core._reassemble import reassemble_source
 from defsort._core._safety import (
+    SafetyVerdict,
     check_sort_safety,
     has_anchored_main_annotation_hazard,
     has_annotation_order_hazard,
     has_sectioned_duplicates,
 )
+from defsort._core._syntax import parse_source
 from defsort._types import (
     BannerConstraint,
-    Blocker,
-    BlockingCode,
     Definition,
     EngineOptions,
     MethodSortInfo,
@@ -67,7 +67,7 @@ def _check_full_safety(  # noqa: PLR0913
     is_noop: bool,
     options: EngineOptions,
     policy: SortPolicy,
-) -> tuple[bool, Blocker | None, list[BlockingCode]]:
+) -> SafetyVerdict:
     """Run full-sort safety checks, including barrier-local grouping."""
     result = check_sort_safety(
         definitions,
@@ -82,14 +82,13 @@ def _check_full_safety(  # noqa: PLR0913
         dynamic_all=dynamic_all,
         evaluation_order=policy.evaluation_order,
     )
-    skipped, _, _ = result
     if (
-        not skipped
+        result.blocker is None
         and policy.definition_order != 'none'
         and policy.banners == 'barriers'
         and has_sectioned_duplicates(definitions)
     ):
-        return True, 'duplicates', []
+        return SafetyVerdict('duplicates', blocker_message('duplicates'), [])
     return result
 
 
@@ -193,7 +192,7 @@ def _sort_file(source: str, tree: ast.Module, *, options: EngineOptions) -> Sort
     policy = options.policy
     method_result = sort_file_methods(source, tree, policy=policy)
     candidate_source = method_result.candidate_source
-    candidate_tree = tree if candidate_source == source else ast.parse(candidate_source)
+    candidate_tree = tree if candidate_source == source else parse_source(candidate_source)
     parsed = parse_definitions(
         candidate_source,
         banners=policy.banners,
@@ -275,26 +274,26 @@ def _sort_file(source: str, tree: ast.Module, *, options: EngineOptions) -> Sort
         and not method_source_changed
     )
 
-    skipped, blocker, blocking_code = _check_full_safety(
+    verdict = _check_full_safety(
         definitions,
         new_order,
         method_sorts,
         postamble_names,
         has_future,
         dynamic_all=postamble_has_dynamic_all(postamble),
-        is_noop=no_source_change and not class_blockers,
+        is_noop=no_source_change,
         options=options,
         policy=policy,
     )
-    if skipped:
+    if verdict.blocker is not None:
         skipped_result = SortResult(
             original_source=source,
             new_source=source,
             original_order=definitions,
             new_order=new_order,
-            warning=blocker_message(blocker) if blocker else None,
-            blocking_code=blocking_code,
-            blocker=blocker,
+            warning=verdict.message,
+            blocking_code=verdict.blocking_code,
+            blocker=verdict.blocker,
             skipped=True,
             method_sorts=method_sorts,
             total_methods=total_methods,
@@ -376,7 +375,8 @@ def sort_file(
         TypeError: If the configured banner pattern is neither a string nor
             `None`.
         ValueError: If the configured banner pattern does not compile or uses
-            unsupported syntax. Compilation failures chain `re.error`.
+            unsupported syntax, or source parsing encounters a lone Unicode
+            surrogate. Pattern compilation failures chain `re.error`.
     """
     policy = options.policy
     validate_banner_pattern(policy.banner_pattern)
@@ -385,7 +385,7 @@ def sort_file(
         tree = _tree
     else:
         try:
-            tree = ast.parse(source)
+            tree = parse_source(source)
         except SyntaxError:
             return make_unchanged_result(source)
 

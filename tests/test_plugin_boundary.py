@@ -1,7 +1,7 @@
 import ast
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _imports(path: Path) -> list[str]:
@@ -16,18 +16,21 @@ def _imports(path: Path) -> list[str]:
 
 
 def test_core_does_not_import_bundled_plugins() -> None:
-    for path in (ROOT / 'src' / 'defsort').rglob('*.py'):
+    for path in (_ROOT / 'src' / 'defsort').rglob('*.py'):
         assert not any(
             name == 'plugins' or name.startswith('plugins.') for name in _imports(path)
         ), path
 
 
 def test_plugins_use_only_the_public_hook_contract() -> None:
-    for package in (ROOT / 'plugins').glob('*/_defsort'):
+    for package in (_ROOT / 'plugins').glob('*/_defsort'):
         for path in package.rglob('*.py'):
             for name in _imports(path):
                 if name == 'defsort' or name.startswith('defsort.'):
-                    assert name == 'defsort.hooks', (path, name)
+                    assert name in {
+                        'defsort.hooks',
+                        'defsort._vendor.hookfront',
+                    } or name.startswith('defsort._vendor.hookfront.'), (path, name)
                 if name == 'plugins' or name.startswith('plugins.'):
                     assert name.startswith(f'plugins.{package.parent.name}._defsort'), (
                         path,

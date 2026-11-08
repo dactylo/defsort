@@ -6,6 +6,8 @@ from collections.abc import Hashable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
+from defsort._core._syntax import parse_source
+
 BLOCKING_CODE_PREVIEW_LEN = 60
 
 _BodyRefScopeKind = Literal[
@@ -91,15 +93,18 @@ class _EagerRefCollector:
     expanded: set[int] | None = None
     sibling_bound: set[str] | None = None
     shadowed_names: frozenset[str] = frozenset()
+    has_global: bool = False
 
-    def _collect_class(self, current: ast.ClassDef) -> set[str]:
-        """Collect class outer parts and suite reads in the right contexts."""
-        outer_roots: list[ast.AST] = [
+    def _collect_class(
+        self, current: ast.ClassDef
+    ) -> Iterator[tuple['_EagerRefCollector', ast.AST]]:
+        """Yield class outer parts and suite reads in their evaluation contexts."""
+        for root in (
             *current.decorator_list,
             *current.bases,
             *(keyword.value for keyword in current.keywords),
-        ]
-        refs = {name for root in outer_roots for name in self._collect(root)}
+        ):
+            yield self, root
         sibling_lists: dict[str, list[ast.FunctionDef]] = {}
         for statement in current.body:
             if isinstance(statement, ast.FunctionDef):
@@ -113,16 +118,17 @@ class _EagerRefCollector:
             shadowed_names=self.shadowed_names,
         )
         for statement in current.body:
-            refs.update(class_collector._collect(statement))
+            yield class_collector, statement
+            # Resume only after this statement's entire subtree was visited.
             if class_collector.sibling_bound is not None:
                 class_collector.sibling_bound.update(get_bound_names(statement))
-        return refs
 
-    def _expand_sibling(self, name: str, *, consume_generators: bool) -> set[str]:
-        """Expand one directly referenced sibling function body, once."""
+    def _expand_sibling(
+        self, name: str, *, consume_generators: bool
+    ) -> Iterator[tuple['_EagerRefCollector', ast.AST]]:
+        """Yield one directly referenced sibling function body, once."""
         if self.sibling_functions is None or self.expanded is None:
-            return set()
-        refs: set[str] = set()
+            return
         for function in self.sibling_functions.get(name, ()):
             function_id = id(function)
             if function_id in self.expanded:
@@ -132,30 +138,34 @@ class _EagerRefCollector:
             self.expanded.add(function_id)
             function_collector = _EagerRefCollector()
             for statement in function.body:
-                refs.update(function_collector._collect(statement))
-        return refs
+                yield function_collector, statement
 
-    def _collect_consumed_iterators(self, current: ast.AST) -> set[str]:
-        """Collect sibling generators consumed directly by iteration syntax."""
+    def _collect_consumed_iterators(
+        self, current: ast.AST
+    ) -> Iterator[tuple['_EagerRefCollector', ast.AST]]:
+        """Yield sibling generators consumed directly by iteration syntax."""
         if (
             isinstance(current, ast.For)
             and isinstance(current.iter, ast.Call)
             and isinstance(current.iter.func, ast.Name)
         ):
-            return self._expand_sibling(current.iter.func.id, consume_generators=True)
-        if not isinstance(current, (ast.DictComp, ast.ListComp, ast.SetComp)):
-            return set()
-        refs: set[str] = set()
-        for generator in current.generators:
-            if isinstance(generator.iter, ast.Call) and isinstance(generator.iter.func, ast.Name):
-                refs.update(self._expand_sibling(generator.iter.func.id, consume_generators=True))
-        return refs
+            yield from self._expand_sibling(current.iter.func.id, consume_generators=True)
+        elif isinstance(current, (ast.DictComp, ast.ListComp, ast.SetComp)):
+            for generator in current.generators:
+                if isinstance(generator.iter, ast.Call) and isinstance(
+                    generator.iter.func, ast.Name
+                ):
+                    yield from self._expand_sibling(
+                        generator.iter.func.id, consume_generators=True
+                    )
 
-    def _collect_expanded_call(self, current: ast.AST) -> set[str]:
-        """Collect one level of directly called or consumed sibling bodies."""
+    def _collect_expanded_call(
+        self, current: ast.AST
+    ) -> Iterator[tuple['_EagerRefCollector', ast.AST]]:
+        """Yield one level of directly called or consumed sibling bodies."""
         if not isinstance(current, ast.Call) or not isinstance(current.func, ast.Name):
-            return set()
-        refs = self._expand_sibling(current.func.id, consume_generators=False)
+            return
+        yield from self._expand_sibling(current.func.id, consume_generators=False)
         if (
             self.sibling_functions is not None
             and current.func.id in _EAGER_GENERATOR_CONSUMERS
@@ -164,39 +174,59 @@ class _EagerRefCollector:
         ):
             for argument in current.args:
                 if isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name):
-                    refs.update(self._expand_sibling(argument.func.id, consume_generators=True))
-        return refs
+                    yield from self._expand_sibling(argument.func.id, consume_generators=True)
 
-    def _collect(self, current: ast.AST) -> set[str]:
-        """Collect eager references from an AST subtree."""
+    def _iter_eager_parts(
+        self, current: ast.AST
+    ) -> Iterator[tuple['_EagerRefCollector', ast.AST]]:
+        """Yield children and expansions without descending into their subtrees."""
         if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
             roots: list[ast.AST] = [*current.decorator_list, *current.args.defaults]
             roots.extend(default for default in current.args.kw_defaults if default is not None)
-            refs = {name for root in roots for name in self._collect(root)}
+            for root in roots:
+                yield self, root
             for decorator in current.decorator_list:
                 if isinstance(decorator, ast.Name):
-                    refs.update(self._expand_sibling(decorator.id, consume_generators=False))
-            return refs
+                    yield from self._expand_sibling(decorator.id, consume_generators=False)
+            return
         if isinstance(current, ast.ClassDef):
-            return self._collect_class(current)
+            yield from self._collect_class(current)
+            return
         if isinstance(current, ast.AnnAssign):
-            roots = [current.target]
+            yield self, current.target
             if current.value is not None:
-                roots.append(current.value)
-            return {name for root in roots for name in self._collect(root)}
+                yield self, current.value
+            return
         if isinstance(current, ast.TypeAlias):
-            return set()
-        if isinstance(current, ast.Name):
-            return {current.id} if isinstance(current.ctx, ast.Load) else set()
+            return
 
         children = (
             (current.generators[0].iter,)
             if isinstance(current, ast.GeneratorExp)
             else iter_child_nodes(current)
         )
-        refs = {name for child in children for name in self._collect(child)}
-        refs.update(self._collect_consumed_iterators(current))
-        refs.update(self._collect_expanded_call(current))
+        for child in children:
+            yield self, child
+        yield from self._collect_consumed_iterators(current)
+        yield from self._collect_expanded_call(current)
+
+    def collect(self, current: ast.AST) -> set[str]:
+        """Collect eager references and retain whether a global declaration is reached."""
+        refs: set[str] = set()
+        stack: list[Iterator[tuple[_EagerRefCollector, ast.AST]]] = [iter(((self, current),))]
+        while stack:
+            item = next(stack[-1], None)
+            if item is None:
+                stack.pop()
+                continue
+            collector, node = item
+            if isinstance(node, ast.Global):
+                self.has_global = True
+            if isinstance(node, ast.Name):
+                if isinstance(node.ctx, ast.Load):
+                    refs.add(node.id)
+                continue
+            stack.append(collector._iter_eager_parts(node))  # noqa: SLF001
         return refs
 
 
@@ -259,17 +289,6 @@ def _body_ref_type_params(
 ) -> tuple[ast.AST, ...]:
     """Return type-parameter nodes from a definition."""
     return tuple(node.type_params)
-
-
-def _collect_eager_refs(
-    node: ast.AST,
-    *,
-    module_shadowed: frozenset[str] = frozenset(),
-) -> set[str]:
-    """Collect eager reads, including bounded class-local call expansion."""
-    return _EagerRefCollector(shadowed_names=module_shadowed)._collect(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        node
-    )
 
 
 def _count_inversions(values: list[int]) -> int:
@@ -531,7 +550,7 @@ def aggregate_score(section_ranks: Iterable[list[int]]) -> float | None:
 
 
 def compute_ranks(actual: Iterable[int], target: Iterable[int]) -> list[int]:
-    """Build rank array for kendall_tau comparison.
+    """Build rank array for `kendall_tau` comparison.
 
     Maps actual ordering into ranks relative to target ordering.
     Each element in actual gets assigned its position in target.
@@ -629,7 +648,7 @@ def get_node_end_line(node: ast.stmt) -> int:
 
 
 def is_constant_name(name: str) -> bool:
-    """Check if a name follows UPPER_SNAKE_CASE convention.
+    """Check if a name follows `UPPER_SNAKE_CASE` convention.
 
     Args:
         name: Identifier to check.
@@ -657,11 +676,11 @@ def is_overload_decorated(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
 
 
 def iter_child_nodes(node: ast.AST) -> Iterator[ast.AST]:
-    """Yield direct child AST nodes by inspecting node.__dict__.
+    """Yield direct child AST nodes by inspecting `node.__dict__`.
 
     This is CPython-specific traversal used by defsort to match the
     implementation behavior of a file's AST as Python sees it.  See
-    docs/platform.md for rationale.
+    `docs/platform.md` for rationale.
 
     Args:
         node: AST node whose direct children should be visited.
@@ -705,23 +724,19 @@ def _collect_func_annotation_refs(
 
 def _collect_class_suite_annotation_refs(node: ast.AST) -> set[str]:
     """Collect annotations reachable in an executable class suite."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return _collect_func_annotation_refs(node)
-    if isinstance(node, ast.ClassDef):
-        return {
-            name
-            for statement in node.body
-            for name in _collect_class_suite_annotation_refs(statement)
-        }
-    if isinstance(node, ast.AnnAssign):
-        return _collect_all_names(node.annotation)
-    if isinstance(node, ast.TypeAlias):
-        return set()
-    return {
-        name
-        for child in iter_child_nodes(node)
-        for name in _collect_class_suite_annotation_refs(child)
-    }
+    refs: set[str] = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            refs.update(_collect_func_annotation_refs(current))
+        elif isinstance(current, ast.ClassDef):
+            stack.extend(current.body)
+        elif isinstance(current, ast.AnnAssign):
+            refs.update(_collect_all_names(current.annotation))
+        elif not isinstance(current, ast.TypeAlias):
+            stack.extend(iter_child_nodes(current))
+    return refs
 
 
 def _collect_class_annotation_refs(cls: ast.ClassDef) -> set[str]:
@@ -729,6 +744,36 @@ def _collect_class_annotation_refs(cls: ast.ClassDef) -> set[str]:
     return {
         name for statement in cls.body for name in _collect_class_suite_annotation_refs(statement)
     }
+
+
+def _header_has_walrus(
+    node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Find header walruses without entering function, class, or lambda bodies."""
+    roots: list[ast.AST] = list(node.decorator_list)
+    if isinstance(node, ast.ClassDef):
+        roots.extend(node.bases)
+        roots.extend(keyword.value for keyword in node.keywords)
+    else:
+        roots.extend(node.args.defaults)
+        roots.extend(default for default in node.args.kw_defaults if default is not None)
+        roots.extend(
+            argument.annotation
+            for argument in _body_ref_arguments(node.args)
+            if argument.annotation is not None
+        )
+        if node.returns is not None:
+            roots.append(node.returns)
+    while roots:
+        current = roots.pop()
+        if isinstance(current, ast.NamedExpr):
+            return True
+        if isinstance(current, ast.Lambda):
+            roots.extend(current.args.defaults)
+            roots.extend(default for default in current.args.kw_defaults if default is not None)
+        else:
+            roots.extend(iter_child_nodes(current))
+    return False
 
 
 def _is_generator_function(func: ast.FunctionDef) -> bool:
@@ -828,10 +873,10 @@ def _class_hook_body_refs(
     hook_name: str,
     *,
     module_shadowed: frozenset[str],
-) -> set[str]:
-    """Collect eager reads from one directly defined class hook body."""
+) -> tuple[set[str], bool]:
+    """Collect eager reads and global declarations from one class hook body."""
     if cls is None:
-        return set()
+        return set(), False
     hook: ast.FunctionDef | None = None
     for statement in cls.body:
         if (
@@ -849,17 +894,11 @@ def _class_hook_body_refs(
             else None
         )
     if hook is None:
-        return set()
+        return set(), False
     local_names, _, nonlocal_names = _body_ref_scope_bindings(hook)
     collector = _EagerRefCollector(shadowed_names=module_shadowed | local_names | nonlocal_names)
-    refs = {
-        name
-        for statement in hook.body
-        for name in collector._collect(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            statement
-        )
-    }
-    return refs - local_names
+    refs = {name for statement in hook.body for name in collector.collect(statement)}
+    return refs - local_names, collector.has_global
 
 
 def _class_protocol_refs(
@@ -867,27 +906,28 @@ def _class_protocol_refs(
     module_classes: Mapping[str, ast.ClassDef],
     *,
     module_shadowed: frozenset[str],
-) -> set[str]:
-    """Collect eager reads from supported local class-creation protocols."""
+) -> tuple[set[str], bool]:
+    """Collect eager reads and global declarations from local class protocols."""
     refs: set[str] = set()
+    has_global = False
     for base in cls.bases:
         if isinstance(base, ast.Name):
-            refs.update(
-                _class_hook_body_refs(
-                    module_classes.get(base.id),
-                    '__init_subclass__',
-                    module_shadowed=module_shadowed,
-                )
+            hook_refs, hook_has_global = _class_hook_body_refs(
+                module_classes.get(base.id),
+                '__init_subclass__',
+                module_shadowed=module_shadowed,
             )
+            refs.update(hook_refs)
+            has_global |= hook_has_global
     for keyword in cls.keywords:
         if keyword.arg == 'metaclass' and isinstance(keyword.value, ast.Name):
-            refs.update(
-                _class_hook_body_refs(
-                    module_classes.get(keyword.value.id),
-                    '__new__',
-                    module_shadowed=module_shadowed,
-                )
+            hook_refs, hook_has_global = _class_hook_body_refs(
+                module_classes.get(keyword.value.id),
+                '__new__',
+                module_shadowed=module_shadowed,
             )
+            refs.update(hook_refs)
+            has_global |= hook_has_global
     for statement in cls.body:
         value: ast.expr | None = None
         if isinstance(statement, (ast.AnnAssign, ast.Assign)):
@@ -897,14 +937,14 @@ def _class_protocol_refs(
             and isinstance(value.func, ast.Name)
             and value.func.id in module_classes
         ):
-            refs.update(
-                _class_hook_body_refs(
-                    module_classes[value.func.id],
-                    '__set_name__',
-                    module_shadowed=module_shadowed,
-                )
+            hook_refs, hook_has_global = _class_hook_body_refs(
+                module_classes[value.func.id],
+                '__set_name__',
+                module_shadowed=module_shadowed,
             )
-    return refs
+            refs.update(hook_refs)
+            has_global |= hook_has_global
+    return refs, has_global
 
 
 def _scan_body_ref_nodes(
@@ -958,13 +998,13 @@ def analyze_annotation_refs(
     return _collect_class_annotation_refs(node)
 
 
-def analyze_eager_refs(
+def analyze_eager_effects(
     node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
     *,
     module_classes: Mapping[str, ast.ClassDef] | None = None,
     module_shadowed: frozenset[str] = frozenset(),
-) -> set[str]:
-    """Collect direct name reads from definition-time expressions.
+) -> tuple[set[str], bool]:
+    """Collect definition-time reads and whether creation can bind other names.
 
     Args:
         node: Definition whose eager expressions should be scanned.
@@ -972,15 +1012,33 @@ def analyze_eager_refs(
         module_shadowed: Names already bound in the containing module.
 
     Returns:
-        Names loaded while Python creates the definition.
+        Names loaded during creation and whether header walruses or globals
+        reached by the same traversal require keeping the definition in place.
     """
-    refs = _collect_eager_refs(node, module_shadowed=module_shadowed)
+    collector = _EagerRefCollector(shadowed_names=module_shadowed)
+    refs = collector.collect(node)
+    binds_other_names = _header_has_walrus(node) or collector.has_global
     if isinstance(node, ast.ClassDef) and module_classes:
-        refs |= _class_protocol_refs(
+        protocol_refs, protocol_has_global = _class_protocol_refs(
             node,
             module_classes,
             module_shadowed=module_shadowed,
         )
+        refs |= protocol_refs
+        binds_other_names |= protocol_has_global
+    return refs, binds_other_names
+
+
+def _analyze_eager_refs(
+    node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    module_classes: Mapping[str, ast.ClassDef] | None = None,
+    module_shadowed: frozenset[str] = frozenset(),
+) -> set[str]:
+    """Collect direct name reads from definition-time expressions."""
+    refs, _ = analyze_eager_effects(
+        node, module_classes=module_classes, module_shadowed=module_shadowed
+    )
     return refs
 
 
@@ -1013,7 +1071,7 @@ def collect_const_def_lines(
 
     Args:
         tree: The full source AST.
-        candidates: UPPER_SNAKE_CASE names to look for.
+        candidates: `UPPER_SNAKE_CASE` names to look for.
 
     Returns:
         Candidate names mapped to their assignment lines.
@@ -1152,12 +1210,15 @@ def has_future_annotations_import(source: str, *, _tree: ast.Module | None = Non
     Returns:
         `True` when the future import is present. Returns `False` when it is
         absent or parsing the source raises `SyntaxError`.
+
+    Raises:
+        ValueError: If source parsing encounters a lone Unicode surrogate.
     """
     if _tree is not None:
         tree = _tree
     else:
         try:
-            tree = ast.parse(source)
+            tree = parse_source(source)
         except SyntaxError:
             return False
     return any(
@@ -1195,7 +1256,7 @@ def analyze_dependencies(
     if not isinstance(node, ast.ClassDef):
         return collect_name_references(node, all_names, node.name)
     deps = _analyze_class_deps(node, all_names, node.name) - (preamble_shadowed or set())
-    class_eager_refs = analyze_eager_refs(node) if eager_refs is None else eager_refs
+    class_eager_refs = _analyze_eager_refs(node) if eager_refs is None else eager_refs
     deps.update(((class_eager_refs - (preamble_shadowed or set())) & all_names) - {node.name})
     return deps
 
@@ -1203,8 +1264,8 @@ def analyze_dependencies(
 def kendall_tau(ranks: list[int]) -> float:
     """Compute Kendall tau-a rank correlation against the natural order.
 
-    Compares the given permutation against [0, 1, 2, ..., n-1].
-    Returns 1.0 for identical ordering, -1.0 for fully reversed.
+    Compares the given permutation against `[0, 1, 2, ..., n-1]`.
+    Returns `1.0` for identical ordering, `-1.0` for fully reversed.
 
     Args:
         ranks: A permutation of integers representing the actual positions
@@ -1220,6 +1281,36 @@ def kendall_tau(ranks: list[int]) -> float:
     discordant = _count_inversions(ranks)
     concordant = total - discordant
     return (concordant - discordant) / total
+
+
+def method_binds_other_names(
+    method: ast.FunctionDef | ast.AsyncFunctionDef, class_node: ast.ClassDef
+) -> bool:
+    """Detect header writes or globals reached while creating a class method.
+
+    Args:
+        method: Method statement belonging to `class_node`.
+        class_node: Class supplying sibling functions and earlier bindings.
+
+    Returns:
+        Whether the method must keep its order relative to every other method.
+    """
+    sibling_lists: dict[str, list[ast.FunctionDef]] = {}
+    for statement in class_node.body:
+        if isinstance(statement, ast.FunctionDef):
+            sibling_lists.setdefault(statement.name, []).append(statement)
+    bound: set[str] = set()
+    for statement in class_node.body:
+        if statement is method:
+            break
+        bound.update(get_bound_names(statement))
+    collector = _EagerRefCollector(
+        sibling_functions={name: tuple(functions) for name, functions in sibling_lists.items()},
+        expanded=set(),
+        sibling_bound=bound,
+    )
+    collector.collect(method)
+    return _header_has_walrus(method) or collector.has_global
 
 
 def module_contains_annotations(tree: ast.Module) -> bool:

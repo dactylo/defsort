@@ -1,5 +1,4 @@
 import ast
-from collections.abc import Sequence
 from types import FunctionType
 from typing import Any, cast
 
@@ -8,7 +7,6 @@ import pytest
 import defsort._core._incremental as incremental
 import defsort._core._methods as methods_module
 from defsort._core._api import sort_file, sort_file_incremental
-from defsort._core._banners import collect_banner_constraints
 from defsort._core._incremental import (
     _HookSortResult,
     _IncrementalSortResult,
@@ -17,9 +15,7 @@ from defsort._core._incremental import (
     sort_incremental_impl,
 )
 from defsort._core._methods import (
-    collect_method_coordinates,
     parse_class_methods,
-    per_class_incremental_sort,
 )
 from defsort._core._parse import parse_definitions
 from defsort._types import (
@@ -27,19 +23,17 @@ from defsort._types import (
     BannerMode,
     ClassBlocker,
     ClassSlice,
-    Definition,
     DefsortConfig,
     EngineOptions,
     HeldItem,
-    MethodDefinition,
     SectionBoundary,
     SortPolicy,
     SortResult,
     SortScopeOrder,
     sort_policy_from_config,
 )
-from tests._helpers import execute_source
-from tests.core._helpers import _SRC_BASELINE, _SRC_WITH_NEW
+from tests._helpers import DYNAMIC_ALL_WARNING, execute_source, incremental_gate_case
+from tests.core._helpers import SRC_BASELINE, SRC_WITH_NEW
 
 _DEFAULT_SORT_POLICY = SortPolicy()
 
@@ -116,6 +110,30 @@ class TestClassLocalBlockerOwnership:
             assert result.new_source.startswith(blocked_class)
             assert [b.class_name for b in result.class_blockers] == ['C']
             assert result.class_blockers[0].blocker == 'interstitial'
+
+    @pytest.mark.parametrize('repeated_name', [False, True])
+    def test_blocker_order_survives_top_level_movement(self, *, repeated_name: bool) -> None:
+        first = 'class B:\n    def z(self): pass\n    x = 1\n    def a(self): pass\n'
+        second = 'class B:\n    def z(self): pass\n    def a(self): pass\n    def z(self): pass\n'
+        added = first.replace('class B:', 'class A:')
+        baseline = first.removesuffix('    def a(self): pass\n')
+        source = first + ('\n\n' + second if repeated_name else '') + '\n\n' + added
+        policy = SortPolicy(definition_order='alphabetical', method_order='alphabetical')
+
+        result = sort_incremental_detailed(source, baseline, policy=policy)
+
+        assert result.blocker is None
+        assert result.new_source is not None
+        assert result.new_source.index('class A:') < result.new_source.index('class B:')
+        assert first in result.new_source
+        assert added in result.new_source
+        if repeated_name:
+            assert second in result.new_source
+        expected = [('B', 1, 'interstitial')]
+        if repeated_name:
+            expected.append(('B', 2, 'duplicates'))
+        expected.append(('A', 1, 'interstitial'))
+        assert [(b.class_name, b.occurrence, b.blocker) for b in result.class_blockers] == expected
 
 
 class TestIncrementalAnnotationOrderSafety:
@@ -243,23 +261,12 @@ class TestIncrementalAnnotationOrderSafety:
             '        value: ZetaType\n'
         )
 
-        if surface == 'public':
-            result = _sort_incremental(
-                current,
-                baseline,
-                policy=SortPolicy(definition_order='alphabetical', method_order='none'),
-            )
-        else:
-            result = sort_incremental_detailed(
-                current,
-                baseline,
-                policy=sort_policy_from_config(
-                    DefsortConfig(
-                        definition_order='alphabetical',
-                        method_order='none',
-                    )
-                ),
-            )
+        result = _sort_annotation_surface(
+            surface,
+            current,
+            baseline,
+            DefsortConfig(definition_order='alphabetical', method_order='none'),
+        )
 
         assert result.blocker is None
         assert result.new_source is not None
@@ -278,23 +285,12 @@ class TestIncrementalAnnotationOrderSafety:
             '        value: ZetaType\n'
         )
 
-        if surface == 'public':
-            result = _sort_incremental(
-                current,
-                baseline,
-                policy=SortPolicy(definition_order='alphabetical', method_order='none'),
-            )
-        else:
-            result = sort_incremental_detailed(
-                current,
-                baseline,
-                policy=sort_policy_from_config(
-                    DefsortConfig(
-                        definition_order='alphabetical',
-                        method_order='none',
-                    )
-                ),
-            )
+        result = _sort_annotation_surface(
+            surface,
+            current,
+            baseline,
+            DefsortConfig(definition_order='alphabetical', method_order='none'),
+        )
 
         assert result.blocker == 'forward_refs'
         assert result.new_source is None
@@ -404,23 +400,12 @@ class TestIncrementalAnnotationOrderSafety:
             '        return value\n'
         )
 
-        if surface == 'public':
-            result = _sort_incremental(
-                current,
-                baseline,
-                policy=SortPolicy(definition_order='none', method_order='alphabetical'),
-            )
-        else:
-            result = sort_incremental_detailed(
-                current,
-                baseline,
-                policy=sort_policy_from_config(
-                    DefsortConfig(
-                        definition_order='none',
-                        method_order='alphabetical',
-                    )
-                ),
-            )
+        result = _sort_annotation_surface(
+            surface,
+            current,
+            baseline,
+            DefsortConfig(definition_order='none', method_order='alphabetical'),
+        )
 
         assert result.blocker is None
         assert result.new_source is not None
@@ -439,23 +424,12 @@ class TestIncrementalAnnotationOrderSafety:
             '        return value\n'
         )
 
-        if surface == 'public':
-            result = _sort_incremental(
-                current,
-                baseline,
-                policy=SortPolicy(definition_order='none', method_order='alphabetical'),
-            )
-        else:
-            result = sort_incremental_detailed(
-                current,
-                baseline,
-                policy=sort_policy_from_config(
-                    DefsortConfig(
-                        definition_order='none',
-                        method_order='alphabetical',
-                    )
-                ),
-            )
+        result = _sort_annotation_surface(
+            surface,
+            current,
+            baseline,
+            DefsortConfig(definition_order='none', method_order='alphabetical'),
+        )
 
         assert result.blocker == 'forward_refs'
         assert result.new_source is None
@@ -566,58 +540,8 @@ class TestIncrementalBanners:
         )
 
         assert result.new_source.index('class C') < result.new_source.index('def aardvark')
-        original_coordinates = collect_method_coordinates(
-            current,
-            ast.parse(current),
-            banners='barriers',
-            banner_pattern=None,
-        )
-        rewritten_tree = ast.parse(result.new_source)
-        rewritten_cls = next(
-            node for node in rewritten_tree.body if isinstance(node, ast.ClassDef)
-        )
-        assert rewritten_cls.end_lineno is not None
-        rewritten_lines = result.new_source.splitlines(keepends=True)
-        rewritten_slice = ClassSlice(
-            lines=rewritten_lines[rewritten_cls.lineno - 1 : rewritten_cls.end_lineno],
-            start_line=rewritten_cls.lineno,
-        )
-        baseline_tree = ast.parse(baseline)
-        baseline_cls = next(node for node in baseline_tree.body if isinstance(node, ast.ClassDef))
-        assert baseline_cls.end_lineno is not None
-        baseline_lines = [str(line) for line in baseline.splitlines(keepends=True)]
-        baseline_slice = ClassSlice(
-            lines=baseline_lines[baseline_cls.lineno - 1 : baseline_cls.end_lineno],
-            start_line=baseline_cls.lineno,
-        )
-        class_result = per_class_incremental_sort(
-            rewritten_cls,
-            baseline_cls,
-            parse_class_methods(
-                rewritten_cls,
-                rewritten_slice,
-                banners='barriers',
-            ),
-            parse_class_methods(
-                baseline_cls,
-                baseline_slice,
-                banners='barriers',
-            ),
-            rewritten_slice,
-            policy=SortPolicy(
-                method_order='dependency',
-                banners='barriers',
-            ),
-            original_parse=original_coordinates[('C', 1)],
-        )
-
-        constraint = class_result.banner_constraints[0]
-        retained_boundary = next(
-            part
-            for part in original_coordinates[('C', 1)].boundary_layout
-            if isinstance(part, SectionBoundary)
-        )
-        assert retained_boundary.start_line == banner_line
+        assert len(result.banner_constraints) == 1
+        constraint = result.banner_constraints[0]
         assert constraint.boundary.start_line == banner_line
         assert {item.name: item.line for item in constraint.held} == {
             'alpha': alpha_line,
@@ -1062,10 +986,7 @@ class TestIncrementalBanners:
         assert result.new_source.index('def alpha') < result.new_source.index('def beta')
         assert result.new_source.index('def beta') < result.new_source.index('def delta')
 
-    def test_banner_pipeline_keeps_duplicate_class_coordinates_from_original(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_banner_pipeline_keeps_duplicate_class_coordinates_from_original(self) -> None:
         baseline = (
             'class C:\n'
             '    def alpha(self):\n'
@@ -1095,29 +1016,6 @@ class TestIncrementalBanners:
         banner_line = original_lines.index('    # second class') + 1
         zulu_line = original_lines.index('    def zulu(self):') + 1
         alpha_line = len(original_lines) - original_lines[::-1].index('    def alpha(self):')
-        captured: list[BannerConstraint] = []
-
-        def recording_collect_banner_constraints[T: (Definition, MethodDefinition)](
-            original: Sequence[T],
-            unconstrained: Sequence[T],
-            boundaries: Sequence[SectionBoundary],
-            *,
-            class_name: str | None = None,
-        ) -> list[BannerConstraint]:
-            constraints = collect_banner_constraints(
-                original,
-                unconstrained,
-                boundaries,
-                class_name=class_name,
-            )
-            captured.extend(constraints)
-            return constraints
-
-        monkeypatch.setattr(
-            'defsort._core._methods.collect_banner_constraints',
-            recording_collect_banner_constraints,
-        )
-
         result = sort_file_incremental(
             current,
             baseline,
@@ -1133,8 +1031,8 @@ class TestIncrementalBanners:
         )
 
         assert result.new_source.index('class C') < result.new_source.index('def aardvark')
-        assert len(captured) == 1
-        constraint = captured[0]
+        assert len(result.banner_constraints) == 1
+        constraint = result.banner_constraints[0]
         assert constraint.boundary.start_line == banner_line
         assert constraint.boundary.text == '# second class\n# ========'
         assert {item.name: item.line for item in constraint.held} == {
@@ -1630,6 +1528,7 @@ class TestIncrementalEagerOrderSafety:
         result = sort_file_incremental(current, baseline, options=options)
 
         assert result.blocker == 'eager_order'
+        assert result.warning == DYNAMIC_ALL_WARNING
         assert result.original_source == current
         assert result.new_source == current
 
@@ -1646,6 +1545,7 @@ class TestIncrementalEagerOrderSafety:
         result = sort_file_incremental(current, baseline, options=options)
 
         assert result.blocker == 'eager_order'
+        assert result.warning == DYNAMIC_ALL_WARNING
         assert result.original_source == current
         assert result.new_source == current
 
@@ -2749,13 +2649,13 @@ class TestSortFileIncremental:
 
     def test_noop_returns_unchanged(self) -> None:
         result = sort_file_incremental(
-            _SRC_BASELINE, _SRC_BASELINE, options=EngineOptions(policy=SortPolicy())
+            SRC_BASELINE, SRC_BASELINE, options=EngineOptions(policy=SortPolicy())
         )
         assert result.new_source == result.original_source
 
     def test_returns_sort_result(self) -> None:
         result = sort_file_incremental(
-            _SRC_WITH_NEW, _SRC_BASELINE, options=EngineOptions(policy=SortPolicy())
+            SRC_WITH_NEW, SRC_BASELINE, options=EngineOptions(policy=SortPolicy())
         )
         assert isinstance(result, SortResult)
         assert result.new_source != result.original_source
@@ -2763,7 +2663,7 @@ class TestSortFileIncremental:
 
     def test_syntax_error_returns_unchanged(self) -> None:
         result = sort_file_incremental(
-            'def broken(\n', _SRC_BASELINE, options=EngineOptions(policy=SortPolicy())
+            'def broken(\n', SRC_BASELINE, options=EngineOptions(policy=SortPolicy())
         )
         assert result.new_source == result.original_source
         assert result.original_order == []
@@ -2773,7 +2673,9 @@ class TestSortFileIncremental:
 class TestSortForHook:
     def test_already_sorted(self) -> None:
         src = 'def alpha():\n    pass\n\n\ndef bravo():\n    return alpha()\n'
-        assert sort_for_hook_detailed(src, policy=SortPolicy()).new_source is None
+        result = sort_for_hook_detailed(src, policy=SortPolicy())
+        assert result.new_source is None
+        assert result.sorted_defs == ()
 
     def test_banner_duplicate_safety_breaks_groups_at_boundary(self) -> None:
         src = 'def alpha():\n    pass\n\n\n# --------\n\n\ndef alpha():\n    pass\n'
@@ -2796,8 +2698,26 @@ class TestSortForHook:
         )
 
         assert result.new_source is None
-        assert result.blocker == 'interstitial'
+        assert result.blocker is None
+        assert [cb.blocker for cb in result.class_blockers] == ['interstitial']
         assert result.sorted_defs == ()
+
+    @pytest.mark.parametrize('remove_future', [False, True])
+    def test_class_only_soft_skip_condenses_after_cleanup(self, remove_future: bool) -> None:
+        baseline = 'class C:\n    def z(self): pass\n    def a(self): pass\n'
+        source = baseline + '    def b(self): pass\n'
+        if remove_future:
+            source = 'from __future__ import annotations\n\n' + source
+        result = sort_incremental_detailed(
+            source, baseline, policy=SortPolicy(method_order='alphabetical')
+        )
+        assert [cb.blocker for cb in result.class_blockers] == ['non_conforming']
+        if remove_future:
+            assert result.blocker is None
+            assert result.new_source == source.split('\n', 1)[1]
+        else:
+            assert result.blocker == 'non_conforming'
+            assert result.new_source is None
 
     def test_compile_level_error_raises(self) -> None:
         src = 'def alpha():\n    pass\n\n\ndef bravo():\n    pass\n\nreturn 1\n'
@@ -2831,6 +2751,7 @@ class TestSortForHook:
         result = sort_for_hook_detailed(src, policy=SortPolicy())
         assert result.new_source is None
         assert result.blocker == 'interstitial'
+        assert result.sorted_defs == ()
 
     def test_method_only_sort_not_blocked(self) -> None:
         src = (
@@ -2896,6 +2817,8 @@ class TestSortForHook:
         assert result.blocker is None
         assert result.new_source is not None
         assert result.new_source.index('def alpha') < result.new_source.index('def bravo')
+        assert isinstance(result, _HookSortResult)
+        assert [definition.name for definition in result.sorted_defs] == ['alpha', 'bravo']
 
     def test_strip_only_returns_top_level_and_method_source_changes(self) -> None:
         source = (
@@ -2923,34 +2846,6 @@ class TestSortForHook:
             '# --------\n', ''
         )
         assert result.banner_constraints == ()
-
-
-class TestSortForHookDetailed:
-    def test_already_sorted_returns_none_source(self) -> None:
-        src = 'def a():\n    return 1\n\n\ndef b():\n    return a()\n'
-        result = sort_for_hook_detailed(src, policy=SortPolicy())
-        assert result.new_source is None
-        assert result.sorted_defs == ()
-
-    def test_blocker_returns_empty_defs(self) -> None:
-        src = 'def b():\n    return a()\n\nx = 1\n\ndef a():\n    return 1\n'
-        result = sort_for_hook_detailed(src, policy=SortPolicy())
-        assert result.blocker is not None
-        assert result.sorted_defs == ()
-
-    def test_returns_hook_sort_result(self) -> None:
-        src = 'def b():\n    return a()\n\n\ndef a():\n    return 1\n'
-        result = sort_for_hook_detailed(src, policy=SortPolicy())
-        assert isinstance(result, _HookSortResult)
-        assert result.new_source is not None
-        assert result.blocker is None
-        assert len(result.sorted_defs) == 2
-
-    def test_sorted_defs_are_reordered(self) -> None:
-        src = 'def b():\n    return a()\n\n\ndef a():\n    return 1\n'
-        result = sort_for_hook_detailed(src, policy=SortPolicy())
-        assert result.sorted_defs[0].name == 'a'
-        assert result.sorted_defs[1].name == 'b'
 
     def test_syntax_error_propagates(self) -> None:
         with pytest.raises(SyntaxError):
@@ -2981,7 +2876,7 @@ class TestSortIncremental:
         assert result.blocker == 'non_conforming'
 
     def test_existing_defs_not_moved(self) -> None:
-        result = _sort_incremental(_SRC_WITH_NEW, _SRC_BASELINE)
+        result = _sort_incremental(SRC_WITH_NEW, SRC_BASELINE)
         new_source = result.new_source
         assert new_source is not None
         assert new_source.index('def alpha') < new_source.index('def bravo')
@@ -3063,14 +2958,14 @@ class TestSortIncremental:
         )
 
     def test_invalid_baseline_skips(self) -> None:
-        current = _SRC_WITH_NEW
+        current = SRC_WITH_NEW
         result = _sort_incremental(current, 'def broken(\n')
         assert result.new_source is None
         assert result.blocker == 'non_conforming'
 
     def test_invalid_source_raises(self) -> None:
         with pytest.raises(SyntaxError):
-            _sort_incremental('def broken(\n', _SRC_BASELINE)
+            _sort_incremental('def broken(\n', SRC_BASELINE)
 
     def test_new_def_already_in_order(self) -> None:
         baseline = 'def alpha():\n    return 1\n\n\ndef bravo():\n    return alpha()\n'
@@ -3084,14 +2979,14 @@ class TestSortIncremental:
         assert result.new_source is None
 
     def test_new_def_sorted(self) -> None:
-        result = _sort_incremental(_SRC_WITH_NEW, _SRC_BASELINE)
+        result = _sort_incremental(SRC_WITH_NEW, SRC_BASELINE)
         assert result.blocker is None
         assert result.new_source is not None
         # beta depends on alpha, sorts before bravo by alphabetical tiebreak
         assert result.new_source.index('def beta') < result.new_source.index('def bravo')
 
     def test_no_new_defs_noop(self) -> None:
-        result = _sort_incremental(_SRC_BASELINE, _SRC_BASELINE)
+        result = _sort_incremental(SRC_BASELINE, SRC_BASELINE)
         assert result.new_source is None
         assert result.blocker is None
 
@@ -3238,11 +3133,6 @@ class TestSortIncrementalDetailedFutureRemoval:
 
 
 class TestTargetDrift:
-    def test_no_drift_returns_none(self) -> None:
-        source = 'def a():\n    return 1\n\n\ndef b():\n    return a()\n'
-        result = _sort_incremental(source, source)
-        assert result.blocker is None
-
     def test_non_conforming_baseline_detected(self) -> None:
         baseline = 'def b():\n    return a()\n\n\ndef a():\n    return 1\n'
         current = baseline
@@ -3370,6 +3260,15 @@ def _sort_incremental(
     )
 
 
+def _sort_annotation_surface(
+    surface: str, current: str, baseline: str, config: DefsortConfig
+) -> _IncrementalSortResult | _HookSortResult:
+    policy = sort_policy_from_config(config)
+    if surface == 'public':
+        return _sort_incremental(current, baseline, policy=policy)
+    return sort_incremental_detailed(current, baseline, policy=policy)
+
+
 def test_incremental_does_not_split_overload_group() -> None:
     baseline = _SRC_OVERLOAD_CONFORMING
     current = baseline + '\n    def added(self, x):\n        return x\n'
@@ -3380,3 +3279,55 @@ def test_incremental_does_not_split_overload_group() -> None:
     impl = out.index('def foo(self, x, cb=helper)')
     added = out.index('def added')
     assert added < stubs or added > impl
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'method',
+        'method_banner',
+        'future',
+        'duplicates_method',
+        'sectioned_method',
+        'top_level',
+        'duplicates_top_level',
+        'sectioned_top_level',
+        'unchanged',
+        'already_placed',
+        'none',
+        'non_conforming',
+    ],
+)
+def test_incremental_gate_candidate(case: str) -> None:
+    baseline, source, banners, definition_order, blocker = incremental_gate_case(case)
+    policy = SortPolicy(
+        definition_order=definition_order,
+        method_order='alphabetical',
+        banners=banners,
+    )
+    result = sort_file_incremental(source, baseline, options=EngineOptions(policy=policy))
+    detailed = sort_incremental_detailed(source, baseline, policy=policy)
+
+    assert result.blocker == blocker
+    assert detailed.blocker == blocker
+    assert result.skipped is (blocker is not None)
+    if case == 'none':
+        assert result.new_source != source
+        assert result.new_source.index('def a(') < result.new_source.index('def z(')
+        assert detailed.new_source == result.new_source
+    else:
+        assert result.new_source == source
+        assert detailed.new_source is None
+
+
+@pytest.mark.parametrize('baseline', ['', '   \n'])
+def test_incremental_gate_empty_baseline_future_cleanup(baseline: str) -> None:
+    source = (
+        'from __future__ import annotations\n'
+        'class C:\n    def z(self): pass\n'
+        '\nregistry = {}\n\ndef zeta(): pass\n'
+    )
+    result = sort_incremental_detailed(source, baseline, policy=SortPolicy())
+
+    assert result.blocker == 'interstitial'
+    assert result.new_source is None

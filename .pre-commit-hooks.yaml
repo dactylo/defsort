@@ -3,8 +3,10 @@
   entry: defsort --write
   language: python
   types: [python]
+  files: \.py$
 - id: defsort-check
   name: defsort-check
   entry: defsort
   language: python
   types: [python]
+  files: \.py$

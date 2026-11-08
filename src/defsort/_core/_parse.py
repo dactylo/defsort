@@ -11,7 +11,7 @@ from defsort._core._analysis import (
     ENCODING_PATTERN,
     analyze_annotation_refs,
     analyze_dependencies,
-    analyze_eager_refs,
+    analyze_eager_effects,
     decorated_start_line,
     extract_postamble_names,
     get_bound_names,
@@ -37,9 +37,9 @@ from defsort._core._layout import (
     make_ownership_boundary,
     split_item_gap,
     split_terminal_line_ending,
-    split_trailing_owned,
 )
 from defsort._core._safety import is_safe_trailing
+from defsort._core._syntax import parse_source
 from defsort._source import join_physical, split_physical_lines
 from defsort._types import (
     BannerMode,
@@ -439,12 +439,12 @@ def _process_definition(  # noqa: PLR0913
 
     trailing = gap.trailing
     had_interstitial = _process_trailing(trailing)
-    owned_trailing, exposed_separator = split_trailing_owned(trailing)
-    separator = exposed_separator + gap.separator
+    owned_trailing = trailing
+    separator = gap.separator
 
     had_interstitial = had_interstitial or gap.boundary_unsafe
 
-    eager_refs = analyze_eager_refs(
+    eager_refs, binds_other_names = analyze_eager_effects(
         node,
         module_classes=scope_state.visible_classes,
         module_shadowed=frozenset(
@@ -484,6 +484,7 @@ def _process_definition(  # noqa: PLR0913
         section=section,
         eager_refs=eager_refs,
         has_eager_evaluation=has_eager_evaluation,
+        binds_other_names=binds_other_names,
     )
     block, ending = split_terminal_line_ending(pending_leading + def_source + owned_trailing)
     owns_trailing = bool(owned_trailing)
@@ -576,11 +577,12 @@ def parse_definitions(  # noqa: PLR0913
         TypeError: If an active custom banner pattern is neither a string nor
             `None`.
         ValueError: If an active custom banner pattern does not compile or uses
-            unsupported syntax.
+            unsupported syntax, or source parsing encounters a lone Unicode
+            surrogate.
     """
     if tree is None:
         try:
-            tree = ast.parse(source)
+            tree = parse_source(source)
         except SyntaxError:
             return _empty_parse_result(source)
 

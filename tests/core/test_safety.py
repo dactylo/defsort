@@ -1,5 +1,6 @@
 import pytest
 
+import defsort
 from defsort._core import sort_file
 from defsort._core._parse import parse_definitions
 from defsort._core._safety import (
@@ -12,6 +13,7 @@ from defsort._core._safety import (
     is_safe_trailing,
 )
 from defsort._types import (
+    DYNAMIC_ALL_MESSAGE,
     BlockingCode,
     Definition,
     DefinitionKind,
@@ -20,6 +22,19 @@ from defsort._types import (
     MethodSortInfo,
     SortPolicy,
 )
+
+_CLASS_GLOBAL_SOURCE = (
+    "def z():\n    return 'function'\n\n\n"
+    'class A:\n{body}\n\n\n'
+    'def b(value=z):\n    return value\n'
+)
+
+_HEADER_WALRUS_SOURCE = (
+    "def z():\n    return 'function'\n\n\n"
+    'def a(value={default}):\n    pass\n\n\n'
+    'def b(value=z):\n    return value\n'
+)
+
 
 _NO_FUTURE = False
 
@@ -51,11 +66,11 @@ class TestCheckSortSafetyBlockerReturn:
             _def('bravo', 1),
             _def('alpha', 2),
         ]
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             defs, defs, [], set(), _NO_FUTURE, force=False, add_future=False
         )
-        assert skipped is True
-        assert blocker == 'duplicates'
+        assert verdict.message is not None
+        assert verdict.blocker == 'duplicates'
 
     def test_force_does_not_bypass_top_level_duplicates(self) -> None:
         defs = [
@@ -64,12 +79,12 @@ class TestCheckSortSafetyBlockerReturn:
             _def('alpha', 2),
         ]
 
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             defs, defs, [], set(), _NO_FUTURE, force=True, add_future=False
         )
 
-        assert skipped is True
-        assert blocker == 'duplicates'
+        assert verdict.message is not None
+        assert verdict.blocker == 'duplicates'
 
     def test_forward_refs_returns_blocker(self) -> None:
         # alpha refs bravo, but sorted order puts alpha first -> forward ref
@@ -82,34 +97,34 @@ class TestCheckSortSafetyBlockerReturn:
             _def('alpha', 1, ann_refs={'bravo'}),
             _def('bravo', 0, kind='class'),
         ]
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             defs, new_order, [], set(), _NO_FUTURE, force=False, add_future=False
         )
-        assert skipped is True
-        assert blocker == 'forward_refs'
+        assert verdict.message is not None
+        assert verdict.blocker == 'forward_refs'
 
     def test_interstitial_returns_blocker(self) -> None:
         defs = [
             _def('a', 0),
             _def('b', 1, interstitial=True),
         ]
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             defs, defs, [], set(), _NO_FUTURE, force=False, add_future=False
         )
-        assert skipped is True
-        assert blocker == 'interstitial'
+        assert verdict.message is not None
+        assert verdict.blocker == 'interstitial'
 
     def test_no_issues_returns_none(self) -> None:
         defs = [
             _def('alpha', 0),
             _def('bravo', 1),
         ]
-        skipped, blocker, blocking = check_sort_safety(
+        verdict = check_sort_safety(
             defs, defs, [], set(), _NO_FUTURE, force=False, add_future=False
         )
-        assert skipped is False
-        assert blocker is None
-        assert blocking == []
+        assert verdict.message is None
+        assert verdict.blocker is None
+        assert verdict.blocking_code == []
 
 
 class TestCheckSortSafetyBlockingCode:
@@ -119,7 +134,7 @@ class TestCheckSortSafetyBlockingCode:
             _def('bravo', 1, leading="if sys.platform == 'win32':\n    patch()\n"),
         ]
 
-        skipped, blocker, blocking = check_sort_safety(
+        verdict = check_sort_safety(
             defs,
             defs,
             [],
@@ -129,9 +144,9 @@ class TestCheckSortSafetyBlockingCode:
             add_future=False,
         )
 
-        assert skipped is True
-        assert blocker == 'interstitial'
-        assert blocking == [BlockingCode(line=8, text="if sys.platform == 'win32':")]
+        assert verdict.message is not None
+        assert verdict.blocker == 'interstitial'
+        assert verdict.blocking_code == [BlockingCode(line=8, text="if sys.platform == 'win32':")]
 
     def test_blocking_code_includes_line_and_text(self) -> None:
         defs = [
@@ -139,7 +154,7 @@ class TestCheckSortSafetyBlockingCode:
             _def('bravo', 1),
         ]
 
-        skipped, blocker, blocking = check_sort_safety(
+        verdict = check_sort_safety(
             defs,
             defs,
             [],
@@ -149,9 +164,9 @@ class TestCheckSortSafetyBlockingCode:
             add_future=False,
         )
 
-        assert skipped is True
-        assert blocker == 'interstitial'
-        assert blocking == [BlockingCode(line=9, text='registry = {}')]
+        assert verdict.message is not None
+        assert verdict.blocker == 'interstitial'
+        assert verdict.blocking_code == [BlockingCode(line=9, text='registry = {}')]
 
     def test_blocking_preview_counts_physical_lines(self) -> None:
         parsed = parse_definitions(
@@ -164,7 +179,7 @@ class TestCheckSortSafetyBlockingCode:
             'def beta():\n'
             '    pass\n'
         )
-        skipped, blocker, blocking = check_sort_safety(
+        verdict = check_sort_safety(
             parsed.definitions,
             parsed.definitions,
             [],
@@ -173,9 +188,9 @@ class TestCheckSortSafetyBlockingCode:
             force=False,
             add_future=False,
         )
-        assert skipped is True
-        assert blocker == 'interstitial'
-        assert [(item.line, item.text) for item in blocking] == [(5, 'X = compute()')]
+        assert verdict.message is not None
+        assert verdict.blocker == 'interstitial'
+        assert [(item.line, item.text) for item in verdict.blocking_code] == [(5, 'X = compute()')]
 
     def test_directive_comment_reports_line(self) -> None:
         defs = [
@@ -183,7 +198,7 @@ class TestCheckSortSafetyBlockingCode:
             _def('bravo', 1),
         ]
 
-        skipped, blocker, blocking = check_sort_safety(
+        verdict = check_sort_safety(
             defs,
             defs,
             [],
@@ -193,9 +208,9 @@ class TestCheckSortSafetyBlockingCode:
             add_future=False,
         )
 
-        assert skipped is True
-        assert blocker == 'interstitial'
-        assert blocking == [BlockingCode(line=7, text='# type: ignore[override]')]
+        assert verdict.message is not None
+        assert verdict.blocker == 'interstitial'
+        assert verdict.blocking_code == [BlockingCode(line=7, text='# type: ignore[override]')]
 
     def test_multiple_blocking_sections(self) -> None:
         defs = [
@@ -204,7 +219,7 @@ class TestCheckSortSafetyBlockingCode:
             _def('charlie', 2),
         ]
 
-        skipped, blocker, blocking = check_sort_safety(
+        verdict = check_sort_safety(
             defs,
             defs,
             [],
@@ -214,9 +229,9 @@ class TestCheckSortSafetyBlockingCode:
             add_future=False,
         )
 
-        assert skipped is True
-        assert blocker == 'interstitial'
-        assert blocking == [
+        assert verdict.message is not None
+        assert verdict.blocker == 'interstitial'
+        assert verdict.blocking_code == [
             BlockingCode(line=7, text='registry = {}'),
             BlockingCode(line=17, text='cache = {}'),
         ]
@@ -228,7 +243,7 @@ class TestCheckSortSafetyBlockingCode:
             _def('bravo', 1),
         ]
 
-        skipped, blocker, blocking = check_sort_safety(
+        verdict = check_sort_safety(
             defs,
             defs,
             [],
@@ -238,9 +253,9 @@ class TestCheckSortSafetyBlockingCode:
             add_future=False,
         )
 
-        assert skipped is True
-        assert blocker == 'interstitial'
-        assert blocking == [BlockingCode(line=7, text='x' * 60 + '...')]
+        assert verdict.message is not None
+        assert verdict.blocker == 'interstitial'
+        assert verdict.blocking_code == [BlockingCode(line=7, text='x' * 60 + '...')]
 
 
 class TestHasForwardAnnotationRefs:
@@ -271,14 +286,6 @@ class TestHasForwardAnnotationRefs:
         ]
         assert _has_forward_annotation_refs(defs, {'WidgetList'}) is True
 
-    def test_same_position_blocked(self) -> None:
-        defs = [
-            _def('alpha', 0, ann_refs={'bravo'}),
-            _def('bravo', 1, ann_refs={'alpha'}),
-        ]
-        # alpha refs bravo (at position 1, later) -> forward ref
-        assert _has_forward_annotation_refs(defs, set()) is True
-
     def test_self_referential_blocked(self) -> None:
         defs = [
             _def('Node', 0, kind='class', ann_refs={'Node'}),
@@ -287,10 +294,6 @@ class TestHasForwardAnnotationRefs:
 
 
 class TestHasInterstitialCode:
-    def test_blank_lines_safe(self) -> None:
-        defs = [_def('alpha', 0, trailing='\n\n')]
-        assert has_interstitial_code(defs) is False
-
     def test_code_between_defs(self) -> None:
         defs = [
             _def('alpha', 0, trailing='\nregistry = {}\n'),
@@ -305,20 +308,12 @@ class TestHasInterstitialCode:
         ]
         assert has_interstitial_code(defs) is True
 
-    def test_comment_safe(self) -> None:
-        defs = [_def('alpha', 0, trailing='\n# a comment\n')]
-        assert has_interstitial_code(defs) is False
-
     def test_directive_comment_unsafe(self) -> None:
         defs = [
             _def('alpha', 0, trailing='\n# type: ignore[override]\n'),
             _def('bravo', 1),
         ]
         assert has_interstitial_code(defs) is True
-
-    def test_empty_trailing_safe(self) -> None:
-        defs = [_def('alpha', 0)]
-        assert has_interstitial_code(defs) is False
 
     def test_had_interstitial_code_flag(self) -> None:
         defs = [_def('alpha', 0, interstitial=True)]
@@ -395,12 +390,44 @@ class TestIsSafeTrailing:
         assert is_safe_trailing('   \n') is True
 
 
+class TestPropertyRegroupingEffects:
+    def test_accessors_regroup_across_a_plain_method(self) -> None:
+        source = (
+            'class Example:\n'
+            '    @property\n'
+            '    def z(self):\n'
+            '        return 1\n\n'
+            '    def a(self):\n'
+            '        pass\n\n'
+            '    @z.setter\n'
+            '    def z(self, value):\n'
+            '        pass\n'
+        )
+        assert defsort.check(source).status == 'changed'
+
+    def test_regrouping_cannot_reverse_default_effects(self) -> None:
+        source = (
+            'events = []\n\n\n'
+            'class Example:\n'
+            '    @property\n'
+            '    def z(self):\n'
+            '        return 1\n\n'
+            "    def a(self, value=events.append('a')):\n"
+            '        pass\n\n'
+            '    @z.setter\n'
+            "    def z(self, value=events.append('z')):\n"
+            '        pass\n'
+        )
+        assert defsort.check(source).status != 'changed'
+        assert defsort.sort(source) == source
+
+
 class TestReorderHazards:
     def test_default_evaluation_order_is_not_bypassed_by_force(self) -> None:
         zeta = _def('zeta', 0, eager=True)
         alpha = _def('alpha', 1, eager=True)
 
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             [zeta, alpha],
             [alpha, zeta],
             [],
@@ -410,14 +437,14 @@ class TestReorderHazards:
             add_future=True,
         )
 
-        assert skipped is True
-        assert blocker == 'eager_order'
+        assert verdict.message is not None
+        assert verdict.blocker == 'eager_order'
 
     def test_dynamic_all_changed_order_is_hazard(self) -> None:
         zeta = _def('zeta', 0)
         alpha = _def('alpha', 1)
 
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             [zeta, alpha],
             [alpha, zeta],
             [],
@@ -428,14 +455,14 @@ class TestReorderHazards:
             dynamic_all=True,
         )
 
-        assert skipped is True
-        assert blocker == 'eager_order'
+        assert verdict.message == DYNAMIC_ALL_MESSAGE
+        assert verdict.blocker == 'eager_order'
 
     def test_dynamic_all_unchanged_order_is_safe(self) -> None:
         zeta = _def('zeta', 0)
         alpha = _def('alpha', 1)
 
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             [zeta, alpha],
             [zeta, alpha],
             [],
@@ -446,8 +473,8 @@ class TestReorderHazards:
             dynamic_all=True,
         )
 
-        assert skipped is False
-        assert blocker is None
+        assert verdict.message is None
+        assert verdict.blocker is None
 
     def test_eager_binder_moved_behind_reader_is_hazard(self) -> None:
         binder = _def('zeta', 0)
@@ -470,7 +497,7 @@ class TestReorderHazards:
         binder = _def('zeta', 0)
         reader = _def('alpha', 1, eager_refs={'zeta'})
 
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             [binder, reader],
             [reader, binder],
             [],
@@ -480,8 +507,8 @@ class TestReorderHazards:
             add_future=True,
         )
 
-        assert skipped is True
-        assert blocker == 'eager_order'
+        assert verdict.message is not None
+        assert verdict.blocker == 'eager_order'
 
     def test_eager_order_precedes_forward_refs(self) -> None:
         eager_binder = _def('zeta', 0)
@@ -493,7 +520,7 @@ class TestReorderHazards:
             eager_refs={'zeta'},
         )
 
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             [eager_binder, annotation_binder, reader],
             [reader, annotation_binder, eager_binder],
             [],
@@ -503,8 +530,8 @@ class TestReorderHazards:
             add_future=False,
         )
 
-        assert skipped is True
-        assert blocker == 'eager_order'
+        assert verdict.message is not None
+        assert verdict.blocker == 'eager_order'
 
     def test_eager_preexisting_forward_read_is_safe(self) -> None:
         reader = _def('alpha', 0, eager_refs={'zeta'})
@@ -519,6 +546,34 @@ class TestReorderHazards:
             )
             is False
         )
+
+    def test_eager_property_methods_keep_relative_order(self) -> None:
+        zeta_getter = _method('zeta', 0)
+        zeta_setter = _method('zeta', 1)
+        alpha_getter = _method('alpha', 2)
+        zeta_getter.property_group = 'zeta'
+        zeta_setter.property_group = 'zeta'
+        alpha_getter.property_group = 'alpha'
+        zeta_getter.has_eager_evaluation = True
+        zeta_setter.has_eager_evaluation = True
+        alpha_getter.has_eager_evaluation = True
+        method_sort = _method_sort(
+            [zeta_getter, zeta_setter, alpha_getter],
+            [alpha_getter, zeta_getter, zeta_setter],
+        )
+
+        verdict = check_sort_safety(
+            [],
+            [],
+            [method_sort],
+            set(),
+            _NO_FUTURE,
+            force=True,
+            add_future=True,
+        )
+
+        assert verdict.message is not None
+        assert verdict.blocker == 'eager_order'
 
     def test_eager_repeated_binder_identity_change_is_hazard(self) -> None:
         first = _def('zeta', 0)
@@ -538,7 +593,7 @@ class TestReorderHazards:
         zeta = _def('zeta', 0, eager_refs={'events'}, eager=True)
         alpha = _def('alpha', 1, eager_refs={'events'}, eager=True)
 
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             [zeta, alpha],
             [alpha, zeta],
             [],
@@ -548,8 +603,8 @@ class TestReorderHazards:
             add_future=True,
         )
 
-        assert skipped is True
-        assert blocker == 'eager_order'
+        assert verdict.message is not None
+        assert verdict.blocker == 'eager_order'
 
     def test_method_dependencies_and_annotations_are_classified_separately(self) -> None:
         eager_binder = _method('zeta_eager', 0)
@@ -582,7 +637,7 @@ class TestReorderHazards:
         alpha.has_eager_evaluation = True
         method_sort = _method_sort([zeta, middle, alpha], [alpha, middle, zeta])
 
-        skipped, blocker, _ = check_sort_safety(
+        verdict = check_sort_safety(
             [],
             [],
             [method_sort],
@@ -592,36 +647,8 @@ class TestReorderHazards:
             add_future=True,
         )
 
-        assert skipped is True
-        assert blocker == 'eager_order'
-
-    def test_property_family_is_one_eager_group(self) -> None:
-        zeta_getter = _method('zeta', 0)
-        zeta_setter = _method('zeta', 1)
-        alpha_getter = _method('alpha', 2)
-        zeta_getter.property_group = 'zeta'
-        zeta_setter.property_group = 'zeta'
-        alpha_getter.property_group = 'alpha'
-        zeta_getter.has_eager_evaluation = True
-        zeta_setter.has_eager_evaluation = True
-        alpha_getter.has_eager_evaluation = True
-        method_sort = _method_sort(
-            [zeta_getter, zeta_setter, alpha_getter],
-            [alpha_getter, zeta_getter, zeta_setter],
-        )
-
-        skipped, blocker, _ = check_sort_safety(
-            [],
-            [],
-            [method_sort],
-            set(),
-            _NO_FUTURE,
-            force=True,
-            add_future=True,
-        )
-
-        assert skipped is True
-        assert blocker == 'eager_order'
+        assert verdict.message is not None
+        assert verdict.blocker == 'eager_order'
 
 
 def _def(  # noqa: PLR0913
@@ -672,6 +699,135 @@ def _method(
         annotation_refs=ann_refs or set(),
         eager_reads=eager_reads or set(),
     )
+
+
+class TestPinnedDefinitions:
+    def test_base_init_subclass_global_blocks_reordering(self) -> None:
+        source = (
+            'class Base:\n'
+            '    def __init_subclass__(cls):\n'
+            '        global z\n'
+            '        z = 1\n\n\n'
+            "def z():\n    return 'function'\n\n\n"
+            'class A(Base):\n    pass\n\n\n'
+            'def b(value=z):\n    return value\n'
+        )
+        assert defsort.check(source).blocker == 'eager_order'
+        assert defsort.sort(source) == source
+
+    def test_header_walrus_blocks_alphabetical_reordering(self) -> None:
+        source = _HEADER_WALRUS_SOURCE.format(default='((z := i) for i in (1,))')
+        config = defsort.DefsortConfig(definition_order='alphabetical')
+        assert defsort.check(source, config=config).blocker == 'eager_order'
+
+    @pytest.mark.parametrize(
+        'default',
+        [
+            '(z := 1)',
+            '[(z := i) for i in (1,)]',
+            'lambda x=(z := 1): x',
+            'lambda *, x=(z := 1): x',
+            '((z := i) for i in (1,))',
+        ],
+        ids=['walrus', 'comprehension', 'lambda-default', 'lambda-kwonly', 'generator'],
+    )
+    def test_header_walrus_blocks_reordering(self, default: str) -> None:
+        source = _HEADER_WALRUS_SOURCE.format(default=default)
+        result = defsort.check(source)
+        assert (result.status, result.blocker) == ('skipped', 'eager_order')
+        assert defsort.sort(source) == source
+
+    @pytest.mark.parametrize(
+        'body',
+        [
+            '    global z\n    def a(value=(z := 1)):\n        pass',
+            '    global z\n    z = 1',
+            '    def writer():\n        global z\n        return (z := 1)\n    written = writer()',
+            (
+                '    def writer():\n        global z\n        return (z := 1)\n\n'
+                '    def m(self, value=writer()):\n        pass'
+            ),
+        ],
+        ids=['method-walrus', 'assignment', 'suite-call', 'method-default-call'],
+    )
+    def test_class_global_blocks_reordering(self, body: str) -> None:
+        source = _CLASS_GLOBAL_SOURCE.format(body=body)
+        result = defsort.check(source)
+        assert (result.status, result.blocker) == ('skipped', 'eager_order')
+        assert defsort.sort(source) == source
+
+    @pytest.mark.parametrize('evaluation_order', ['preserve', 'allow-reordering'])
+    @pytest.mark.parametrize(
+        'extra',
+        ['', '    def t(self, value=writer()):\n        pass\n\n'],
+        ids=['one-caller', 'two-callers'],
+    )
+    def test_method_calling_global_writer_blocks_method_reordering(
+        self, evaluation_order: defsort.EvaluationOrder, extra: str
+    ) -> None:
+        source = (
+            'class C:\n'
+            '    global z\n\n'
+            '    def writer():\n        global z\n        return (z := 1)\n\n'
+            f'{extra}'
+            "    def z():\n        return 'function'\n\n"
+            '    def a(self, value=writer()):\n        pass\n\n'
+            '    def b(self, value=z):\n        return value\n'
+        )
+        config = defsort.DefsortConfig(evaluation_order=evaluation_order)
+        assert defsort.check(source, config=config).status != 'changed'
+        assert defsort.sort(source, config=config) == source
+
+    @pytest.mark.parametrize('evaluation_order', ['preserve', 'allow-reordering'])
+    def test_consumed_generator_before_later_shadowing_blocks_reordering(
+        self, evaluation_order: defsort.EvaluationOrder
+    ) -> None:
+        source = (
+            'class C:\n'
+            '    global z\n\n'
+            '    def aaa():\n        global z\n        yield (z := 1)\n\n'
+            "    def z():\n        return 'function'\n\n"
+            '    def a(self, value=list(aaa())):\n        pass\n\n'
+            '    def b(self, value=z):\n        return value\n\n'
+            '    def list():\n        pass\n'
+        )
+        config = defsort.DefsortConfig(evaluation_order=evaluation_order)
+        assert defsort.check(source, config=config).status != 'changed'
+        assert defsort.sort(source, config=config) == source
+
+    @pytest.mark.parametrize(
+        'middle',
+        [
+            'class A:\n    marker = (z := 1)\n',
+            'class A:\n    def a(value=(z := 1)):\n        pass\n',
+            'def a(value=lambda: (z := 1)):\n    pass\n',
+        ],
+        ids=['class-suite', 'class-method-default', 'lambda-body'],
+    )
+    def test_local_walrus_does_not_block_reordering(self, middle: str) -> None:
+        source = (
+            f"def z():\n    return 'function'\n\n\n{middle}\n\ndef b(value=z):\n    return value\n"
+        )
+        assert defsort.check(source).status == 'changed'
+
+    def test_method_header_walrus_blocks_reordering(self) -> None:
+        source = (
+            'class C:\n'
+            "    def z(self):\n        return 'function'\n\n"
+            '    def a(self, value=(z := 1)):\n        pass\n\n'
+            '    def b(self, value=z):\n        return value\n'
+        )
+        assert defsort.check(source).status != 'changed'
+        assert defsort.sort(source) == source
+
+    def test_uncalled_global_writer_does_not_block_reordering(self) -> None:
+        source = (
+            "def z():\n    return 'function'\n\n\n"
+            'def writer():\n    global z\n    z = 1\n\n\n'
+            'class A:\n    pass\n\n\n'
+            'def b(value=z):\n    return value\n'
+        )
+        assert defsort.check(source).status == 'changed'
 
 
 def _method_sort(

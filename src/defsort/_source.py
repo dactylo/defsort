@@ -105,7 +105,7 @@ def is_layout_blank(line: str) -> bool:
         line: One physical line, with or without its ending.
 
     Returns:
-        True when the line body is empty or contains only ASCII spaces,
+        `True` when the line body is empty or contains only ASCII spaces,
         horizontal tabs, or form feeds.
     """
     body = line.removesuffix(terminal_line_ending(line))
@@ -124,7 +124,7 @@ def scope_indent_body(line: str, scope_indent: str) -> str | None:
         scope_indent: Exact indentation required at the scope.
 
     Returns:
-        The body after the scope indentation, or None when the line is not at
+        The body after the scope indentation, or `None` when the line is not at
         that indentation.
     """
     body = line.removesuffix(terminal_line_ending(line))

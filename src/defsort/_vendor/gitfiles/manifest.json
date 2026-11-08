@@ -1,0 +1,27 @@
+{
+  "version": "0.1.0",
+  "files": {
+    "src/defsort/_vendor/gitfiles/__init__.py": "a77135bec5c8bdd1fef5c694d636909ea3af7bd9a469685b222d9c68c637a5d6",
+    "src/defsort/_vendor/gitfiles/_adds.py": "b32a51f5ec4d08235848aa2c8dddd6b354d616b96c060ff01ae553302c1f30e6",
+    "src/defsort/_vendor/gitfiles/_blobs.py": "d13c870b6feae74af34a78689b3417ca31f81d5613dfcabb7ac2b6f141ab1ced",
+    "src/defsort/_vendor/gitfiles/_config.py": "e27447d0f3b14b74bff6f6c04725d38af04fed664d66de31be8f3bfd0db84bbe",
+    "src/defsort/_vendor/gitfiles/_discovery.py": "95b59d466d3a68cf7f31ea964eadef417e187de63086017f97a19bcfe6cffdcc",
+    "src/defsort/_vendor/gitfiles/_index.py": "bb5559fefdf01d2a37b6ccf0681f55b27e5968bcfe7bf2bf5812837a104b342c",
+    "src/defsort/_vendor/gitfiles/_listings.py": "14bd4bf56032499b14fbc6dbc1deff6b1ae4e6823d16cc98a8e836bbd5f1680e",
+    "src/defsort/_vendor/gitfiles/_pathspecs.py": "7bfe376949702cb4854cb2889bccef9ccd95088ed93b7f08f955d97502bdd7d2",
+    "src/defsort/_vendor/gitfiles/_repo.py": "40296f7b0450053f330365d10a5ef39cbd225090d7e79ba2a8a3a21e53db31d3",
+    "src/defsort/_vendor/gitfiles/_run.py": "b14c2f36ff05c5a300b6ed83c8390241e83a4871426d20c226bcbb891dc20a64",
+    "tests/gitfiles/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tests/gitfiles/_support.py": "684990e7ae321572405f44683b26a97f08eef3395b7bea0f381e9dc0bdd7e2cf",
+    "tests/gitfiles/conftest.py": "a93b426639330d798e00e96ac4309b7211e5bfa9788c6f44b85f0659129e6a5c",
+    "tests/gitfiles/test_adds.py": "6529c5629f74f144dbb73ba3cf4e0ca91373be24f98456ac0b235deb77edf097",
+    "tests/gitfiles/test_blobs.py": "f2b8c7762b74be367cc4bfe1108422f2e019ba72a6cf3384fe140e2008e49267",
+    "tests/gitfiles/test_config.py": "14f013820b96da672b1f9ebd8bdf219297333925672e80136f4df36d262e94a8",
+    "tests/gitfiles/test_discovery.py": "7e2ebb0b5b140cac41384fe082ca0b459a1fdf010b1ba4f6a4e113a5e335f88b",
+    "tests/gitfiles/test_index.py": "cb62069b8451484680181a13c3695180067a29163b896951eee94b62122ca880",
+    "tests/gitfiles/test_listings.py": "0cef55d9000ca196f82e1f1fe2595e5da0c3ea5c2d59338a1cfcb905c36c11c6",
+    "tests/gitfiles/test_pathspecs.py": "4125f4153988351d7eb5ef2c4f82bcd6ebeb6c5689cdf83a2c35282117c34d57",
+    "tests/gitfiles/test_repo.py": "3a8c576828fad5592d1c2b64f760729f8c73adc1055d8ed22981b389b02ce000",
+    "tests/gitfiles/test_run.py": "2faff281860455a8fff0ab1929afeba726db07bf93667a644874edd7aa46bead"
+  }
+}

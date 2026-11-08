@@ -8,50 +8,6 @@ from defsort._core._future import _remove_future_annotations_import, ensure_futu
 _FUTURE_IMPORT = 'from __future__ import annotations'
 
 
-class TestAstOwnedRemoval:
-    def test_compile_invalid_source_unchanged(self) -> None:
-        source = 'x = 1\nfrom __future__ import annotations\n'
-
-        assert _remove_future_annotations_import(source) == source
-
-    def test_crlf_span_removed_exactly(self) -> None:
-        source = 'from __future__ import ( annotations )\r\n\r\ndef f():\r\n    return 1\r\n'
-        assert _remove_future_annotations_import(source) == '\r\ndef f():\r\n    return 1\r\n'
-
-    def test_mixed_ending_seam_preserves_two_separators(self) -> None:
-        source = '"""doc"""\rfrom __future__ import annotations\r\n\ndef f():\n    return 1\n'
-        result = _remove_future_annotations_import(source)
-
-        assert result == '"""doc"""\n\rdef f():\n    return 1\n'
-        assert len(result.splitlines(keepends=True)) == 4
-        assert _remove_future_annotations_import(result) == result
-
-    def test_recognized_spellings_removed(self) -> None:
-        for spelling in (
-            'from __future__ import annotations\n',
-            'from __future__ import (annotations)\n',
-            'from __future__ import ( annotations )\n',
-            'from __future__ import (annotations,)\n',
-            'from __future__ import  annotations\n',
-            'from __future__ import \\\n    annotations\n',
-            'from __future__ import (\n    annotations\n)\n',
-        ):
-            source = spelling + '\n\ndef f():\n    return 1\n'
-            removed = _remove_future_annotations_import(source)
-            assert removed == '\n\ndef f():\n    return 1\n', spelling
-            assert _remove_future_annotations_import(removed) == removed, spelling
-
-    def test_unowned_or_ineligible_spans_unchanged(self) -> None:
-        for source in (
-            'from __future__ import annotations as _a\n_A = _a\n',
-            'from __future__ import annotations, generator_stop\n',
-            'import os; from __future__ import annotations\n',
-            'from __future__ import annotations  # keep\n',
-            'from __future__ import (\n    # keep\n    annotations\n)\n',
-        ):
-            assert _remove_future_annotations_import(source) == source, source
-
-
 class TestAutomaticFutureCleanup:
     def test_future_cleanup_preserves_mixed_physical_source(self) -> None:
         prefix = '"""Doc\fpage."""\r\n# BEFORE\n'
@@ -246,6 +202,15 @@ class TestEnsureFutureAnnotations:
 
 
 class TestRemoveFutureAnnotationsImport:
+    def test_compile_invalid_source_unchanged(self) -> None:
+        source = 'x = 1\nfrom __future__ import annotations\n'
+
+        assert _remove_future_annotations_import(source) == source
+
+    def test_crlf_span_removed_exactly(self) -> None:
+        source = 'from __future__ import ( annotations )\r\n\r\ndef f():\r\n    return 1\r\n'
+        assert _remove_future_annotations_import(source) == '\r\ndef f():\r\n    return 1\r\n'
+
     def test_docstring_decoy_with_form_feeds_is_not_removed(self) -> None:
         source = (
             '"""DOC-A\fDOC-B\fDOC-C\nfrom __future__ import annotations\n"""\n'
@@ -285,6 +250,14 @@ class TestRemoveFutureAnnotationsImport:
 
         assert _remove_future_annotations_import(source) == expected
 
+    def test_mixed_ending_seam_preserves_two_separators(self) -> None:
+        source = '"""doc"""\rfrom __future__ import annotations\r\n\ndef f():\n    return 1\n'
+        result = _remove_future_annotations_import(source)
+
+        assert result == '"""doc"""\n\rdef f():\n    return 1\n'
+        assert len(result.splitlines(keepends=True)) == 4
+        assert _remove_future_annotations_import(result) == result
+
     @pytest.mark.parametrize(
         'source',
         [
@@ -306,6 +279,21 @@ class TestRemoveFutureAnnotationsImport:
     )
     def test_preserves_unowned_source(self, source: str) -> None:
         assert _remove_future_annotations_import(source) == source
+
+    def test_recognized_spellings_removed(self) -> None:
+        for spelling in (
+            'from __future__ import annotations\n',
+            'from __future__ import (annotations)\n',
+            'from __future__ import ( annotations )\n',
+            'from __future__ import (annotations,)\n',
+            'from __future__ import  annotations\n',
+            'from __future__ import \\\n    annotations\n',
+            'from __future__ import (\n    annotations\n)\n',
+        ):
+            source = spelling + '\n\ndef f():\n    return 1\n'
+            removed = _remove_future_annotations_import(source)
+            assert removed == '\n\ndef f():\n    return 1\n', spelling
+            assert _remove_future_annotations_import(removed) == removed, spelling
 
     @pytest.mark.parametrize(
         ('source', 'expected'),
@@ -364,7 +352,11 @@ class TestRemoveFutureAnnotationsImport:
 
         assert _remove_future_annotations_import(source) == f'{_FUTURE_IMPORT}\n'
 
-    def test_removes_only_first_recognized_duplicate(self) -> None:
-        source = f'{_FUTURE_IMPORT}\r\n{_FUTURE_IMPORT}\n'
-
-        assert _remove_future_annotations_import(source) == f'{_FUTURE_IMPORT}\n'
+    def test_unowned_or_ineligible_spans_unchanged(self) -> None:
+        for source in (
+            'from __future__ import annotations as _a\n_A = _a\n',
+            'from __future__ import annotations, generator_stop\n',
+            'import os; from __future__ import annotations\n',
+            'from __future__ import (\n    # keep\n    annotations\n)\n',
+        ):
+            assert _remove_future_annotations_import(source) == source, source

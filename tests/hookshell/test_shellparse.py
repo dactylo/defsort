@@ -11,7 +11,131 @@ from defsort._vendor.hookshell._shellparse import (
     Word,
     _Comment,
     parse_command,
+    parse_source,
 )
+from defsort._vendor.hookshell._source import (
+    SourceSpan,
+    SourceText,
+    join_sources,
+    resolve_span,
+)
+
+
+class TestSourceMapping:
+    def test_added_newline_in_unterminated_body_has_zero_width_source(self) -> None:
+        command = parse_command('cat <<EOF\nbody')
+        body = next(e for e in command.segments[0].elements if isinstance(e, Heredoc))
+        assert body.source is not None
+        assert body.source.text == 'body\n'
+        span = resolve_span(SourceSpan(body.source, 4, 5), context='heredoc')
+        assert span is not None
+        assert span.start == span.end == 4
+
+    def test_evaluator_join_parses_both_arguments_at_original_body_lines(self) -> None:
+        source = SourceText("'git'\n'commit'", context='heredoc')
+        words = [
+            element
+            for segment in parse_source(source).segments
+            for element in segment.elements
+            if isinstance(element, Word)
+        ]
+        joined = join_sources([word.literal_source for word in words], context='eval')
+        assert joined is not None
+        reparsed = parse_source(joined)
+        for word, expected_line in zip(reparsed.segments[0].elements, (1, 2), strict=True):
+            assert isinstance(word, Word)
+            assert word.span is not None
+            span = resolve_span(word.span, context='heredoc')
+            assert span is not None
+            assert span.source.text[: span.start].count('\n') + 1 == expected_line
+            assert span.source.text[span.start : span.end] == word.literal_text
+
+    def test_hand_built_word_has_no_invented_source(self) -> None:
+        word = Word('git', (LiteralPart('git', quoted=False),))
+        assert word.literal_text == 'git'
+        assert word.literal_source is None
+        assert word.span is None
+
+    def test_late_recovery_tab_removal_keeps_shared_body_ownership(self) -> None:
+        text = "cat <<'MISSING'\nfirst\ncat <<-ALSO_MISSING\n\tgit commit"
+        command = parse_command(text, recover_heredocs=True)
+        first_body = command.segments[0].elements[-1]
+        later_body = command.segments[2].elements[-1]
+        assert isinstance(first_body, Heredoc)
+        assert isinstance(later_body, Heredoc)
+        assert first_body.body == 'first\ncat <<-ALSO_MISSING\n\tgit commit'
+        assert later_body.body == ''
+        word = command.segments[-1].elements[-1]
+        assert isinstance(word, Word)
+        assert word.span is not None
+        span = resolve_span(word.span, context='heredoc')
+        assert span is not None
+        assert span.source is first_body.source
+        assert span.source.text[: span.start].count('\n') + 1 == 3
+        assert span.source.text[span.start : span.end] == 'commit'
+        original = resolve_span(word.span, context='command')
+        assert original is not None
+        assert original.source.text == text
+        assert text[original.start : original.end] == 'commit'
+
+    @pytest.mark.parametrize('strip_tabs', [False, True])
+    def test_recovered_words_keep_body_locations(self, *, strip_tabs: bool) -> None:
+        operator = '<<-' if strip_tabs else '<<'
+        text = f'cat {operator}EOF\n\tfirst\n\tgit commit'
+        command = parse_command(text, recover_heredocs=True)
+        body = next(e for e in command.segments[0].elements if isinstance(e, Heredoc))
+        word = command.segments[-1].elements[-1]
+        assert isinstance(word, Word)
+        assert word.span is not None
+        span = resolve_span(word.span, context='heredoc')
+        assert span is not None
+        assert span.source.text[: span.start].count('\n') + 1 == 2
+        assert span.source.text[span.start : span.end] == 'commit'
+        root = resolve_span(word.span, context='command')
+        assert root is not None
+        assert root.source.text == text
+        assert text[root.start : root.end] == 'commit'
+        assert body.body_inlined
+
+    @pytest.mark.parametrize('text', ["'gi't", 'gi\\\nt', '"gi\\\nt"'])
+    def test_literal_decoding_preserves_character_positions(self, text: str) -> None:
+        word = _word(text)
+        assert word.literal_source is not None
+        resolved = resolve_span(SourceSpan(word.literal_source, 2, 3), context='command')
+        assert resolved is not None
+        assert text[resolved.start : resolved.end] == 't'
+        assert word == Word(text, word.parts, span=None)
+
+    def test_repeated_heredocs_keep_distinct_body_occurrences(self) -> None:
+        text = "cat <<'EOF'; cat <<'EOF'\ngit commit\nEOF\ngit commit\nEOF\n"
+        bodies = [
+            element
+            for segment in parse_command(text).segments
+            for element in segment.elements
+            if isinstance(element, Heredoc)
+        ]
+        assert len(bodies) == 2
+        first_start = len("cat <<'EOF'; cat <<'EOF'\n")
+        second_start = first_start + len('git commit\nEOF\n')
+        for body, start in zip(bodies, (first_start, second_start), strict=True):
+            assert body.source is not None
+            resolved = resolve_span(SourceSpan(body.source, 0, 10), context='command')
+            assert resolved is not None
+            assert resolved.start == start
+            assert text[resolved.start : resolved.end] == 'git commit'
+        assert bodies[0] == bodies[1]
+
+    def test_tabs_and_backtick_decoding_resolve_body_local_line(self) -> None:
+        command = parse_command('cat <<-EOF\n\tfirst\n\t`gi\\\nt commit`\nEOF\n')
+        body = next(e for e in command.segments[0].elements if isinstance(e, Heredoc))
+        part = body.expansions[0]
+        word = part.command.segments[0].elements[1]
+        assert isinstance(word, Word)
+        assert word.span is not None
+        resolved = resolve_span(word.span, context='heredoc')
+        assert resolved is not None
+        assert resolved.source.text[: resolved.start].count('\n') + 1 == 3
+        assert resolved.source.text[resolved.start : resolved.end] == 'commit'
 
 
 class TestLexicalRules:
@@ -61,7 +185,7 @@ class TestLexicalRules:
         word = _word('"a $B c"')
         assert word.parts == (
             LiteralPart('a ', quoted=True),
-            ExpansionPart('$B'),
+            ExpansionPart('$B', in_double_quotes=True),
             LiteralPart(' c', quoted=True),
         )
 
@@ -77,6 +201,21 @@ class TestLexicalRules:
     def test_empty_word_keeps_one_empty_part(self) -> None:
         assert _word('""').parts == (LiteralPart('', quoted=True),)
         assert _word("''").parts == (LiteralPart('', quoted=True),)
+
+    @pytest.mark.parametrize(
+        ('text', 'quoted'),
+        [
+            ('"$TMPDIR/x"', True),
+            ('"${TMPDIR}/x"', True),
+            ('"a $B"', True),
+            ('$TMPDIR/x', False),
+            ('${TMPDIR}/x', False),
+            ('~/x', False),
+        ],
+    )
+    def test_expansion_records_double_quotes(self, text: str, *, quoted: bool) -> None:
+        part = next(part for part in _word(text).parts if isinstance(part, ExpansionPart))
+        assert part.in_double_quotes is quoted
 
     def test_operator_characters_never_join_a_word(self) -> None:
         command = parse_command('a>b')

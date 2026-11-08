@@ -10,7 +10,7 @@ requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "defsort"
-version = "0.2.0"
+version = "0.3.0"
 description = "Sort Python definitions by dependency or alphabetically"
 keywords = [ "ast", "definitions", "dependency", "formatter", "sort" ]
 license = "MIT"
@@ -44,6 +44,7 @@ dev = [
   "pyright",
   "ruff",
   "vulture",
+  "zizmor",
   { include-group = "test" },
 ]
 test = [
@@ -87,14 +88,6 @@ exclude-dependencies = [
 target-version = "py313"
 line-length = 99
 namespace-packages = [ "plugins" ]
-include = [
-  "_build.py",
-  "conftest.py",
-  "plugins/**/*.{py,pyi,ipynb}",
-  "pyproject.toml",
-  "src/**/*.{py,pyi,ipynb}",
-  "tests/**/*.{py,pyi,ipynb}",
-]
 format.quote-style = "single"
 format.exclude = [ "*.md" ]
 lint.select = [ "ALL" ]
@@ -113,10 +106,6 @@ lint.per-file-ignores."plugins/*/tests/**/*.py" = [
   "D",    # No docstrings required in tests
   "S101", # Allow asserts in tests
 ]
-# Same-file private-member collaboration follows the module privacy boundary.
-lint.per-file-ignores."src/defsort/_core/_ordering.py" = [ "SLF001" ]
-lint.per-file-ignores."src/defsort/_vendor/hookshell/_grammar.py" = [ "SLF001" ]
-lint.per-file-ignores."src/defsort/_vendor/hookshell/_shellparse.py" = [ "SLF001" ]
 lint.per-file-ignores."tests/**/*.py" = [
   "D",       # No docstrings required in tests
   "PLR2004", # Allow magic values in tests
@@ -144,8 +133,9 @@ max_supported_python = "3.15"
 # ==========================================================
 [tool.pyright]
 pythonVersion = "3.13"  # Keep in sync with tool.ruff.target-version
+venv = ".venv"  # Created by make setup
+venvPath = "."
 typeCheckingMode = "strict"
-include = [ "_build.py", "conftest.py", "plugins", "src", "tests" ]
 extraPaths = [ ".", "src" ]
 executionEnvironments = [
   { root = "tests", reportPrivateUsage = "none" },

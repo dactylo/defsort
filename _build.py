@@ -12,6 +12,16 @@ class PluginMetadataHook(MetadataHookInterface):
 
     @override
     def update(self, metadata: dict[str, object]) -> None:
+        """Add bundled adapter registrations to the distribution metadata.
+
+        Args:
+            metadata: Metadata mapping whose entry-point table is replaced.
+
+        Raises:
+            OSError: If a plugin manifest cannot be read.
+            tomllib.TOMLDecodeError: If a plugin manifest is invalid TOML.
+            ValueError: If two manifests register the same entry-point name.
+        """
         metadata['entry-points'] = _plugin_entry_points(Path(self.root))
 
 

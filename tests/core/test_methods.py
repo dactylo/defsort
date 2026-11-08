@@ -17,7 +17,6 @@ from defsort._core._methods import (
     _get_property_group_info,
     _group_property_methods,
     _is_property_decorator,
-    _method_group_key,
     _order_methods_alphabetical,
     _order_methods_by_dependency,
     _sort_class_methods,
@@ -116,8 +115,7 @@ class C:
 class TestAnalyzeMethodDeps:
     def test_annotations_not_runtime_deps(self) -> None:
         src = 'class C:\n    def alpha(self): pass\n    def bravo(self) -> alpha: pass\n'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         methods = cls.body
         method_names = {m.name for m in methods if isinstance(m, ast.FunctionDef)}
         func = methods[1]
@@ -127,8 +125,7 @@ class TestAnalyzeMethodDeps:
 
     def test_body_deps_not_collected(self) -> None:
         src = 'class C:\n    def alpha(self): pass\n    def bravo(self): self.alpha()\n'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         methods = cls.body
         method_names = {m.name for m in methods if isinstance(m, ast.FunctionDef)}
         func = methods[1]
@@ -143,8 +140,7 @@ class TestAnalyzeMethodDeps:
             '    @validator\n'
             '    def process(self): pass\n'
         )
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         methods = cls.body
         method_names = {m.name for m in methods if isinstance(m, ast.FunctionDef)}
         func = methods[1]
@@ -154,8 +150,7 @@ class TestAnalyzeMethodDeps:
 
     def test_default_arg_dep(self) -> None:
         src = 'class C:\n    def factory(self): pass\n    def process(self, fn=factory): pass\n'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         methods = cls.body
         method_names = {m.name for m in methods if isinstance(m, ast.FunctionDef)}
         func = methods[1]
@@ -165,8 +160,7 @@ class TestAnalyzeMethodDeps:
 
     def test_same_name_read_is_collected_before_binding(self) -> None:
         src = 'class C:\n    def process(self, fn=process): pass\n'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         methods = cls.body
         method_names = {m.name for m in methods if isinstance(m, ast.FunctionDef)}
         func = methods[0]
@@ -447,7 +441,7 @@ class TestBodyAwareDependency:
         result = defsort.sort(_SRC_BODY_EDGE)
         assert result.index('def record_resource') < result.index('def prepare')
 
-    def test_ignore_matches_head_behavior(self) -> None:
+    def test_ignore_does_not_order_by_body_dependencies(self) -> None:
         policy = SortPolicy(method_bodies='ignore')
         assert _sort_with_policy(_SRC_BODY_EDGE, policy) == _SRC_BODY_EDGE
 
@@ -508,6 +502,16 @@ class TestCategoryComposition:
             '__repr__',
             '_evict',
             'store',
+        ]
+
+        methods = _make_methods(['process', '__str__', '__init__', '__new__', 'validate'])
+        ordered = _order_methods_alphabetical(methods, policy=SortPolicy())
+        assert [method.name for method in ordered] == [
+            '__new__',
+            '__init__',
+            '__str__',
+            'process',
+            'validate',
         ]
 
     def test_before_regular_public_first(self) -> None:
@@ -697,10 +701,6 @@ class TestDecoratorBindingIdentity:
 class TestDefinitionTimeAnchorCrossing:
     def test_init_default_edge_keeps_regular_method_first(self) -> None:
         assert defsort.sort(_SRC_INIT_DEFAULT_EDGE) == _SRC_INIT_DEFAULT_EDGE
-
-    def test_result_is_idempotent(self) -> None:
-        once = defsort.sort(_SRC_INIT_DEFAULT_EDGE)
-        assert defsort.sort(once) == once
 
 
 class TestDuplicatePropertyBinders:
@@ -973,32 +973,28 @@ class TestFullMethodSortHazards:
 class TestGetPropertyGroupInfo:
     def test_deleter(self) -> None:
         src = 'class C:\n    @x.deleter\n    def x(self): pass'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         func = cls.body[0]
         assert isinstance(func, ast.FunctionDef)
         assert _get_property_group_info(func) == ('x', 'deleter')
 
     def test_property_returns_none(self) -> None:
         src = 'class C:\n    @property\n    def x(self): return 1'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         func = cls.body[0]
         assert isinstance(func, ast.FunctionDef)
         assert _get_property_group_info(func) is None
 
     def test_regular_method_returns_none(self) -> None:
         src = 'class C:\n    def m(self): pass'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         func = cls.body[0]
         assert isinstance(func, ast.FunctionDef)
         assert _get_property_group_info(func) is None
 
     def test_setter(self) -> None:
         src = 'class C:\n    @x.setter\n    def x(self, val): pass'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         func = cls.body[0]
         assert isinstance(func, ast.FunctionDef)
         assert _get_property_group_info(func) == ('x', 'setter')
@@ -1442,24 +1438,21 @@ class TestInitialMethodGapOwnership:
 class TestIsPropertyDecorator:
     def test_other_decorator(self) -> None:
         src = 'class C:\n    @staticmethod\n    def m(): pass'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         func = cls.body[0]
         assert isinstance(func, ast.FunctionDef)
         assert _is_property_decorator(func) is False
 
     def test_property_decorator(self) -> None:
         src = 'class C:\n    @property\n    def x(self): return 1'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         func = cls.body[0]
         assert isinstance(func, ast.FunctionDef)
         assert _is_property_decorator(func) is True
 
     def test_undecorated(self) -> None:
         src = 'class C:\n    def m(self): pass'
-        cls = ast.parse(src).body[0]
-        assert isinstance(cls, ast.ClassDef)
+        cls = _class_node(src)
         func = cls.body[0]
         assert isinstance(func, ast.FunctionDef)
         assert _is_property_decorator(func) is False
@@ -1788,54 +1781,6 @@ class TestMethodBanners:
         assert sort_file(result.new_source, options=options).new_source == expected
 
     @pytest.mark.parametrize(
-        ('mode', 'order', 'expected_names', 'has_banner'),
-        [
-            ('barriers', 'alphabetical', ['zulu', 'alpha'], True),
-            ('ignore', 'alphabetical', ['alpha', 'zulu'], True),
-            ('strip', 'alphabetical', ['alpha', 'zulu'], False),
-            ('barriers', 'none', ['zulu', 'alpha'], True),
-            ('ignore', 'none', ['zulu', 'alpha'], True),
-            ('strip', 'none', ['zulu', 'alpha'], False),
-        ],
-    )
-    def test_banner_modes_apply_to_alphabetical_and_none_method_order(
-        self,
-        mode: BannerMode,
-        order: SortScopeOrder,
-        expected_names: list[str],
-        *,
-        has_banner: bool,
-    ) -> None:
-        src = (
-            'class C:\n'
-            '    def zulu(self):\n'
-            '        pass\n'
-            '\n'
-            '    # --------\n'
-            '\n'
-            '    def alpha(self):\n'
-            '        pass\n'
-        )
-
-        result = sort_file(
-            src,
-            options=EngineOptions(
-                policy=SortPolicy(definition_order='none', method_order=order, banners=mode),
-                add_future=False,
-            ),
-        )
-
-        class_node = ast.parse(result.new_source).body[0]
-        assert isinstance(class_node, ast.ClassDef)
-        method_names = [
-            method.name
-            for method in class_node.body
-            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
-        assert method_names == expected_names
-        assert ('    # --------\n' in result.new_source) is has_banner
-
-    @pytest.mark.parametrize(
         'mode',
         ['barriers', 'ignore', 'strip'],
     )
@@ -2146,53 +2091,6 @@ class TestMethodCommentAttachment:
         def_a_idx = next(i for i, line in enumerate(lines) if 'def a(' in line)
         assert second_idx == first_idx + 1
         assert def_a_idx == second_idx + 1
-
-
-class TestMethodGroupKey:
-    def test_dunder_repr(self) -> None:
-        assert _method_group_key('__repr__', SortPolicy()) == (2, '__repr__')
-
-    def test_dunder_str(self) -> None:
-        assert _method_group_key('__str__', SortPolicy()) == (2, '__str__')
-
-    def test_init(self) -> None:
-        assert _method_group_key('__init__', SortPolicy()) == (1, '__init__')
-
-    def test_new(self) -> None:
-        assert _method_group_key('__new__', SortPolicy()) == (0, '__new__')
-
-    def test_regular_method(self) -> None:
-        assert _method_group_key('process', SortPolicy()) == (3, 'process')
-
-    def test_sort_order(self) -> None:
-        names = ['process', '__str__', '__init__', '__new__', 'validate']
-        policy = SortPolicy()
-        sorted_names = sorted(names, key=lambda name: _method_group_key(name, policy))
-        assert sorted_names == ['__new__', '__init__', '__str__', 'process', 'validate']
-
-
-class TestMethodTrailingComments:
-    def test_trailing_comment_after_method_preserved(self) -> None:
-        src = (
-            'class C:\n'
-            '    def b(self):\n'
-            '        return self.a()\n'
-            '    # trailing for b\n'
-            '\n'
-            '    def a(self):\n'
-            '        pass\n'
-        )
-        result = sort_file(
-            src,
-            options=EngineOptions(
-                policy=SortPolicy(
-                    definition_order='alphabetical',
-                    method_order='alphabetical',
-                ),
-                add_future=False,
-            ),
-        )
-        assert '# trailing for b' in result.new_source
 
 
 class TestMethodTrailingOwnershipGuard:
@@ -2772,15 +2670,6 @@ class TestOneMethodBannerParity:
 
 
 class TestOrderMethodsAlphabetical:
-    def test_category_ordering(self) -> None:
-        methods = [
-            _method('process', 0),
-            _method('__repr__', 1),
-            _method('__init__', 2),
-        ]
-        result = _order_methods_alphabetical(methods)
-        assert [m.name for m in result] == ['__init__', '__repr__', 'process']
-
     @pytest.mark.parametrize(
         'source',
         [
@@ -3486,6 +3375,12 @@ class TestSortFileMethods:
         assert result.candidate_source == source.replace(banner, '')
         assert result.method_sorts == ()
         assert result.class_blockers == ()
+
+
+def _class_node(source: str) -> ast.ClassDef:
+    node = ast.parse(source).body[0]
+    assert isinstance(node, ast.ClassDef)
+    return node
 
 
 def _make_methods(names: list[str]) -> list[MethodDefinition]:

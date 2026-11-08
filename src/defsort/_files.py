@@ -1,142 +1,56 @@
 """Shared file I/O utilities for defsort."""
 
-import contextlib
-import errno
 import io
-import os
-import stat
-import subprocess
-import tempfile
 import tokenize
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from defsort._git_executable import resolve_git_executable
-
-_SKIP_DIRS = frozenset(
-    {
-        '.git',
-        '.hg',
-        '.mypy_cache',
-        '.pytest_cache',
-        '.ruff_cache',
-        '.svn',
-        '.tox',
-        '.venv',
-        '__pycache__',
-        'build',
-        'dist',
-        'venv',
-    }
-)
+from defsort._vendor.gitfiles._discovery import collect_file_groups as _shared_collect_file_groups
+from defsort._vendor.gitfiles._discovery import collect_files as _shared_collect_files
+from defsort._vendor.gitfiles._discovery import private_paths as _shared_private_paths
+from defsort._vendor.srcfiles import write_in_place
 
 
 @dataclass(frozen=True, slots=True)
 class _ReadResult:
-    """Result of reading exact Python source with its encoding."""
+    """Result of reading exact Python source with its encoding and the bytes it came from."""
 
     source: str
     encoding: str
+    raw: bytes
 
 
-def _filter_git_ignored(directory: Path, files: list[Path]) -> list[Path]:
-    """Remove Git-ignored paths while retaining the input on Git failure."""
-    if not files:
-        return files
-    relative_files = [(path, os.fsencode(os.path.relpath(path, directory))) for path in files]
-    try:
-        result = subprocess.run(
-            [  # noqa: S607
-                'git',
-                'check-ignore',
-                '-z',
-                '--stdin',
-            ],
-            capture_output=True,
-            cwd=directory,
-            executable=resolve_git_executable(cwd=directory),
-            input=b'\0'.join(raw_path for _, raw_path in relative_files) + b'\0',
-            check=False,
-        )
-    except OSError:
-        return files
-    if result.returncode not in (0, 1):
-        return files
-    ignored = frozenset(result.stdout.split(b'\0'))
-    return [path for path, raw_path in relative_files if raw_path not in ignored]
-
-
-def _collect_directory(directory: Path) -> list[Path]:
-    """Collect Python files from one directory operand."""
-    children: list[Path] = []
-    nested_worktrees: list[Path] = []
-    for root, dirnames, filenames in os.walk(directory):
-        current = Path(root)
-        if current != directory and ('.git' in dirnames or '.git' in filenames):
-            nested_worktrees.append(current)
-        dirnames[:] = sorted(name for name in dirnames if name not in _SKIP_DIRS)
-        children.extend(
-            child
-            for name in filenames
-            if name.endswith('.py') and not (child := current / name).is_symlink()
-        )
-
-    by_worktree: dict[Path, list[Path]] = {directory: []}
-    included_worktrees = {directory}
-    for root in nested_worktrees:
-        parent = next(
-            (
-                candidate
-                for candidate in reversed(nested_worktrees)
-                if candidate != root and root.is_relative_to(candidate)
-            ),
-            directory,
-        )
-        if parent in included_worktrees and _filter_git_ignored(parent, [root]):
-            included_worktrees.add(root)
-    for path in sorted(children):
-        owner = next(
-            (root for root in reversed(nested_worktrees) if path.is_relative_to(root)),
-            directory,
-        )
-        if owner in included_worktrees:
-            by_worktree.setdefault(owner, []).append(path)
-    return sorted(
-        path
-        for root, worktree_files in by_worktree.items()
-        for path in _filter_git_ignored(root, worktree_files)
-    )
-
-
-def collect_files(paths: Iterable[str]) -> list[Path]:
-    """Expand paths into a deduplicated Python file list.
+def collect_file_groups(paths: Iterable[str]) -> list[list[Path]]:
+    """Expand paths into groups of Python file paths that name one file.
 
     Directory operands filter discovered files through standard Git exclusions
-    when available and retain filesystem results on Git failure.
+    when available and retain filesystem results on Git failure. Repeated
+    operands and case, hard-link, and symlink aliases of one file share a
+    group.
 
     Args:
         paths: File and directory paths to expand.
 
     Returns:
-        Python files in stable traversal order, including nonexistent explicit
-        paths for later diagnostics.
+        Groups in stable traversal order, each listing its spellings in that
+        order, including nonexistent explicit paths for later diagnostics.
     """
-    result: list[Path] = []
-    for raw in paths:
-        p = Path(raw)
-        if p.is_dir():
-            result.extend(_collect_directory(p))
-        elif p.suffix == '.py' or not p.exists():
-            result.append(p)
-    seen: set[Path] = set()
-    deduped: list[Path] = []
-    for p in result:
-        resolved = p.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            deduped.append(p)
-    return deduped
+    return _shared_collect_file_groups(paths, tool='defsort')
+
+
+def collect_files(paths: Iterable[str]) -> list[Path]:
+    """Expand paths into a deduplicated Python file list.
+
+    A file named more than once is kept once under its first spelling.
+
+    Args:
+        paths: File and directory paths to expand.
+
+    Returns:
+        The first spelling of each group from `collect_file_groups`.
+    """
+    return _shared_collect_files(paths, tool='defsort')
 
 
 def encode_source(source: str, encoding: str) -> bytes:
@@ -148,22 +62,40 @@ def encode_source(source: str, encoding: str) -> bytes:
 
     Returns:
         Encoded source bytes.
+
+    Raises:
+        LookupError: If the encoding name is unknown.
+        UnicodeEncodeError: If the source cannot be represented in the
+            requested encoding.
     """
     return source.encode(encoding)
+
+
+def private_paths(repo_root: str, paths: list[str]) -> tuple[frozenset[str], str | None]:
+    """Return repository-relative paths whose private attribute is set.
+
+    Args:
+        repo_root: Repository root used to query Git attributes.
+        paths: Repository-relative paths as Git reports them.
+
+    Returns:
+        Labelled paths, or an empty set and the Git failure detail.
+    """
+    return _shared_private_paths(repo_root, paths, tool='defsort')
 
 
 def read_file_result(path: Path) -> _ReadResult:
     """Read exact file contents with encoding detection.
 
-    Reads raw bytes once, detects encoding via tokenize (matching
-    tokenize.open() behavior for BOM and PEP 263 cookies), and decodes without
-    changing line endings.
+    Reads raw bytes once, detects encoding via `tokenize` (matching
+    `tokenize.open()` behavior for BOM and PEP 263 cookies), and decodes
+    without changing line endings.
 
     Args:
         path: Path to the Python source file.
 
     Returns:
-        Exact decoded source plus its encoding.
+        Exact decoded source, its encoding, and the bytes it was decoded from.
 
     Raises:
         OSError: If the file cannot be read.
@@ -175,53 +107,36 @@ def read_file_result(path: Path) -> _ReadResult:
     encoding = tokenize.detect_encoding(io.BytesIO(raw).readline)[0]
     source = raw.decode(encoding)
     source = source.removeprefix('\ufeff')
-    return _ReadResult(source=source, encoding=encoding)
+    return _ReadResult(source=source, encoding=encoding, raw=raw)
 
 
-def write_source(
-    path: Path,
-    content: str,
-    *,
-    encoding: str = 'utf-8',
-) -> None:
-    """Write exact source bytes atomically without text-mode newline conversion.
+def write_source(path: Path, content: str, *, encoding: str, raw: bytes) -> bytes:
+    """Write exact source in place without text-mode newline conversion.
 
-    Writes to a temporary file in the target's directory and replaces the
-    target with `os.replace`, so a failed write never truncates the target.
-    A symlink target is resolved first, so the linked-to file is replaced.
-    Permission bits of an existing target are preserved; other inode metadata
-    (ownership, ACLs, extended attributes) is not. The target's parent
-    directory must be writable.
+    The file is written through its own descriptor only while it still holds
+    `raw`, so hard links, ownership, permissions, ACLs, and extended attributes
+    stay as an ordinary write leaves them, and a symlink writes its target. On
+    a write error, restoration of the original bytes is attempted.
 
     Args:
-        path: Target file path.
+        path: Existing target file.
         content: Exact source text.
-        encoding: Encoding to use for write-back (default 'utf-8').
+        encoding: Encoding to use for write-back.
+        raw: The bytes read from `path`.
+
+    Returns:
+        The bytes the file now holds, for a later rollback.
 
     Raises:
-        OSError: If the target is not writable or the write or replace fails.
-            The target is unchanged in every failure case.
+        LookupError: If the encoding name is unknown; no write is attempted.
+        UnicodeEncodeError: If the content cannot be represented in the
+            requested encoding; no write is attempted.
+        FileChangedError: If the file no longer holds `raw` or no longer
+            exists.
+        OSError: If the file cannot be written; restoration is attempted first.
+        RestoreError: If restoration fails or a close error leaves the outcome
+            uncertain.
     """
     data = encode_source(content, encoding)
-    target = path.resolve()
-    try:
-        mode: int | None = stat.S_IMODE(target.stat().st_mode)
-    except FileNotFoundError:
-        mode = None
-    if mode is not None and not os.access(target, os.W_OK):
-        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(target))
-    if mode is None:
-        umask = os.umask(0)
-        os.umask(umask)
-        mode = 0o666 & ~umask
-    fd, tmp_name = tempfile.mkstemp(prefix='.defsort-', suffix='.tmp', dir=target.parent)
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, 'wb') as tmp_file:
-            tmp_file.write(data)
-        tmp_path.chmod(mode)
-        tmp_path.replace(target)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink()
-        raise
+    write_in_place(path, data, expected=raw, tool='defsort')
+    return data

@@ -48,9 +48,9 @@ def build_json_record(
 
     Args:
         path: Display path for the selected file.
-        status: JsonStatus literal string value.
+        status: `JsonStatus` literal string value.
         warning: Human-readable error, skip, guard, or partial-outcome note.
-        result: SortResult when the file was successfully parsed.
+        result: `SortResult` when the file was successfully parsed.
         detect_result: Original-order classification and scores, when
             available.
 

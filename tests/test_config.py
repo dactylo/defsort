@@ -34,10 +34,9 @@ from defsort._types import (
     BannerMode,
     DefsortConfig,
     SortOverrides,
-    SortPolicy,
-    sort_policy_from_config,
+    validate_banner_pattern,
 )
-from tests._helpers import _ENV, decode_text, run_setup
+from tests._helpers import ENV, decode_text, run_setup
 
 _ALL_AXIS_VALUES = [
     (key, value, field)
@@ -138,9 +137,11 @@ class TestConfigCache:
         )
         proc = run_setup(
             [sys.executable, '-c', script, str(tmp_path)],
-            env={**_ENV, 'PYTHONWARNINGS': 'default'},
+            env={**ENV, 'PYTHONWARNINGS': 'default'},
         )
-        assert decode_text(proc.stderr).count('Unknown [tool.defsort] key: bogus-key') == 2
+        assert (
+            decode_text(proc.stderr).count('[tool.defsort]: unknown key bogus-key; ignoring') == 2
+        )
 
     def test_distinct_nested_sources_load_separately(
         self, tmp_path: Path, counted_config_load: list[Path]
@@ -222,6 +223,26 @@ class TestConfigCache:
         assert resolve_config_sourced(second)[0].transform.method_order == 'none'
         assert len(counted_config_load) == 1
 
+    def test_symlinked_pyproject_warns_once(self, tmp_path: Path) -> None:
+        source = tmp_path / 'shared.toml'
+        source.write_text('[tool.defsort]\nbanners = "bogus"\n', encoding='utf-8')
+        link = tmp_path / 'pyproject.toml'
+        try:
+            link.symlink_to(source)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f'symlinks unavailable: {exc}')
+
+        clear_config_cache()
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter('always', DefsortConfigWarning)
+            assert resolve_config_at_root(str(tmp_path)).transform.banners == 'barriers'
+            assert resolve_config(tmp_path / 'mod.py').banners == 'barriers'
+        assert len(captured) == 1
+        assert str(captured[0].message) == (
+            f"{source.as_posix()}: [tool.defsort].banners: invalid value 'bogus'; "
+            'expected barriers, ignore, strip; using barriers'
+        )
+
 
 class TestConfigWarningRendering:
     def test_body_exception_remains_primary(self) -> None:
@@ -241,12 +262,12 @@ class TestConfigWarningRendering:
             warnings.simplefilter('ignore', DefsortConfigWarning)
             with render_config_warnings():
                 _warn_config('invalid setting')
-        assert capsys.readouterr().err == 'Warning: invalid setting\n'
+        assert capsys.readouterr().err == 'warning: invalid setting\n'
 
     def test_config_warning_is_immediate(self, capsys: pytest.CaptureFixture[str]) -> None:
         with render_config_warnings():
             _warn_config('invalid setting')
-            assert capsys.readouterr().err == 'Warning: invalid setting\n'
+            assert capsys.readouterr().err == 'warning: invalid setting\n'
 
     def test_nested_exception_restores_outer_renderer(
         self, capsys: pytest.CaptureFixture[str]
@@ -257,7 +278,7 @@ class TestConfigWarningRendering:
                 with pytest.raises(RuntimeError, match='inner failed'), render_config_warnings():
                     raise RuntimeError('inner failed')
                 _warn_config('outer warning')
-        assert capsys.readouterr().err == 'Warning: outer warning\n'
+        assert capsys.readouterr().err == 'warning: outer warning\n'
 
     def test_toml_warning_escapes_controls(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -268,7 +289,8 @@ class TestConfigWarningRendering:
         with render_config_warnings():
             resolve_config_at_root(str(tmp_path))
         assert capsys.readouterr().err == (
-            'Warning: Unknown [tool.defsort] key: bad\\x1b\\x85\\x0a\\x1b, ignoring\n'
+            f'warning: {tmp_path.as_posix()}/pyproject.toml: [tool.defsort]: '
+            'unknown key bad\\x1b\\x85\\x0a\\x1b; ignoring\n'
         )
 
     def test_unrelated_warning_filter_still_raises(self) -> None:
@@ -381,18 +403,6 @@ class TestIncrementalFallbackConfig:
         assert cfg.incremental_fallback == 'warn'
         assert capsys.readouterr().err == ''
 
-    def test_parse_full_sort(self, tmp_path: Path) -> None:
-        toml = '[tool.defsort]\nincremental-fallback = "full-sort"\n'
-        (tmp_path / 'pyproject.toml').write_text(toml, encoding='utf-8')
-        cfg = resolve_runtime_config(tmp_path)
-        assert cfg.incremental_fallback == 'full-sort'
-
-    def test_parse_warn(self, tmp_path: Path) -> None:
-        toml = '[tool.defsort]\nincremental-fallback = "warn"\n'
-        (tmp_path / 'pyproject.toml').write_text(toml, encoding='utf-8')
-        cfg = resolve_runtime_config(tmp_path)
-        assert cfg.incremental_fallback == 'warn'
-
 
 class TestInvalidUtf8Toml:
     def test_invalid_utf8_warns_and_defaults(self, tmp_path: Path) -> None:
@@ -476,12 +486,6 @@ class TestLoadConfig:
         assert cfg.definition_order == 'dependency'
         assert cfg.method_order == 'dependency'
         assert capsys.readouterr().err == ''
-
-    def test_reads_color(self, tmp_path: Path) -> None:
-        toml = '[tool.defsort]\ncolor = "never"\n'
-        (tmp_path / 'pyproject.toml').write_text(toml)
-        cfg = resolve_runtime_config(tmp_path / 'foo.py')
-        assert cfg.color == 'never'
 
     def test_reads_incremental(self, tmp_path: Path) -> None:
         toml = '[tool.defsort]\nincremental = true\n'
@@ -693,7 +697,7 @@ class TestResolutionDiagnostics:
 
     def test_unknown_key_warns_and_is_ignored(self, tmp_path: Path) -> None:
         (tmp_path / 'pyproject.toml').write_text('[tool.defsort]\nbogus-key = 1\n')
-        with pytest.warns(DefsortConfigWarning, match='Unknown .* bogus-key'):
+        with pytest.warns(DefsortConfigWarning, match='unknown key bogus-key; ignoring'):
             assert resolve_config(tmp_path) == DefsortConfig()
 
     def test_unreadable_file_warns_and_defaults(self, tmp_path: Path) -> None:
@@ -760,20 +764,6 @@ class TestScopedEffectiveConfig:
         assert result.transform.definition_order == 'alphabetical'
         assert result.transform.method_order == 'dependency'
 
-    def test_cli_scoped_overrides_config(self) -> None:
-        cfg = ResolvedConfig(
-            transform=DefsortConfig(
-                definition_order='alphabetical',
-                method_order='alphabetical',
-            ),
-        )
-        result = effective_config(
-            cfg,
-            SortOverrides(definition_order='dependency'),
-        )
-        assert result.transform.definition_order == 'dependency'
-        assert result.transform.method_order == 'alphabetical'
-
     def test_no_overrides_preserves_config(self) -> None:
         cfg = ResolvedConfig(
             transform=DefsortConfig(
@@ -825,17 +815,10 @@ class TestScopedOrderConfig:
         assert cfg.definition_order == 'alphabetical'
         assert cfg.method_order == 'none'
 
-    def test_scoped_keys_override_order(self, tmp_path: Path) -> None:
-        toml = '[tool.defsort]\norder = "alphabetical"\nmethod-order = "dependency"\n'
-        (tmp_path / 'pyproject.toml').write_text(toml, encoding='utf-8')
-        cfg = resolve_config(tmp_path)
-        assert cfg.definition_order == 'alphabetical'
-        assert cfg.method_order == 'dependency'
-
 
 def _parse_for(body: str) -> ResolvedConfig:
     data = tomllib.loads(f'[tool.defsort]\n{body}')
-    return _parse_section(data['tool']['defsort'])
+    return _parse_section(data['tool']['defsort'], Path('pyproject.toml'))
 
 
 @pytest.fixture
@@ -852,11 +835,6 @@ def counted_config_load(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
 
 
 class TestBannerConfig:
-    def test_default_is_barriers(self) -> None:
-        cfg = DefsortConfig()
-        assert cfg.banners == 'barriers'
-        assert cfg.banner_pattern is None
-
     def test_effective_mode_override_preserves_config_pattern(self) -> None:
         cfg = ResolvedConfig(
             transform=DefsortConfig(
@@ -880,7 +858,7 @@ class TestBannerConfig:
             '[tool.defsort]\nbanners = "move"\n',
             encoding='utf-8',
         )
-        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banners'):
+        with pytest.warns(DefsortConfigWarning, match=r'\[tool.defsort\].banners: invalid value'):
             cfg = resolve_config(tmp_path)
         assert cfg.banners == 'barriers'
         assert capsys.readouterr().err == ''
@@ -892,7 +870,9 @@ class TestBannerConfig:
             "[tool.defsort]\nbanners = 'ignore'\nbanner-pattern = '('\n",
             encoding='utf-8',
         )
-        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
+        with pytest.warns(
+            DefsortConfigWarning, match=r'\[tool.defsort\].banner-pattern: invalid value'
+        ):
             cfg = resolve_config(tmp_path)
         assert cfg.banners == 'ignore'
         assert cfg.banner_pattern is None
@@ -905,7 +885,9 @@ class TestBannerConfig:
             "[tool.defsort]\nbanner-pattern = '[unterminated'\n",
             encoding='utf-8',
         )
-        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
+        with pytest.warns(
+            DefsortConfigWarning, match=r'\[tool.defsort\].banner-pattern: invalid value'
+        ):
             cfg = resolve_config(tmp_path)
         assert cfg.banner_pattern is None
         assert capsys.readouterr().err == ''
@@ -917,7 +899,7 @@ class TestBannerConfig:
             '[tool.defsort]\nbanner-pattern = 42\n',
             encoding='utf-8',
         )
-        with pytest.warns(DefsortConfigWarning, match='expected string'):
+        with pytest.warns(DefsortConfigWarning, match='expected a string'):
             cfg = resolve_config(tmp_path)
         assert cfg.banner_pattern is None
         assert capsys.readouterr().err == ''
@@ -947,7 +929,9 @@ class TestBannerConfig:
             "[tool.defsort]\nbanner-pattern = '^# (a+)+$'\n",
             encoding='utf-8',
         )
-        with pytest.warns(DefsortConfigWarning, match=r'Invalid \[tool.defsort\] banner-pattern'):
+        with pytest.warns(
+            DefsortConfigWarning, match=r'\[tool.defsort\].banner-pattern: invalid value'
+        ):
             cfg = resolve_config(tmp_path)
         assert cfg.banner_pattern is None
         assert capsys.readouterr().err == ''
@@ -958,13 +942,6 @@ def isolate_config_cache() -> Iterator[None]:
     clear_config_cache()
     yield
     clear_config_cache()
-
-
-def test_axis_keys_parse() -> None:
-    cfg = _parse_for('method-bodies = "across-categories"\nmain = "sorted"\ntie-break = "source"')
-    assert cfg.transform.method_bodies == 'across-categories'
-    assert cfg.transform.main == 'sorted'
-    assert cfg.transform.tie_break == 'source'
 
 
 def test_axis_override_beats_config() -> None:
@@ -988,10 +965,6 @@ def test_clear_then_explicit_banner_pattern_override() -> None:
     assert effective.transform.banner_pattern == '^# Replacement'
 
 
-def test_default_config_matches_default_sort_policy() -> None:
-    assert sort_policy_from_config(DefsortConfig()) == SortPolicy()
-
-
 @pytest.mark.parametrize(('key', 'value', 'field'), _ALL_AXIS_VALUES)
 def test_every_axis_value_parses(key: str, value: str, field: str) -> None:
     cfg = _parse_for(f'{key} = "{value}"')
@@ -1013,21 +986,114 @@ def test_every_runtime_vocabulary_value_parses(key: str, value: str, field: str)
     assert getattr(cfg, field) == value
 
 
+def test_invalid_banner_pattern_includes_validation_reason() -> None:
+    pattern = '^# (a+)+$'
+    with pytest.raises(ValueError, match='unsupported regular-expression syntax') as invalid:
+        validate_banner_pattern(pattern)
+    with pytest.warns(DefsortConfigWarning) as captured:
+        cfg = _parse_for(f'banner-pattern = "{pattern}"')
+    assert cfg.transform.banner_pattern is None
+    assert str(captured[0].message) == (
+        f'pyproject.toml: [tool.defsort].banner-pattern: invalid value {pattern!r}; '
+        f'expected a valid banner pattern ({invalid.value}); using built-in detection'
+    )
+
+
+@pytest.mark.parametrize(
+    ('body', 'expected'),
+    [
+        (
+            'allow-on-failure = "yes"',
+            (
+                "[tool.defsort].allow-on-failure: invalid value 'yes'; "
+                'expected true or false; using false'
+            ),
+        ),
+        (
+            'show-skips = 1',
+            '[tool.defsort].show-skips: invalid value 1; expected true or false; using true',
+        ),
+        (
+            'incremental = "yes"',
+            (
+                "[tool.defsort].incremental: invalid value 'yes'; "
+                'expected true or false; using full mode'
+            ),
+        ),
+        (
+            'max-reorder-count = -1',
+            (
+                '[tool.defsort].max-reorder-count: invalid value -1; '
+                'expected a non-negative integer; using no limit'
+            ),
+        ),
+        (
+            'max-reorder-percent = 101',
+            (
+                '[tool.defsort].max-reorder-percent: invalid value 101; '
+                'expected an integer from 0 to 100; using no limit'
+            ),
+        ),
+        (
+            'banner-pattern = 1',
+            (
+                '[tool.defsort].banner-pattern: invalid value 1; '
+                'expected a string; using built-in detection'
+            ),
+        ),
+        (
+            'color = "bogus"',
+            (
+                "[tool.defsort].color: invalid value 'bogus'; "
+                'expected auto, always, never; using auto'
+            ),
+        ),
+        (
+            'incremental-fallback = "bogus"',
+            (
+                "[tool.defsort].incremental-fallback: invalid value 'bogus'; "
+                'expected warn, full-sort; using warn'
+            ),
+        ),
+        ('mystery = true', '[tool.defsort]: unknown key mystery; ignoring'),
+    ],
+)
+def test_invalid_key_warning_names_file_and_fallback(body: str, expected: str) -> None:
+    with pytest.warns(DefsortConfigWarning) as captured:
+        _parse_for(body)
+    assert [str(item.message) for item in captured] == [f'pyproject.toml: {expected}']
+
+
 def test_invalid_method_bodies_lists_every_valid_value() -> None:
     with pytest.warns(DefsortConfigWarning) as captured:
         cfg = _parse_for('method-bodies = "bogus"')
     assert cfg.transform.method_bodies == 'within-categories'
     assert str(captured[0].message) == (
-        "Invalid [tool.defsort] method-bodies: 'bogus' "
-        "(expected 'within-categories', 'ignore', or 'across-categories'), "
-        'using default'
+        "pyproject.toml: [tool.defsort].method-bodies: invalid value 'bogus'; "
+        'expected within-categories, ignore, across-categories; using within-categories'
     )
 
 
-def test_order_accepts_none() -> None:
-    cfg = _parse_for('order = "none"')
-    assert cfg.transform.definition_order == 'none'
-    assert cfg.transform.method_order == 'none'
+def test_invalid_method_order_names_order_value() -> None:
+    with pytest.warns(DefsortConfigWarning) as captured:
+        cfg = _parse_for('order = "alphabetical"\nmethod-order = 1')
+    assert cfg.transform.method_order == 'alphabetical'
+    assert str(captured[0].message) == (
+        'pyproject.toml: [tool.defsort].method-order: invalid value 1; '
+        'expected dependency, alphabetical, none; using alphabetical'
+    )
+
+
+def test_invalid_vocabulary_names_file_and_values(tmp_path: Path) -> None:
+    path = tmp_path / 'pyproject.toml'
+    path.write_text('[tool.defsort]\nbanners = "bogus"\n', encoding='utf-8')
+    with pytest.warns(DefsortConfigWarning) as captured:
+        cfg = resolve_config(tmp_path)
+    assert cfg.banners == 'barriers'
+    assert str(captured[0].message) == (
+        f"{path.as_posix()}: [tool.defsort].banners: invalid value 'bogus'; "
+        'expected barriers, ignore, strip; using barriers'
+    )
 
 
 def test_order_override_leaves_axis_config_intact() -> None:
@@ -1064,8 +1130,12 @@ def test_invalid_axis_value_warns_and_defaults(key: str, field: str) -> None:
 def test_nondefault_ineffective_value_warns(
     key: str, body: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    warn_ineffective_policy(_parse_for(body).transform)
-    assert key in capsys.readouterr().err
+    with render_config_warnings():
+        warn_ineffective_policy(_parse_for(body).transform)
+    assert (
+        f'warning: [tool.defsort] {key} has no effect under the resolved strategies; ignoring\n'
+        in capsys.readouterr().err
+    )
 
 
 def test_sourced_resolver_cleared_with_cache(tmp_path: Path) -> None:

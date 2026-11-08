@@ -1,7 +1,7 @@
-from defsort._types import Definition, SortResult
+from defsort._types import Definition, MethodDefinition, MethodSortInfo, SortResult
 
 
-def _make_def(  # pyright: ignore[reportUnusedFunction]
+def make_def(  # pyright: ignore[reportUnusedFunction]
     index: int, name: str
 ) -> Definition:
     return Definition(
@@ -15,7 +15,7 @@ def _make_def(  # pyright: ignore[reportUnusedFunction]
     )
 
 
-def _make_result(  # pyright: ignore[reportUnusedFunction]
+def make_result(  # pyright: ignore[reportUnusedFunction]
     *, changed: bool = True
 ) -> SortResult:
     orig = [
@@ -67,3 +67,13 @@ def _make_result(  # pyright: ignore[reportUnusedFunction]
         blocking_code=[],
         skipped=False,
     )
+
+
+def method_swap(
+    class_name: str, names: tuple[str, str], *, lines: tuple[int, int]
+) -> MethodSortInfo:
+    methods = [
+        MethodDefinition(index=index, name=name, start_line=line, end_line=line + 1, source='')
+        for index, (name, line) in enumerate(zip(names, lines, strict=True))
+    ]
+    return MethodSortInfo(class_name=class_name, original_order=methods, new_order=methods[::-1])

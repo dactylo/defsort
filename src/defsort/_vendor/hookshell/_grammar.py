@@ -1,7 +1,5 @@
 """Accept the closed commit command grammar over a parsed shell tree."""
 
-# pyright: reportPrivateUsage=false
-
 import re
 import sys
 from collections.abc import Sequence
@@ -25,6 +23,8 @@ from ._shellparse import (
     Word,
     WordPart,
 )
+
+__all__ = ['ADD_SELECTORS', 'CommitMode', 'CommitPlan', 'NoCommit', 'PreCommitAdd']
 
 ADD_SELECTORS = frozenset({'-A', '-u', '--all', '--update'})
 _AMEND_DATE_COMMAND = ('git', 'log', '-1', '--format=%aI')
@@ -72,17 +72,17 @@ _COMMIT_INTERACTIVE_LONG = {
 }
 _COMMIT_OPTIONAL_VALUE_SHORT = frozenset('Su')
 _COMMIT_SELECTION_LONG = {
-    '--all': ('_auto_stage', True),
-    '--include': ('_include', True),
-    '--no-all': ('_auto_stage', False),
-    '--no-include': ('_include', False),
-    '--no-only': ('_only', False),
-    '--only': ('_only', True),
+    '--all': ('auto_stage', True),
+    '--include': ('include', True),
+    '--no-all': ('auto_stage', False),
+    '--no-include': ('include', False),
+    '--no-only': ('only', False),
+    '--only': ('only', True),
 }
 _COMMIT_SELECTION_SHORT = {
-    'a': ('_auto_stage', True),
-    'i': ('_include', True),
-    'o': ('_only', True),
+    'a': ('auto_stage', True),
+    'i': ('include', True),
+    'o': ('only', True),
 }
 _COMMIT_STATUS_LONG = frozenset({'--dry-run', '--long', '--null', '--porcelain', '--short'})
 _COMMIT_VALUE_LONG = frozenset(
@@ -113,7 +113,7 @@ _HEREDOC_ELEMENT_COUNT = 3
 _HINT_ADD = (
     'supported add: git add [--] PATHSPEC... or git add (-A|--all|-u|--update) [--] [PATHSPEC...]'
 )
-_HINT_COMMIT = 'supported commit options are listed in docs/hook.md'
+HINT_COMMIT = 'supported commit options are listed in the hook documentation'
 _HINT_EXECUTABLE = 'use the bare executable name git; PATH resolves the installed git'
 _HINT_PRECHECK = (
     'run the check or observation in a separate tool call, then run the add/commit command '
@@ -211,32 +211,32 @@ class _CommitState:
     """Mutable option state while a commit segment is parsed."""
 
     __slots__ = (
-        '_auto_stage',
-        '_heredoc_messages',
-        '_include',
-        '_interactive',
-        '_interactive_option',
-        '_only',
-        '_options_ended',
-        '_pathspec_file_nul',
-        '_pathspec_from_file',
-        '_pathspecs',
-        '_status_only',
+        'auto_stage',
+        'heredoc_messages',
+        'include',
+        'interactive',
+        'interactive_option',
+        'only',
+        'options_ended',
+        'pathspec_file_nul',
+        'pathspec_from_file',
+        'pathspecs',
+        'status_only',
     )
 
     def __init__(self) -> None:
         """Initialize selection and metadata state before reading commit options."""
-        self._auto_stage = False
-        self._heredoc_messages = 0
-        self._include = False
-        self._interactive = False
-        self._interactive_option = ''
-        self._only = False
-        self._options_ended = False
-        self._pathspec_file_nul = False
-        self._pathspec_from_file: str | None = None
-        self._pathspecs: list[str] = []
-        self._status_only = False
+        self.auto_stage = False
+        self.heredoc_messages = 0
+        self.include = False
+        self.interactive = False
+        self.interactive_option = ''
+        self.only = False
+        self.options_ended = False
+        self.pathspec_file_nul = False
+        self.pathspec_from_file: str | None = None
+        self.pathspecs: list[str] = []
+        self.status_only = False
 
 
 class _GitSegment(NamedTuple):
@@ -297,24 +297,24 @@ def _check_shape(cd_route: str | None, parsed: Sequence[_GitSegment]) -> Rejecti
 
 def _commit_finish(state: _CommitState) -> _CommitState | Rejection:
     """Check the final selection state of a commit segment."""
-    has_inline = bool(state._pathspecs)
-    has_file = state._pathspec_from_file is not None
+    has_inline = bool(state.pathspecs)
+    has_file = state.pathspec_from_file is not None
     has_pathspec = has_inline or has_file
     defects = (
-        (state._interactive, f'option {state._interactive_option}'),
+        (state.interactive, f'option {state.interactive_option}'),
         (
-            state._pathspec_file_nul and not has_file,
+            state.pathspec_file_nul and not has_file,
             '--pathspec-file-nul without --pathspec-from-file',
         ),
-        (state._auto_stage and has_pathspec, 'pathspec with --all'),
+        (state.auto_stage and has_pathspec, 'pathspec with --all'),
         (has_inline and has_file, '--pathspec-from-file with pathspecs'),
-        (state._include and state._only, '--include with --only'),
-        (state._include and not has_pathspec, '--include without pathspec'),
-        (state._only and not has_pathspec, '--only without pathspec'),
+        (state.include and state.only, '--include with --only'),
+        (state.include and not has_pathspec, '--include without pathspec'),
+        (state.only and not has_pathspec, '--only without pathspec'),
     )
     for defect, element in defects:
         if defect:
-            return Rejection(element, _HINT_COMMIT)
+            return Rejection(element, HINT_COMMIT)
     return state
 
 
@@ -325,12 +325,12 @@ def _commit_flag(name: str, state: _CommitState) -> bool:
     if selection is not None:
         setattr(state, selection[0], selection[1])
     elif interactive is not None:
-        state._interactive = interactive
-        state._interactive_option = name
+        state.interactive = interactive
+        state.interactive_option = name
     elif name in _COMMIT_STATUS_LONG:
-        state._status_only = True
+        state.status_only = True
     elif name == '--pathspec-file-nul':
-        state._pathspec_file_nul = True
+        state.pathspec_file_nul = True
     else:
         return name in _COMMIT_BOOL_LONG
     return True
@@ -342,10 +342,10 @@ def _commit_short_flag(character: str, state: _CommitState) -> bool:
     if selection is not None:
         setattr(state, selection[0], selection[1])
     elif character == 'z':
-        state._status_only = True
+        state.status_only = True
     elif character == 'p':
-        state._interactive = True
-        state._interactive_option = '-p'
+        state.interactive = True
+        state.interactive_option = '-p'
     else:
         return character in _COMMIT_BOOL_SHORT
     return True
@@ -454,11 +454,11 @@ def _reject_word(word: Word, hint: str) -> Rejection:
 def _heredoc_message(word: Word) -> Rejection | None:
     """Accept the double-quoted heredoc message idiom, else name the defect."""
     if len(word.parts) != 1 or not isinstance(word.parts[0], SubstitutionPart):
-        return _reject_word(word, _HINT_COMMIT)
+        return _reject_word(word, HINT_COMMIT)
     part = word.parts[0]
     segments = part.command.segments
     if len(segments) != 1 or segments[0].terminator not in (None, '\n'):
-        return _reject_word(word, _HINT_COMMIT)
+        return _reject_word(word, HINT_COMMIT)
     elements = segments[0].elements
     shape = (
         len(elements) == _HEREDOC_ELEMENT_COUNT
@@ -470,9 +470,9 @@ def _heredoc_message(word: Word) -> Rejection | None:
         and elements[2].quoted
     )
     if not shape:
-        return _reject_word(word, _HINT_COMMIT)
+        return _reject_word(word, HINT_COMMIT)
     if not part.in_double_quotes:
-        return Rejection('unquoted heredoc message', _HINT_COMMIT)
+        return Rejection('unquoted heredoc message', HINT_COMMIT)
     return None
 
 
@@ -481,9 +481,9 @@ def _commit_message_word(value: Word, state: _CommitState) -> Rejection | None:
     rejection = _heredoc_message(value)
     if rejection is not None:
         return rejection
-    state._heredoc_messages += 1
-    if state._heredoc_messages > 1:
-        return Rejection('second heredoc message', _HINT_COMMIT)
+    state.heredoc_messages += 1
+    if state.heredoc_messages > 1:
+        return Rejection('second heredoc message', HINT_COMMIT)
     return None
 
 
@@ -496,16 +496,16 @@ def _commit_value(
     """Record one option value and return the index after it."""
     if isinstance(value, Word) and value.literal_text is None:
         if name not in ('-m', '--message'):
-            return _reject_word(value, _HINT_COMMIT)
+            return _reject_word(value, HINT_COMMIT)
         rejection = _commit_message_word(value, state)
         return next_index if rejection is None else rejection
     literal = value if isinstance(value, str) else (value.literal_text or '')
     if name == '--fixup' and literal.startswith('reword:'):
-        return Rejection('option --fixup=reword:', _HINT_COMMIT)
+        return Rejection('option --fixup=reword:', HINT_COMMIT)
     if name == '--pathspec-from-file':
         if literal in ('', '-'):
-            return Rejection('option --pathspec-from-file=-', _HINT_COMMIT)
-        state._pathspec_from_file = literal
+            return Rejection('option --pathspec-from-file=-', HINT_COMMIT)
+        state.pathspec_from_file = literal
     return next_index
 
 
@@ -520,14 +520,14 @@ def _commit_long_option(
     if separator and name in _COMMIT_VALUE_LONG:
         return _commit_value(name, joined, state, index + 1)
     if separator:
-        joined_rejection = Rejection(f'option {_fragment(text)}', _HINT_COMMIT)
+        joined_rejection = Rejection(f'option {_fragment(text)}', HINT_COMMIT)
         return index + 1 if name in _COMMIT_BOOL_LONG_JOINED else joined_rejection
     if _commit_flag(name, state):
         return index + 1
     if name not in _COMMIT_VALUE_LONG:
-        return Rejection(f'option {_fragment(text)}', _HINT_COMMIT)
+        return Rejection(f'option {_fragment(text)}', HINT_COMMIT)
     if index + 1 >= len(words):
-        return Rejection(f'missing value for {name}', _HINT_COMMIT)
+        return Rejection(f'missing value for {name}', HINT_COMMIT)
     return _commit_value(name, words[index + 1], state, index + 2)
 
 
@@ -547,12 +547,12 @@ def _commit_short_cluster(
         if character in _COMMIT_OPTIONAL_VALUE_SHORT:
             return index + 1
         if character not in _COMMIT_VALUE_SHORT:
-            return Rejection(f'option -{character}', _HINT_COMMIT)
+            return Rejection(f'option -{character}', HINT_COMMIT)
         remainder = text[position + 1 :]
         if remainder:
             return _commit_value(f'-{character}', remainder, state, index + 1)
         if index + 1 >= len(words):
-            return Rejection(f'missing value for -{character}', _HINT_COMMIT)
+            return Rejection(f'missing value for -{character}', HINT_COMMIT)
         return _commit_value(f'-{character}', words[index + 1], state, index + 2)
     return index + 1
 
@@ -576,17 +576,17 @@ def _parse_commit(words: Sequence[Word]) -> _CommitState | Rejection:
         word = words[index]
         text = word.literal_text
         if text is None:
-            return _reject_word(word, _HINT_COMMIT)
-        if state._options_ended or not text.startswith('-') or text == '-':
-            state._pathspecs.append(text)
+            return _reject_word(word, HINT_COMMIT)
+        if state.options_ended or not text.startswith('-') or text == '-':
+            state.pathspecs.append(text)
             index += 1
             continue
         if text == '--':
-            state._options_ended = True
+            state.options_ended = True
             index += 1
             continue
         if text in _COMMIT_HELP:
-            return Rejection(f'option {text}', _HINT_COMMIT)
+            return Rejection(f'option {text}', HINT_COMMIT)
         if text.startswith('--'):
             consumed = _commit_long_option(text, words, index, state)
         else:
@@ -630,7 +630,7 @@ def _resolve_plan(
     state = parsed[-1].commit
     if state is None:
         raise ValueError('a validated commit sequence must contain commit state')
-    if state._status_only:
+    if state.status_only:
         return NoCommit()
     route = cd_route if cd_route is not None else parsed[0].route
     if route is None:
@@ -648,12 +648,12 @@ def _resolve_plan(
             return NoCommit()
         cwd = resolved
     mode = CommitMode(
-        auto_stage=state._auto_stage,
-        include=state._include,
-        only=state._only,
-        pathspecs=tuple(state._pathspecs),
-        pathspec_from_file=state._pathspec_from_file,
-        pathspec_file_nul=state._pathspec_file_nul,
+        auto_stage=state.auto_stage,
+        include=state.include,
+        only=state.only,
+        pathspecs=tuple(state.pathspecs),
+        pathspec_from_file=state.pathspec_from_file,
+        pathspec_file_nul=state.pathspec_file_nul,
     )
     exec_cwd = command_cwd if cd_route is None and command_cwd is not None else cwd
     pre_commit_adds = tuple(
@@ -812,3 +812,29 @@ def classify_grammar(
                     f'read-only git {git.subcommand} before git commit', _HINT_PRECHECK
                 )
     return plan
+
+
+def has_outer_commit(command: Command) -> bool:
+    """Recognize sufficient outer command-position evidence for commit diagnostics.
+
+    This recognizes an optional accepted amend assignment and literal -C route,
+    without validating commit options or changing grammar acceptance.
+    """
+    for segment in command.segments:
+        words: list[Word] = []
+        for element in segment.elements:
+            if not isinstance(element, Word):
+                break
+            words.append(element)
+        if words and _amend_prefix(words[0]) is True:
+            words = words[1:]
+        if not words or not is_git_executable(words[0].literal_text or ''):
+            continue
+        route = _git_route(words)
+        if (
+            route is not None
+            and len(words) > route[1]
+            and words[route[1]].literal_text == 'commit'
+        ):
+            return True
+    return False

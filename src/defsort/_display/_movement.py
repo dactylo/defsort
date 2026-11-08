@@ -2,12 +2,13 @@
 
 from collections.abc import Iterable, Sequence
 
-from defsort._color import BOLD, colorize, spectral_map
+from defsort._display._color import spectral_map
 from defsort._display._constraints import format_banner_constraint_details
 from defsort._display._types import MovementPositions, MovementRow
 from defsort._display._width import display_width, pad_cells
-from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import Definition, MethodDefinition, MethodSortInfo, SortResult
+from defsort._vendor.hookfront._color import BOLD, colorize
+from defsort._vendor.hookfront._terminal import escape_terminal_text, path_text
 
 
 def _print_unchanged_preview(
@@ -162,7 +163,7 @@ def count_moved_split(result: SortResult) -> tuple[int, int]:
         result: Sorting result whose movements should be counted.
 
     Returns:
-        Tuple of (top_level_moved, methods_moved).
+        Tuple of (`top_level_moved`, `methods_moved`).
     """
     top = len(movement_positions(result.original_order, result.new_order).moved_indices)
     methods = sum(
@@ -228,12 +229,11 @@ def print_preview(  # noqa: PLR0913
         Whether output was emitted, for inter-file separator tracking.
     """
     constraint_details = format_banner_constraint_details(result.banner_constraints)
-    safe_path = escape_terminal_text(path_text(path))
 
     # Unchanged file
     if result.original_source == result.new_source:
         emitted = _print_unchanged_preview(
-            safe_path,
+            path,
             verbose,
             ordering,
             color=color,
@@ -244,6 +244,7 @@ def print_preview(  # noqa: PLR0913
         return emitted or (verbose and bool(constraint_details))
 
     # Build tables
+    safe_path = escape_terminal_text(path_text(path))
     def_table = format_movement_table(result, color=color, verbose=verbose)
     method_table = (
         _format_method_tables(result.method_sorts, color=color, verbose=verbose)

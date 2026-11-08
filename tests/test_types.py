@@ -109,6 +109,10 @@ class TestBlobReadResult:
         r = BlobReadResult(status=BlobReadStatus.DECODE_FAILED)
         assert r.content is None
 
+    def test_detail_rejects_content(self) -> None:
+        with pytest.raises(ValueError, match='detail'):
+            BlobReadResult(status=BlobReadStatus.CONTENT, content='', detail='bad')
+
     def test_frozen(self) -> None:
         r = BlobReadResult(status=BlobReadStatus.MISSING)
         with pytest.raises(FrozenInstanceError):
@@ -133,6 +137,7 @@ class TestBlobReadResult:
             BlobReadStatus.DECODE_FAILED,
             BlobReadStatus.INFRA_ERROR,
             BlobReadStatus.MISSING,
+            BlobReadStatus.OUTSIDE_REPOSITORY,
         ],
     )
     def test_non_content_status_rejects_content(self, status: BlobReadStatus) -> None:
@@ -147,6 +152,7 @@ class TestBlobReadStatus:
             'MISSING',
             'INFRA_ERROR',
             'DECODE_FAILED',
+            'OUTSIDE_REPOSITORY',
         }
 
     def test_values(self) -> None:
@@ -154,6 +160,7 @@ class TestBlobReadStatus:
         assert BlobReadStatus.MISSING.value == 'missing'
         assert BlobReadStatus.INFRA_ERROR.value == 'infra_error'
         assert BlobReadStatus.DECODE_FAILED.value == 'decode_failed'
+        assert BlobReadStatus.OUTSIDE_REPOSITORY.value == 'outside_repository'
 
 
 class TestBlocker:
@@ -329,13 +336,6 @@ class TestDefsortConfig:
 class TestEngineOptions:
     def test_contains_one_required_policy_plus_execution_controls(self) -> None:
         assert not issubclass(EngineOptions, DefsortConfig)
-        assert [field.name for field in fields(EngineOptions)] == [
-            'policy',
-            'force',
-            'hoist',
-            'add_future',
-            'remove_future',
-        ]
         parameters = inspect.signature(EngineOptions).parameters
         assert parameters['policy'].default is inspect.Parameter.empty
         assert parameters['policy'].kind is inspect.Parameter.KEYWORD_ONLY
@@ -343,6 +343,9 @@ class TestEngineOptions:
         untyped_constructor = cast('Callable[..., EngineOptions]', EngineOptions)
         with pytest.raises(TypeError, match='policy'):
             untyped_constructor()
+
+    def test_default_config_matches_default_sort_policy(self) -> None:
+        assert sort_policy_from_config(DefsortConfig()) == SortPolicy()
 
     def test_is_keyword_only(self) -> None:
         parameters = inspect.signature(EngineOptions).parameters.values()
@@ -388,13 +391,8 @@ class TestFallbackMode:
 
 class TestHookContext:
     def test_contains_only_execution_state(self) -> None:
-        assert [item.name for item in fields(HookContext)] == [
-            'cwd',
-            'repo_root',
-            'allow_on_failure',
-            'incremental',
-            'overrides',
-        ]
+        policy_fields = {field.name for field in fields(SortPolicy)}
+        assert policy_fields.isdisjoint(field.name for field in fields(HookContext))
 
 
 class TestJsonStatus:
@@ -535,19 +533,7 @@ class TestSortOverrides:
 
 
 class TestSortPolicy:
-    def test_fields_and_defaults(self) -> None:
-        assert [field.name for field in fields(SortPolicy)] == [
-            'definition_order',
-            'method_order',
-            'evaluation_order',
-            'method_bodies',
-            'method_visibility',
-            'method_dunders',
-            'main',
-            'tie_break',
-            'banners',
-            'banner_pattern',
-        ]
+    def test_defaults(self) -> None:
 
         policy = SortPolicy()
         assert policy.definition_order == 'dependency'

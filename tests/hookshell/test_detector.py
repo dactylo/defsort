@@ -1,17 +1,178 @@
+import shlex
+
 import pytest
 
 from defsort._vendor.hookshell import (
     _detector,
 )
 from defsort._vendor.hookshell._detector import (
-    _tokens_commit,
-    detect_commit,
+    find_commit,
     is_git_executable,
 )
 from defsort._vendor.hookshell._shellparse import (
     Command,
+    Heredoc,
+    LiteralPart,
+    Operator,
+    Segment,
+    Word,
     parse_command,
+    parse_source,
 )
+from defsort._vendor.hookshell._source import (
+    SourceSpan,
+    SourceText,
+    resolve_span,
+)
+
+
+class TestEvidence:
+    def test_cached_body_evidence_keeps_the_first_occurrences_blocker(self) -> None:
+        text = 'cat <<\'A\'\n$GIT com""mit\nA\ncat > b <<B\n$GIT com""mit\nB\n'
+        match = find_commit(parse_command(text))
+        assert match is not None
+        assert match.span is not None
+        span = resolve_span(match.span, context='command')
+        assert span is not None
+        assert span.start == text.index('com')
+        assert match.blocker is not None
+        assert match.blocker.kind == 'sink'
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'echo "$(git commit -m earlier)" git commit -m later',
+            'cat <<\'EOF\'\n$GIT com""mit -m earlier\ngit commit -m later\nEOF\n',
+            'echo "$(sh -c \'g""it com""mit\')" git commit',
+            'eval \'g""it\' "$(sh -c \'g""it com""mit\')" \'com""mit\'',
+            'sh -c \'g""it com""mit\' "$(sh -c \'g""it com""mit\')"',
+        ],
+    )
+    def test_first_source_match_wins_across_scan_paths(
+        self, text: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parsed: set[str] = set()
+
+        def counted_parse(source: SourceText, **kwargs: bool) -> Command:
+            assert source.text not in parsed
+            parsed.add(source.text)
+            return parse_source(source, **kwargs)
+
+        monkeypatch.setattr(_detector, 'parse_source', counted_parse)
+        match = find_commit(parse_command(text))
+        assert match is not None
+        assert match.span is not None
+        span = resolve_span(match.span, context='command')
+        assert span is not None
+        assert span.start == text.index('com')
+
+    def test_legacy_tree_has_context_without_invented_spans(self) -> None:
+        command = Command(
+            (
+                Segment(
+                    (
+                        Word('cat', (LiteralPart('cat', quoted=False),)),
+                        Operator('<<'),
+                        Heredoc('EOF', quoted=True, body='git commit\n'),
+                    ),
+                    None,
+                ),
+            )
+        )
+        match = find_commit(command)
+        assert match is not None
+        assert match.span is None
+        assert match.related_span is None
+        assert match.contexts[-1].source.context == 'heredoc'
+
+    @pytest.mark.parametrize('recover', [False, True])
+    def test_recovered_tab_stripping_keeps_earliest_source_match(self, *, recover: bool) -> None:
+        text = 'cat <<-EOF\n\t$GIT com""mit -m earlier\n\tgit commit -m later'
+        command = parse_command(text, recover_heredocs=recover)
+        body = command.segments[0].elements[-1]
+        assert isinstance(body, Heredoc)
+        match = find_commit(command)
+        assert match is not None
+        assert match.span is not None
+        original = resolve_span(match.span, context='command')
+        assert original is not None
+        assert original.start == 17
+        assert text[original.start : original.end] == 'com""mit'
+        local = resolve_span(match.span, context='heredoc')
+        assert local is not None
+        assert body.source is not None
+        owner = resolve_span(SourceSpan(body.source, 0, 0), context='heredoc')
+        assert owner is not None
+        assert local.source is owner.source
+        assert local.source.text[: local.start].count('\n') + 1 == 1
+        assert local.source.text[local.start : local.end] == 'com""mit'
+
+    def test_repeated_bodies_keep_the_matched_occurrence(self) -> None:
+        text = "cat > first <<'A'\ngit commit\nA\ncat <<'B'\ngit commit\nB\n"
+        match = find_commit(parse_command(text))
+        assert match is not None
+        assert match.span is not None
+        span = resolve_span(match.span, context='command')
+        assert span is not None
+        assert span.start == text.index('commit')
+        assert match.blocker is not None
+        assert match.blocker.kind == 'sink'
+
+    def test_repeated_script_reports_the_first_source_occurrence(self) -> None:
+        text = 'sh -c \'g""it com""mit\'; sh -c \'g""it com""mit\''
+        match = find_commit(parse_command(text))
+        assert match is not None
+        assert match.span is not None
+        span = resolve_span(match.span, context='command')
+        assert span is not None
+        assert span.start == text.index('com')
+
+    def test_truncation_reports_uncertainty_without_a_token(self) -> None:
+        match = find_commit(parse_command('echo ' + '$(echo ' * 9 + 'deep' + ')' * 9))
+        assert match is not None
+        assert match.kind == 'unknown-substitution'
+        assert match.span is None
+        assert match.related_span is None
+        assert match.contexts[-1].source.context == 'command substitution'
+
+    @pytest.mark.parametrize('first', [True, False])
+    def test_unknown_substitution_uses_its_context_position(self, *, first: bool) -> None:
+        uncertain = 'echo ' + '$(echo ' * 9 + 'deep' + ')' * 9
+        script = f'sh -c {shlex.quote(uncertain)}'
+        text = f'{script}; echo git commit' if first else f'echo git commit; {script}'
+        match = find_commit(parse_command(text))
+        assert match is not None
+        assert (match.kind == 'unknown-substitution') is first
+        assert (match.span is None) is first
+
+    @pytest.mark.parametrize('body', ['git\ncommit -m x\n', 'g""it com""mit\n', '$GIT com""mit\n'])
+    def test_body_token_locations_survive_reparsing(self, body: str) -> None:
+        command = parse_command(f"cat <<-'EOF'\n\t{body}EOF\n")
+        match = find_commit(command)
+        assert match is not None
+        assert match.span is not None
+        span = resolve_span(match.span, context='heredoc')
+        assert span is not None
+        assert span.source.text[span.start : span.end] in {'commit', 'com""mit'}
+        assert match.related_span is not None
+
+    @pytest.mark.parametrize(
+        ('text', 'context'),
+        [
+            ('echo "$(git commit)"', 'command substitution'),
+            ("eval 'git' 'com'\"mit\"", 'eval argument'),
+            ("sh -c 'git commit'", 'shell -c script'),
+            ('python -c \'run(["git","commit"])\'', 'inline interpreter script'),
+        ],
+    )
+    def test_nested_contexts_retain_exact_original_tokens(self, text: str, context: str) -> None:
+        match = find_commit(parse_command(text))
+        assert match is not None
+        assert match.span is not None
+        assert context in [frame.source.context for frame in match.contexts]
+        span = resolve_span(match.span, context='command')
+        assert span is not None
+        assert text[span.start : span.end] in {'commit', 'com\'"mit'}
 
 
 class TestDataSinkRule:
@@ -23,6 +184,7 @@ class TestDataSinkRule:
             "cat <<'EOF' > notes.md\ngit commit -m x\nEOF\n",
             "cat <<-'EOF' > notes.md\n\tgit commit -m x\n\tEOF\n",
             "tee notes.md <<'EOF'\ngit commit -m x\nEOF\n",
+            "cat > a.md <<'EOF' && echo done\ngit commit -m x\nEOF\n",
             "tee -a notes.md <<'EOF'\ngit commit -m x\nEOF\n",
         ],
     )
@@ -33,7 +195,6 @@ class TestDataSinkRule:
         'text',
         [
             "cat <<'EOF'\ngit commit -m x\nEOF\n",
-            "cat > a.md <<'EOF' && echo done\ngit commit -m x\nEOF\n",
             "cat > s.sh <<'EOF' && sh s.sh\ngit commit -m x\nEOF\n",
             "cat > s.sh <<'EOF'\ngit commit -m x\nEOF\nsh s.sh\n",
             'eval "$(tee s.sh <<\'EOF\'\ngit commit -m x\nEOF\n)"\n',
@@ -80,7 +241,7 @@ class TestHeredocRules:
         command = parse_command(
             "python - <<'PY'\n" + 'value = 1 << 2\n' * 2000 + "$GIT com''mit\nPY\n"
         )
-        assert detect_commit(command)
+        assert find_commit(command) is not None
 
     def test_nested_heredoc_scans_quoted_fragments(self) -> None:
         assert _detected('cat <<\'OUTER\'\nsh <<\'INNER\'\ng""it com""mit -m x\nINNER\nOUTER\n')
@@ -131,14 +292,14 @@ class TestHeredocRules:
         command = parse_command(f'{prefix}{body}{delimiter}\n')
         parsed_characters = 0
 
-        def counted_parse(text: str, **kwargs: bool) -> Command:
+        def counted_parse(source: SourceText, **kwargs: bool) -> Command:
             nonlocal parsed_characters
-            parsed_characters += len(text)
+            parsed_characters += len(source.text)
             assert parsed_characters <= 2 * len(body), 'reparsed overlapping heredoc suffixes'
-            return parse_command(text, **kwargs)
+            return parse_source(source, **kwargs)
 
-        monkeypatch.setattr(_detector, 'parse_command', counted_parse)
-        assert detect_commit(command) is bool(suffix)
+        monkeypatch.setattr(_detector, 'parse_source', counted_parse)
+        assert (find_commit(command) is not None) is bool(suffix)
 
     def test_subprocess_commit_in_a_heredoc_body(self) -> None:
         body = (
@@ -184,7 +345,6 @@ class TestWordRule:
             'echo "git commit"',
             "grep 'git commit' docs/hook.md",
             'ls # git commit',
-            'git $ACTION',
         ],
     )
     def test_no_commit_word_pair(self, text: str) -> None:
@@ -318,7 +478,7 @@ class TestScriptDataRule:
         ],
     )
     def test_tokens_commit(self, text: str, *, expected: bool) -> None:
-        assert _tokens_commit(text) is expected
+        assert _detected(f'python -c {shlex.quote(text)}') is expected
 
 
 class TestSubstitutionRule:
@@ -346,9 +506,6 @@ class TestSubstitutionRule:
     def test_single_quoted_text_is_not_a_substitution(self) -> None:
         assert not _detected("echo '$(git commit -m x)'")
 
-    def test_truncated_substitution_is_a_commit(self) -> None:
-        assert _detected('echo ' + '$(echo ' * 9 + 'deep' + ')' * 9)
-
 
 class TestEvaluatorRule:
     @pytest.mark.parametrize('suffix', ['', '; git commit --interactive'])
@@ -358,16 +515,41 @@ class TestEvaluatorRule:
         command = parse_command('eval ' * 24 + 'true' + suffix)
         reparsed: list[str] = []
 
-        def counted_parse(text: str, **kwargs: bool) -> Command:
+        def counted_parse(source: SourceText, **kwargs: bool) -> Command:
+            text = source.text
             assert text not in reparsed, 'repeated evaluator script parse'
             reparsed.append(text)
-            return parse_command(text, **kwargs)
+            return parse_source(source, **kwargs)
 
-        monkeypatch.setattr(_detector, 'parse_command', counted_parse)
+        monkeypatch.setattr(_detector, 'parse_source', counted_parse)
         for _ in range(2):
             reparsed.clear()
-            assert detect_commit(command) is bool(suffix)
+            assert (find_commit(command) is not None) is bool(suffix)
             assert len(reparsed) == 24
+
+    def test_plain_arguments_read_word_text_linearly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        getter = Word.literal_text.fget
+        assert getter is not None
+        reads = 0
+
+        def counted(word: Word) -> str | None:
+            nonlocal reads
+            reads += 1
+            return getter(word)
+
+        monkeypatch.setattr(Word, 'literal_text', property(counted))
+
+        def reads_for(count: int) -> int:
+            nonlocal reads
+            command = parse_command('echo ' + ' '.join(['a'] * count))
+            reads = 0
+            assert find_commit(command) is None
+            return reads
+
+        assert reads_for(400) <= 3 * reads_for(200)
+        assert _detected('echo ' + 'a ' * 400 + "; eval 'git commit -m x'")
 
     @pytest.mark.parametrize(
         'text',
@@ -449,4 +631,5 @@ class TestRecoveryRule:
 
 
 def _detected(text: str) -> bool:
-    return detect_commit(parse_command(text))
+    command = parse_command(text)
+    return find_commit(command) is not None

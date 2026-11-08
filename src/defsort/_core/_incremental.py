@@ -2,7 +2,7 @@
 
 import ast
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 
@@ -44,6 +44,7 @@ from defsort._core._safety import (
     has_nonconsecutive_duplicates,
     has_sectioned_duplicates,
 )
+from defsort._core._syntax import NESTING_LIMIT_MESSAGE, parse_source
 from defsort._source import split_physical_lines
 from defsort._types import (
     BannerConstraint,
@@ -58,6 +59,7 @@ from defsort._types import (
     SectionBoundary,
     SortPolicy,
     blocker_message,
+    is_soft_blocker,
 )
 
 
@@ -69,6 +71,8 @@ class _HookSortResult:
     blocker: Blocker | None
     sorted_defs: tuple[Definition, ...] = ()
     banner_constraints: tuple[BannerConstraint, ...] = ()
+    class_blockers: tuple[ClassBlocker, ...] = ()
+    message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +96,8 @@ class _IncrementalSortResult:
     sorted_defs: tuple[Definition, ...] = ()
     banner_constraints: tuple[BannerConstraint, ...] = ()
     class_blockers: tuple[ClassBlocker, ...] = ()
+    safety_gate: Blocker | None = None
+    message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +145,7 @@ def _incremental_method_sort(
         cur_tree = tree_or_original_coordinates
         original_coordinates = None
     else:
-        cur_tree = ast.parse(source)
+        cur_tree = parse_source(source)
         original_coordinates = tree_or_original_coordinates
 
     source_lines = split_physical_lines(source, keepends=True)
@@ -219,6 +225,11 @@ def _incremental_method_sort(
             method_sorts.append(result.method_sort)
         constraints.extend(result.banner_constraints)
 
+    if original_coordinates is not None:
+        # Coordinates were collected in original AST order, before top-level moves.
+        original_order = {identity: index for index, identity in enumerate(original_coordinates)}
+        class_blockers.sort(key=lambda item: original_order[(item.class_name, item.occurrence)])
+
     new_source = apply_class_replacements(source_lines, replacements)
     if new_source is None or new_source == source:
         return _IncrementalMethodResult(
@@ -233,6 +244,23 @@ def _incremental_method_sort(
         banner_constraints=constraints,
         class_blockers=class_blockers,
     )
+
+
+def _incremental_safety_blocker(
+    current_defs: Sequence[Definition],
+    *,
+    policy: SortPolicy,
+    force: bool,
+) -> Blocker | None:
+    """Return the top-level safety refusal to apply when a candidate changes."""
+    definitions = list(current_defs)
+    if not force and has_interstitial_code(definitions):
+        return 'interstitial'
+    if has_nonconsecutive_duplicates(definitions) or (
+        policy.banners == 'barriers' and has_sectioned_duplicates(definitions)
+    ):
+        return 'duplicates'
+    return None
 
 
 def _order_incremental_definitions(
@@ -264,6 +292,7 @@ def _sort_incremental_full(
     return _IncrementalSortResult(
         new_source=new_source,
         blocker=result.blocker,
+        message=result.warning,
         method_sorts=result.method_sorts if result.blocker is None else [],
         original_defs=list(result.original_order),
         sorted_defs=(
@@ -271,10 +300,19 @@ def _sort_incremental_full(
         ),
         banner_constraints=tuple(result.banner_constraints),
         class_blockers=result.class_blockers,
+        safety_gate=(
+            _incremental_safety_blocker(
+                result.original_order,
+                policy=options.policy,
+                force=options.force,
+            )
+            if options.policy.definition_order != 'none'
+            else None
+        ),
     )
 
 
-def _top_level_incremental_merge(  # noqa: PLR0911, PLR0913
+def _top_level_incremental_merge(  # noqa: PLR0913
     source: str,
     current_defs: list[Definition],
     baseline_defs: list[Definition],
@@ -282,7 +320,6 @@ def _top_level_incremental_merge(  # noqa: PLR0911, PLR0913
     blocks: Mapping[int, str],
     *,
     boundary_layout: list[BoundaryLayoutPart],
-    options: EngineOptions,
     policy: SortPolicy,
 ) -> _TopLevelMergeResult:
     """Run the top-level incremental merge pipeline."""
@@ -300,23 +337,6 @@ def _top_level_incremental_merge(  # noqa: PLR0911, PLR0913
     )
     new_defs = find_new_items(baseline_defs, current_defs, _def_key, _def_is_overload)
 
-    layout_changed = reassemble_source(layout, blocks, current_defs) != source
-    if new_defs or layout_changed:
-        if not options.force and has_interstitial_code(current_defs):
-            return _TopLevelMergeResult(
-                new_source=source,
-                blocker='interstitial',
-                banner_constraints=tuple(constraints),
-            )
-        if has_nonconsecutive_duplicates(current_defs) or (
-            policy.banners == 'barriers' and has_sectioned_duplicates(current_defs)
-        ):
-            return _TopLevelMergeResult(
-                new_source=source,
-                blocker='duplicates',
-                banner_constraints=tuple(constraints),
-            )
-
     merged, blocker = incremental_merge(
         current_defs,
         baseline_defs,
@@ -330,27 +350,6 @@ def _top_level_incremental_merge(  # noqa: PLR0911, PLR0913
         return _TopLevelMergeResult(
             new_source=source,
             blocker=blocker,
-            banner_constraints=tuple(constraints),
-        )
-
-    if not new_defs and not layout_changed:
-        return _TopLevelMergeResult(
-            new_source=source,
-            blocker=None,
-            sorted_defs=tuple(current_defs),
-            banner_constraints=tuple(constraints),
-        )
-
-    if (
-        new_defs
-        and [definition.index for definition in merged]
-        == [definition.index for definition in current_defs]
-        and not layout_changed
-    ):
-        return _TopLevelMergeResult(
-            new_source=source,
-            blocker=None,
-            sorted_defs=tuple(merged),
             banner_constraints=tuple(constraints),
         )
 
@@ -382,17 +381,9 @@ def _sort_incremental(
 ) -> _IncrementalSortResult:
     """Build an incremental candidate while preserving a whole-file refusal boundary."""
     original_source = source
-    if not baseline.strip():
-        return _sort_incremental_full(
-            source,
-            tree,
-            options=options,
-        )
-
     policy = options.policy
     try:
-        baseline_tree = ast.parse(baseline)
-        compile(baseline_tree, '<defsort.baseline>', 'exec')
+        baseline_tree = parse_source(baseline, filename='<defsort.baseline>', check=True)
     except SyntaxError:
         # Invalid baseline -> non-conforming, skip (spec: do not raise,
         # avoid trapping users who need to commit a fix for a syntax error).
@@ -432,6 +423,11 @@ def _sort_incremental(
         tree=tree,
     )
     current_defs = current_parsed.definitions
+    safety_gate = (
+        _incremental_safety_blocker(current_defs, policy=policy, force=options.force)
+        if policy.definition_order != 'none'
+        else None
+    )
     postamble = current_parsed.postamble
     original_defs = list(current_defs)  # snapshot before any merge
     baseline_parsed = parse_definitions(
@@ -479,7 +475,6 @@ def _sort_incremental(
             current_parsed.layout,
             current_parsed.blocks,
             boundary_layout=current_parsed.boundary_layout,
-            options=options,
             policy=policy,
         )
     source = top_result.new_source
@@ -509,6 +504,16 @@ def _sort_incremental(
     constraints = (*top_result.banner_constraints, *method_result.banner_constraints)
     top_candidate_defs = top_result.sorted_defs or tuple(original_defs)
     structural_blocker = top_result.blocker
+    if safety_gate is not None and source != original_source:
+        return _IncrementalSortResult(
+            new_source=None,
+            blocker=safety_gate,
+            method_sorts=[],
+            original_defs=original_defs,
+            banner_constraints=constraints,
+            class_blockers=tuple(method_result.class_blockers),
+            safety_gate=safety_gate,
+        )
     semantic_blocker = check_reorder_hazards(
         original_defs,
         top_candidate_defs,
@@ -520,13 +525,16 @@ def _sort_incremental(
         evaluation_order=policy.evaluation_order,
     )
     if semantic_blocker is not None:
+        blocker, message = semantic_blocker
         return _IncrementalSortResult(
             new_source=None,
-            blocker=structural_blocker or semantic_blocker,
+            blocker=structural_blocker or blocker,
+            message=blocker_message(structural_blocker) if structural_blocker else message,
             method_sorts=[],
             original_defs=original_defs,
             banner_constraints=constraints,
             class_blockers=tuple(method_result.class_blockers),
+            safety_gate=safety_gate,
         )
 
     if source != original_source:
@@ -539,6 +547,7 @@ def _sort_incremental(
             sorted_defs=sorted_defs,
             banner_constraints=constraints,
             class_blockers=tuple(method_result.class_blockers),
+            safety_gate=safety_gate,
         )
 
     return _IncrementalSortResult(
@@ -548,6 +557,7 @@ def _sort_incremental(
         original_defs=original_defs,
         banner_constraints=constraints,
         class_blockers=tuple(method_result.class_blockers),
+        safety_gate=safety_gate,
     )
 
 
@@ -558,7 +568,7 @@ def sort_for_hook_detailed(
 ) -> _HookSortResult:
     """Sort source for hook usage, exposing sorted definitions.
 
-    Returns a _HookSortResult with the sorted definitions list, so downstream
+    Returns a `_HookSortResult` with the sorted definitions list, so downstream
     consumers (e.g. reorder guard) can inspect what moved without re-parsing.
 
     Args:
@@ -566,16 +576,20 @@ def sort_for_hook_detailed(
         policy: Concrete ordering policy.
 
     Returns:
-        _HookSortResult with new_source, blocker, and sorted_defs.
-        sorted_defs is non-empty only when sorting succeeded (new_source is not
-        None and blocker is None).
+        `_HookSortResult` with `new_source`, `blocker`, and `sorted_defs`.
+        `sorted_defs` is non-empty only when sorting succeeded (`new_source` is
+        not `None` and `blocker` is `None`).
 
     Raises:
         SyntaxError: If source is not valid Python (includes compile-level
             checks like bare return/break at module scope).
+        TypeError: If the configured banner pattern is neither a string nor
+            `None`.
+        ValueError: If source contains a lone Unicode surrogate, or the
+            configured banner pattern does not compile or uses unsupported
+            syntax. Pattern compilation failures chain `re.error`.
     """
-    tree = ast.parse(source)
-    compile(tree, '<sort_for_hook_detailed>', 'exec')
+    tree = parse_source(source, filename='<sort_for_hook_detailed>', check=True)
     result = sort_file(
         source,
         options=EngineOptions(
@@ -587,19 +601,22 @@ def sort_for_hook_detailed(
         _tree=tree,
     )
     new_source = result.new_source if result.new_source != source else None
-    blocker = result.blocker
-    # The hook result carries a single diagnostic rather than per-class records.
-    if blocker is None and new_source is None and result.class_blockers:
-        blocker = result.class_blockers[0].blocker
+    blocker: Blocker | None = result.blocker
+    if blocker is None and new_source is None:
+        blocker = next(
+            (cb.blocker for cb in result.class_blockers if is_soft_blocker(cb.blocker)), None
+        )
     if blocker is not None:
         new_source = None
     return _HookSortResult(
         new_source=new_source,
         blocker=blocker,
+        message=result.warning,
         sorted_defs=(
             tuple(result.new_order) if new_source is not None and result.blocker is None else ()
         ),
         banner_constraints=tuple(result.banner_constraints),
+        class_blockers=tuple(result.class_blockers),
     )
 
 
@@ -629,15 +646,28 @@ def sort_incremental_impl(
     Raises:
         SyntaxError: If current source cannot be parsed or compiled as a
             module, including constructs such as a top-level return.
+        TypeError: If a validated banner pattern is neither a string nor
+            `None`.
+        ValueError: If parsing source or baseline encounters a lone Unicode
+            surrogate, or a validated banner pattern does not compile or uses
+            unsupported syntax. Pattern compilation failures chain `re.error`.
     """
     # Validate source is compilable (matching sort_for_hook_detailed).
     # ast.parse accepts some constructs that compile()
     # rejects (e.g., bare return/break at module scope). Raise
     # SyntaxError early so callers handle it uniformly.
-    tree = _tree if _tree is not None else ast.parse(source)
-    compile(tree, '<sort_incremental_impl>', 'exec')
+    if _tree is None:
+        tree = parse_source(source, filename='<sort_incremental_impl>', check=True)
+    else:
+        tree = _tree
+        try:
+            compile(tree, '<sort_incremental_impl>', 'exec')
+        except (RecursionError, MemoryError) as error:
+            raise SyntaxError(NESTING_LIMIT_MESSAGE) from error
 
     try:
+        if not baseline.strip():
+            return _sort_incremental_full(source, tree, options=options)
         return _sort_incremental(source, baseline, tree, options=options)
     except LayoutPreservationError:
         parsed = parse_definitions(
@@ -684,8 +714,13 @@ def sort_incremental_detailed(
     Raises:
         SyntaxError: If current source cannot be parsed or compiled as a
             module.
+        TypeError: If a validated banner pattern is neither a string nor
+            `None`.
+        ValueError: If parsing source or baseline encounters a lone Unicode
+            surrogate, or a validated banner pattern does not compile or uses
+            unsupported syntax. Pattern compilation failures chain `re.error`.
     """
-    tree = ast.parse(source)
+    tree = parse_source(source)
     result = sort_incremental_impl(
         source,
         baseline,
@@ -697,29 +732,36 @@ def sort_incremental_detailed(
         ),
         _tree=tree,
     )
-    blocker = result.blocker
-    # Preserve class-only skip diagnostics at the condensed hook boundary.
-    if blocker is None and result.new_source is None and result.class_blockers:
-        blocker = result.class_blockers[0].blocker
+    blocker: Blocker | None = result.blocker
     if blocker is not None:
         return _HookSortResult(
             new_source=result.new_source,
             blocker=blocker,
+            message=result.message,
             sorted_defs=(),
             banner_constraints=result.banner_constraints,
+            class_blockers=result.class_blockers,
         )
 
     managed_source = result.new_source or source
-    managed_tree = tree if managed_source is source else ast.parse(managed_source)
+    managed_tree = tree if managed_source is source else parse_source(managed_source)
     if has_future_annotations_import(managed_source, _tree=managed_tree):
         managed_source = remove_unused_future_annotations(managed_source, _tree=managed_tree)
 
-    new_source = managed_source if managed_source != source else result.new_source
+    new_source = managed_source if managed_source != source else None
+    if new_source is not None and result.safety_gate is not None:
+        new_source = None
+        blocker = result.safety_gate
+    elif new_source is None:
+        blocker = next(
+            (cb.blocker for cb in result.class_blockers if is_soft_blocker(cb.blocker)), None
+        )
     return _HookSortResult(
         new_source=new_source,
-        blocker=None,
+        blocker=blocker,
         sorted_defs=(
             result.sorted_defs or tuple(result.original_defs) if new_source is not None else ()
         ),
         banner_constraints=result.banner_constraints,
+        class_blockers=result.class_blockers,
     )

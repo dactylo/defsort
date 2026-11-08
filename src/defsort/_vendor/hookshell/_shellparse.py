@@ -1,10 +1,10 @@
 """Parse POSIX shell command text into a structural tree without executing it."""
 
-# pyright: reportPrivateUsage=false
-
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from string import ascii_letters, digits
+
+from ._source import SourceSpan, SourceText, join_sources
 
 _MAX_SUBSTITUTION_DEPTH = 8
 NAME_CHARACTERS = frozenset(ascii_letters + digits + '_')
@@ -47,15 +47,29 @@ type _Element = Word | Operator | Heredoc | _Comment
 
 @dataclass(frozen=True, slots=True)
 class LiteralPart:
-    """Literal text of a word and whether quoting or an escape produced it."""
+    """Represent literal argv text and the quoting that produced it.
+
+    Provenance fields do not participate in equality.
+
+    Attributes:
+        text: Text after quote and escape processing.
+        quoted: Whether quoting or an escape produced the literal.
+        span: Interval in the literal's source view, or `None` without
+            provenance.
+        source: Mapped view of the decoded text, or `None` without provenance.
+    """
 
     text: str
     quoted: bool
+    span: SourceSpan | None = field(default=None, compare=False)
+    source: SourceText | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class SubstitutionPart:
-    """Command substitution with its parsed body and surrounding quote context.
+    """Represent command substitution with its parsed body and quote context.
+
+    The provenance span does not participate in equality.
 
     Attributes:
         command: Parsed nested command. An empty tree does not establish an
@@ -64,35 +78,80 @@ class SubstitutionPart:
         in_double_quotes: Whether the substitution occurs inside double quotes.
         truncated: Whether the parser omitted the nested tree because its depth
             limit was reached. Consumers must treat its contents as unknown.
+        span: Interval covering the substitution spelling, or `None` without
+            provenance.
     """
 
     command: 'Command'
     raw: str
     in_double_quotes: bool
     truncated: bool = False
+    span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class ExpansionPart:
-    """Parameter, tilde, or brace expansion with any substitutions nested inside it."""
+    """Represent an expansion or unparsed quoted form with nested substitutions.
+
+    The provenance span does not participate in equality.
+
+    Attributes:
+        raw: Source spelling of the expansion or unsupported ANSI-C quoted
+            form.
+        children: Parsed substitutions nested inside the expansion.
+        in_double_quotes: Whether the expansion occurs inside double quotes.
+        span: Interval covering the expansion spelling, or `None` without
+            provenance.
+    """
 
     raw: str
     children: tuple[SubstitutionPart, ...] = ()
+    in_double_quotes: bool = False
+    span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class GlobPart:
-    """Unquoted glob character."""
+    """Represent one unquoted glob character.
+
+    The provenance span does not participate in equality.
+
+    Attributes:
+        raw: The unquoted `*`, `?`, or `[` character.
+        span: Interval covering that character, or `None` without provenance.
+    """
 
     raw: str
+    span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class Word:
-    """Shell word made of parts, keeping its raw text."""
+    """Represent a shell word before expansion.
+
+    The provenance span does not participate in equality.
+
+    Attributes:
+        raw: Original spelling, retaining quotes and escapes.
+        parts: Ordered literal, substitution, expansion, and glob components.
+        span: Interval covering the word's spelling, or `None` without
+            provenance.
+    """
 
     raw: str
     parts: tuple[WordPart, ...]
+    span: SourceSpan | None = field(default=None, compare=False)
+
+    @property
+    def literal_source(self) -> SourceText | None:
+        """Return mapped argv text for a fully literal word with provenance."""
+        if any(not isinstance(part, LiteralPart) for part in self.parts):
+            return None
+        return join_sources(
+            [part.source for part in self.parts if isinstance(part, LiteralPart)],
+            context='literal',
+            separator='',
+        )
 
     @property
     def literal_text(self) -> str | None:
@@ -107,19 +166,39 @@ class Word:
 
 @dataclass(frozen=True, slots=True)
 class Operator:
-    """Operator element that does not terminate its segment."""
+    """Represent an operator that does not terminate its segment.
+
+    The provenance span does not participate in equality.
+
+    Attributes:
+        text: Operator spelling.
+        span: Interval covering the operator, or `None` without provenance.
+    """
 
     text: str
+    span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class Heredoc:
-    """Heredoc body and expansions, with recovery scan ownership.
+    """Represent a heredoc body, expansions, and recovery scan ownership.
+
+    Provenance fields do not participate in equality.
 
     Attributes:
+        delimiter: Delimiter text after quote removal.
+        quoted: Whether quoting or escaping any delimiter character suppresses
+            ordinary body expansion.
+        body: Body text after applicable leading-tab removal. Recovery may
+            leave it empty when an earlier recovered body owns the same text.
+        expansions: Parsed body substitutions, empty for quoted bodies or
+            expansions already owned by an earlier recovered body.
         body_inlined: Whether detector recovery parsed the body as following
-            segments. Its token text and expansions may be shared with an
-            earlier recovered heredoc, in which case these fields are empty.
+            segments, so it must not be reparsed as a separate script.
+        span: Interval covering the redirect operator and delimiter, or `None`
+            without provenance.
+        source: Mapped body view, or `None` when provenance is unavailable or
+            recovery shares the body text elsewhere.
     """
 
     delimiter: str
@@ -127,21 +206,32 @@ class Heredoc:
     body: str
     expansions: tuple[SubstitutionPart, ...] = ()
     body_inlined: bool = False
+    span: SourceSpan | None = field(default=None, compare=False)
+    source: SourceText | None = field(default=None, compare=False)
 
 
 class _CommandState:
     """Mutable state of one command level while its segments are parsed."""
 
-    __slots__ = ('_elements', '_finished', '_nested', '_paren_depth', '_pending', '_terminators')
+    __slots__ = (
+        'elements',
+        'finished',
+        'nested',
+        'paren_depth',
+        'pending',
+        'spans',
+        'terminators',
+    )
 
     def __init__(self, *, nested: bool) -> None:
         """Initialize the segments and pending heredocs for one command level."""
-        self._nested = nested
-        self._elements: list[list[_Element]] = []
-        self._terminators: list[str | None] = []
-        self._pending: list[_PendingHeredoc] = []
-        self._paren_depth = 0
-        self._finished = False
+        self.nested = nested
+        self.elements: list[list[_Element]] = []
+        self.terminators: list[str | None] = []
+        self.spans: list[SourceSpan] = []
+        self.pending: list[_PendingHeredoc] = []
+        self.paren_depth = 0
+        self.finished = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,53 +239,83 @@ class _Comment:
     """Comment element from `#` to the end of its line."""
 
     text: str
+    span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class Segment:
-    """Elements of one simple command and the operator that terminated it."""
+    """Represent the elements and terminator of one command segment.
+
+    The provenance span does not participate in equality.
+
+    Attributes:
+        elements: Ordered word, operator, heredoc, and comment nodes.
+        terminator: Separating shell operator or newline, or `None` at the
+            command boundary.
+        span: Interval through the segment's terminator, excluding drained
+            heredoc bodies, or `None` without provenance.
+    """
 
     elements: tuple[_Element, ...]
     terminator: str | None
+    span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
 class Command:
-    """Parsed command tree with the recovery reasons a total parse recorded."""
+    """Represent a parsed command tree and its recovery reasons.
+
+    The provenance span does not participate in equality.
+
+    Attributes:
+        segments: Command segments in source order.
+        recovery: Reasons parsing required recovery; empty for a clean parse.
+        span: Interval of parsed text, excluding enclosing substitution
+            delimiters, or `None` without provenance.
+    """
 
     segments: tuple[Segment, ...]
     recovery: tuple[str, ...] = ()
+    span: SourceSpan | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
 class _PendingHeredoc:
     """Heredoc awaiting its body at the next line feed."""
 
-    _elements: list[_Element]
-    _index: int
-    _delimiter: str
-    _quoted: bool
-    _strip_tabs: bool
+    elements: list[_Element]
+    index: int
+    delimiter: str
+    quoted: bool
+    strip_tabs: bool
+    span: SourceSpan
 
 
 class _WordState:
     """Mutable state while one word's parts are collected."""
 
-    __slots__ = ('_parts', '_run', '_start')
+    __slots__ = ('ends', 'parts', 'run', 'start', 'starts')
 
     def __init__(self, start: int) -> None:
         """Begin collecting one word at its raw-text offset."""
-        self._start = start
-        self._parts: list[WordPart] = []
-        self._run: list[str] = []
+        self.start = start
+        self.parts: list[WordPart] = []
+        self.run: list[str] = []
+        self.starts: list[int] = []
+        self.ends: list[int] = []
 
 
 class _Parser:
     """Recursive-descent parser over one command text."""
 
-    def __init__(self, text: str, depth: int = 0, *, recover_heredocs: bool = False) -> None:
+    def __init__(
+        self, source: SourceText, depth: int = 0, *, recover_heredocs: bool = False
+    ) -> None:
         """Bind the input and inherited substitution depth."""
-        self._text = text
+        self._source = source
+        self._text = source.text
+        self._active_body: SourceText | None = None
+        self._active_body_start = 0
         self._pos = 0
         self._depth = depth
         self._recovery: list[str] = []
@@ -209,12 +329,6 @@ class _Parser:
         """Return whether the cursor has consumed the input."""
         return self._pos >= len(self._text)
 
-    def _flush(self, state: _WordState, *, quoted: bool) -> None:
-        """Append a pending literal run with its quoting provenance."""
-        if state._run:
-            state._parts.append(LiteralPart(''.join(state._run), quoted))
-            state._run.clear()
-
     def _has_heredoc_end(self, pending: _PendingHeredoc) -> bool:
         """Check remaining delimiter lines using one index for this script."""
         if self._heredoc_ends is None:
@@ -226,7 +340,13 @@ class _Parser:
                 self._heredoc_ends[False, line] = offset
                 self._heredoc_ends[True, line.lstrip('\t')] = offset
                 offset += len(line) + 1
-        return self._heredoc_ends.get((pending._strip_tabs, pending._delimiter), -1) >= self._pos
+        return self._heredoc_ends.get((pending.strip_tabs, pending.delimiter), -1) >= self._pos
+
+    def _literal(self, source: SourceText, *, quoted: bool) -> LiteralPart:
+        """Attach decoded text and its exact source view to a literal part."""
+        return LiteralPart(
+            source.text, quoted, span=SourceSpan(source, 0, len(source.text)), source=source
+        )
 
     def _match_operator(self) -> str | None:
         """Find the longest operator at the current cursor."""
@@ -235,21 +355,197 @@ class _Parser:
                 return operator
         return None
 
+    def _read_to_line_end(self) -> str:
+        """Consume comment text while leaving its line feed for segment parsing."""
+        end = self._text.find('\n', self._pos)
+        end = len(self._text) if end < 0 else end
+        text = self._text[self._pos : end]
+        self._pos = end
+        return text
+
+    def _scan_heredoc_expansions(self, body: SourceText) -> tuple[SubstitutionPart, ...]:
+        """Scan body expansions with structural parsing at each substitution opener."""
+        scanner = _Parser(body, self._depth, recover_heredocs=self._recover_heredocs)
+        found: list[SubstitutionPart] = []
+        while not scanner._at_end():
+            char = scanner._text[scanner._pos]
+            if char == '\\':
+                following = scanner._text[scanner._pos + 1 : scanner._pos + 2]
+                scanner._pos += 2 if following in ('$', '`', '\\', '\n') else 1
+            elif scanner._text.startswith('$(', scanner._pos) or char == '`':
+                part = scanner._parse_dynamic(in_double_quotes=False)
+                if isinstance(part, SubstitutionPart):
+                    found.append(part)
+            else:
+                scanner._pos += 1
+        self._recovery.extend(scanner._recovery)
+        return tuple(found)
+
+    def _skip_blanks(self) -> None:
+        """Skip unquoted spaces, tabs, and continued line feeds."""
+        while not self._at_end():
+            if self._text[self._pos] in ' \t':
+                self._pos += 1
+            elif self._text.startswith('\\\n', self._pos):
+                self._pos += 2
+            else:
+                return
+
+    def _span(self, start: int, end: int) -> SourceSpan:
+        """Capture an input interval, retaining recovery body ownership."""
+        if self._active_body is not None and start >= self._active_body_start:
+            return SourceSpan(
+                self._active_body, start - self._active_body_start, end - self._active_body_start
+            )
+        return SourceSpan(self._source, start, end)
+
+    def _parse_brace_expansion(self, *, in_double_quotes: bool) -> ExpansionPart:
+        """Retain parameter-expansion text and every nested substitution."""
+        start = self._pos
+        self._pos += 2
+        children: list[SubstitutionPart] = []
+        depth = 1
+        while not self._at_end():
+            char = self._text[self._pos]
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    self._pos += 1
+                    return ExpansionPart(
+                        self._text[start : self._pos],
+                        children=tuple(children),
+                        in_double_quotes=in_double_quotes,
+                        span=self._span(start, self._pos),
+                    )
+            elif char == '`' or self._text.startswith('$(', self._pos):
+                part = self._parse_dynamic(in_double_quotes=in_double_quotes)
+                if isinstance(part, SubstitutionPart):
+                    children.append(part)
+                continue
+            self._pos += 1
+        self._recovery.append(_RECOVERY_EXPANSION)
+        return ExpansionPart(
+            self._text[start : self._pos],
+            children=tuple(children),
+            in_double_quotes=in_double_quotes,
+            span=self._span(start, self._pos),
+        )
+
+    def _parse_operator(
+        self,
+        operator: str,
+        elements: list[_Element],
+        state: _CommandState,
+    ) -> None:
+        """Record an operator and collect any heredoc delimiter it introduces."""
+        if operator == '(':
+            state.paren_depth += 1
+        elif operator == ')':
+            state.paren_depth -= 1
+        start = self._pos - len(operator)
+        elements.append(Operator(operator, self._span(start, self._pos)))
+        if operator in ('<<', '<<-'):
+            self._skip_blanks()
+            word, quoted = self._parse_word()
+            delimiter = _quote_removed_text(word)
+            state.pending.append(
+                _PendingHeredoc(
+                    elements,
+                    len(elements),
+                    delimiter,
+                    quoted,
+                    strip_tabs=operator == '<<-',
+                    span=self._span(start, self._pos),
+                )
+            )
+            elements.append(Heredoc(delimiter, quoted, '', span=self._span(start, self._pos)))
+
+    def _parse_substitution(self, *, in_double_quotes: bool) -> SubstitutionPart:
+        """Parse a nested command until its structural closing parenthesis."""
+        start = self._pos
+        self._pos += 2
+        if self._depth >= _MAX_SUBSTITUTION_DEPTH:
+            self._pos = _scan_balanced(self._text, start + 1, '(', ')')
+            self._recovery.append(_RECOVERY_NESTING)
+            raw = self._text[start : self._pos]
+            return SubstitutionPart(
+                Command(()),
+                raw,
+                in_double_quotes,
+                truncated=True,
+                span=self._span(start, self._pos),
+            )
+        recovery_start = len(self._recovery)
+        self._depth += 1
+        segments = self._parse_segments(nested=True)
+        self._depth -= 1
+        child_recovery = tuple(self._recovery[recovery_start:])
+        inner_span = self._span(start + 2, self._pos)
+        if self._at_end():
+            self._recovery.append(_RECOVERY_SUBSTITUTION)
+        else:
+            self._pos += 1
+        raw = self._text[start : self._pos]
+        return SubstitutionPart(
+            Command(tuple(segments), child_recovery, span=inner_span),
+            raw,
+            in_double_quotes,
+            span=self._span(start, self._pos),
+        )
+
+    def _view(self, start: int, end: int, *, context: str = 'literal') -> SourceText:
+        """Capture a cheap identity slice in its enclosing context."""
+        span = self._span(start, end)
+        return SourceText(self._text[start:end], context, span.source, span.start)
+
+    def _mapped(
+        self, text: str, starts: list[int], ends: list[int], *, context: str = 'literal'
+    ) -> SourceText:
+        """Map retained characters without assigning deleted text to neighbors."""
+        if not starts:
+            return self._view(self._pos, self._pos, context=context)
+        span = self._span(starts[0], ends[-1])
+        shift = starts[0] - span.start
+        if all(
+            start == starts[0] + i and end == start + 1
+            for i, (start, end) in enumerate(zip(starts, ends, strict=True))
+        ):
+            return SourceText(text, context, span.source, span.start)
+        return SourceText(
+            text,
+            context,
+            span.source,
+            offsets=(*(start - shift for start in starts), ends[-1] - shift),
+            end_offsets=tuple(end - shift for end in ends),
+        )
+
+    def _flush(self, state: _WordState, *, quoted: bool) -> None:
+        """Append a pending literal run with its quoting provenance."""
+        if state.run:
+            source = self._mapped(''.join(state.run), state.starts, state.ends)
+            state.parts.append(self._literal(source, quoted=quoted))
+            state.run.clear()
+            state.starts.clear()
+            state.ends.clear()
+
     def _nested_substitution(
         self,
-        inner: str,
+        inner: SourceText,
         raw: str,
+        span: SourceSpan,
         *,
         in_double_quotes: bool = False,
     ) -> SubstitutionPart:
         """Parse detached substitution text at the next depth or record truncation."""
         if self._depth >= _MAX_SUBSTITUTION_DEPTH:
             self._recovery.append(_RECOVERY_NESTING)
-            return SubstitutionPart(Command(()), raw, in_double_quotes, truncated=True)
+            return SubstitutionPart(Command(()), raw, in_double_quotes, truncated=True, span=span)
         parser = _Parser(inner, self._depth + 1, recover_heredocs=self._recover_heredocs)
-        command = parser._parse()
+        command = parser.parse()
         self._recovery.extend(parser._recovery)
-        return SubstitutionPart(command, raw, in_double_quotes)
+        return SubstitutionPart(command, raw, in_double_quotes, span=span)
 
     def _parse_ansi_c_quoted(self) -> LiteralPart | ExpansionPart:
         """Recover ANSI-C quote boundaries, retaining only unescaped literal contents."""
@@ -267,14 +563,14 @@ class _Parser:
                 self._pos = min(self._pos + 2, len(self._text))
             else:
                 self._pos += 1
-        content = self._text[content_start : self._pos]
+        content_end = self._pos
         if self._at_end():
             self._recovery.append(_RECOVERY_QUOTES)
         else:
             self._pos += 1
         if escaped:
-            return ExpansionPart(self._text[start : self._pos])
-        return LiteralPart(content, quoted=True)
+            return ExpansionPart(self._text[start : self._pos], span=self._span(start, self._pos))
+        return self._literal(self._view(content_start, content_end), quoted=True)
 
     def _parse_backtick(self, *, in_double_quotes: bool) -> SubstitutionPart:
         """Parse a backtick region with its inherited quote context."""
@@ -288,42 +584,37 @@ class _Parser:
             self._pos = close + 1
         # Remove one backtick escape layer before parsing the nested shell text.
         escapes = r'\\([$`\\"])|\\\n' if in_double_quotes else r'\\([$`\\])|\\\n'
-        inner = re.sub(escapes, r'\1', self._text[start + 1 : close])
+        starts: list[int] = []
+        ends: list[int] = []
+        chunks: list[str] = []
+        cursor = start + 1
+        for match in re.finditer(escapes, self._text[start + 1 : close]):
+            match_start = start + 1 + match.start()
+            match_end = start + 1 + match.end()
+            chunks.append(self._text[cursor:match_start])
+            starts.extend(range(cursor, match_start))
+            ends.extend(range(cursor + 1, match_start + 1))
+            if match.group(1):
+                chunks.append(match.group(1))
+                starts.append(match_end - 1)
+                ends.append(match_end)
+            cursor = match_end
+        chunks.append(self._text[cursor:close])
+        starts.extend(range(cursor, close))
+        ends.extend(range(cursor + 1, close + 1))
+        inner = self._mapped(''.join(chunks), starts, ends, context='substitution')
         return self._nested_substitution(
             inner,
             self._text[start : self._pos],
+            self._span(start, self._pos),
             in_double_quotes=in_double_quotes,
         )
-
-    def _parse_brace_expansion(self, *, in_double_quotes: bool) -> ExpansionPart:
-        """Retain parameter-expansion text and every nested substitution."""
-        start = self._pos
-        self._pos += 2
-        children: list[SubstitutionPart] = []
-        depth = 1
-        while not self._at_end():
-            char = self._text[self._pos]
-            if char == '{':
-                depth += 1
-            elif char == '}':
-                depth -= 1
-                if depth == 0:
-                    self._pos += 1
-                    return ExpansionPart(self._text[start : self._pos], tuple(children))
-            elif char == '`' or self._text.startswith('$(', self._pos):
-                part = self._parse_dynamic(in_double_quotes=in_double_quotes)
-                if isinstance(part, SubstitutionPart):
-                    children.append(part)
-                continue
-            self._pos += 1
-        self._recovery.append(_RECOVERY_EXPANSION)
-        return ExpansionPart(self._text[start : self._pos], tuple(children))
 
     def _parse_double_quoted(self, state: _WordState) -> None:
         """Read double-quoted parts with shell escape and substitution rules."""
         self._flush(state, quoted=False)
         self._pos += 1
-        run: list[str] = []
+        quoted_state = _WordState(self._pos)
         emitted = False
         while True:
             if self._at_end():
@@ -339,23 +630,34 @@ class _Parser:
                     continue
                 following = self._text[self._pos + 1 : self._pos + 2]
                 if following in ('$', '`', '"', '\\'):
-                    run.append(following)
+                    quoted_state.run.append(following)
+                    quoted_state.starts.append(self._pos + 1)
+                    quoted_state.ends.append(self._pos + 2)
                     self._pos += 2
                     continue
-                run.append('\\')
+                quoted_state.run.append('\\')
+                quoted_state.starts.append(self._pos)
+                quoted_state.ends.append(self._pos + 1)
                 self._pos += 1
                 continue
             if char in '$`':
-                if run:
-                    state._parts.append(LiteralPart(''.join(run), quoted=True))
-                    run.clear()
-                state._parts.append(self._parse_dynamic(in_double_quotes=True))
+                self._flush(quoted_state, quoted=True)
+                state.parts.extend(quoted_state.parts)
+                quoted_state.parts.clear()
+                state.parts.append(self._parse_dynamic(in_double_quotes=True))
                 emitted = True
                 continue
-            run.append(char)
+            quoted_state.run.append(char)
+            quoted_state.starts.append(self._pos)
+            quoted_state.ends.append(self._pos + 1)
             self._pos += 1
-        if run or not emitted:
-            state._parts.append(LiteralPart(''.join(run), quoted=True))
+        if quoted_state.run:
+            self._flush(quoted_state, quoted=True)
+            state.parts.extend(quoted_state.parts)
+        elif not emitted:
+            state.parts.append(
+                self._literal(self._view(quoted_state.start, quoted_state.start), quoted=True)
+            )
 
     def _parse_dynamic(self, *, in_double_quotes: bool) -> WordPart:
         """Read the expansion or substitution beginning at the cursor."""
@@ -367,17 +669,23 @@ class _Parser:
         if following == '{':
             return self._parse_brace_expansion(in_double_quotes=in_double_quotes)
         if following in _SPECIAL_PARAMETERS:
+            start = self._pos
             self._pos += 2
-            return ExpansionPart(f'${following}')
+            return ExpansionPart(
+                f'${following}',
+                in_double_quotes=in_double_quotes,
+                span=self._span(start, self._pos),
+            )
         if following in NAME_START:
             end = self._pos + 1
             while end < len(self._text) and self._text[end] in NAME_CHARACTERS:
                 end += 1
             raw = self._text[self._pos : end]
+            span = self._span(self._pos, end)
             self._pos = end
-            return ExpansionPart(raw)
+            return ExpansionPart(raw, in_double_quotes=in_double_quotes, span=span)
         self._pos += 1
-        return LiteralPart('$', quoted=False)
+        return self._literal(self._view(self._pos - 1, self._pos), quoted=False)
 
     def _parse_escape(self, state: _WordState) -> bool:
         """Consume an escape and return whether it quoted a character."""
@@ -386,10 +694,12 @@ class _Parser:
             return False
         self._flush(state, quoted=False)
         if self._pos + 1 < len(self._text):
-            state._parts.append(LiteralPart(self._text[self._pos + 1], quoted=True))
+            state.parts.append(
+                self._literal(self._view(self._pos + 1, self._pos + 2), quoted=True)
+            )
             self._pos += 2
             return True
-        state._parts.append(LiteralPart('\\', quoted=False))
+        state.parts.append(self._literal(self._view(self._pos, self._pos + 1), quoted=False))
         self._pos += 1
         return False
 
@@ -397,6 +707,7 @@ class _Parser:
         """Read literal single-quoted text, recovering an absent closing quote."""
         self._flush(state, quoted=False)
         self._pos += 1
+        start = self._pos
         end = self._text.find("'", self._pos)
         if end < 0:
             self._recovery.append(_RECOVERY_QUOTES)
@@ -405,32 +716,7 @@ class _Parser:
         else:
             text = self._text[self._pos : end]
             self._pos = end + 1
-        state._parts.append(LiteralPart(text, quoted=True))
-
-    def _parse_substitution(self, *, in_double_quotes: bool) -> SubstitutionPart:
-        """Parse a nested command until its structural closing parenthesis."""
-        start = self._pos
-        self._pos += 2
-        if self._depth >= _MAX_SUBSTITUTION_DEPTH:
-            self._pos = _scan_balanced(self._text, start + 1, '(', ')')
-            self._recovery.append(_RECOVERY_NESTING)
-            raw = self._text[start : self._pos]
-            return SubstitutionPart(Command(()), raw, in_double_quotes, truncated=True)
-        recovery_start = len(self._recovery)
-        self._depth += 1
-        segments = self._parse_segments(nested=True)
-        self._depth -= 1
-        child_recovery = tuple(self._recovery[recovery_start:])
-        if self._at_end():
-            self._recovery.append(_RECOVERY_SUBSTITUTION)
-        else:
-            self._pos += 1
-        raw = self._text[start : self._pos]
-        return SubstitutionPart(
-            Command(tuple(segments), child_recovery),
-            raw,
-            in_double_quotes,
-        )
+        state.parts.append(self._literal(self._view(start, start + len(text)), quoted=True))
 
     def _parse_word(self) -> tuple[Word, bool]:
         """Collect word parts without discarding quote and expansion boundaries."""
@@ -451,70 +737,118 @@ class _Parser:
             elif self._text.startswith("$'", self._pos):
                 quoted = True
                 self._flush(state, quoted=False)
-                state._parts.append(self._parse_ansi_c_quoted())
+                state.parts.append(self._parse_ansi_c_quoted())
             elif char in '$`':
                 self._flush(state, quoted=False)
-                state._parts.append(self._parse_dynamic(in_double_quotes=False))
+                state.parts.append(self._parse_dynamic(in_double_quotes=False))
             elif char in '*?[':
                 self._flush(state, quoted=False)
-                state._parts.append(GlobPart(char))
+                state.parts.append(GlobPart(char, span=self._span(self._pos, self._pos + 1)))
                 self._pos += 1
-            elif char in '{}' or (char == '~' and self._pos == state._start):
+            elif char in '{}' or (char == '~' and self._pos == state.start):
                 self._flush(state, quoted=False)
-                state._parts.append(ExpansionPart(char))
+                state.parts.append(ExpansionPart(char, span=self._span(self._pos, self._pos + 1)))
                 self._pos += 1
             else:
-                state._run.append(char)
+                state.run.append(char)
+                state.starts.append(self._pos)
+                state.ends.append(self._pos + 1)
                 self._pos += 1
         self._flush(state, quoted=False)
-        return Word(self._text[state._start : self._pos], tuple(state._parts)), quoted
+        return Word(
+            self._text[state.start : self._pos],
+            tuple(state.parts),
+            span=self._span(state.start, self._pos),
+        ), quoted
 
-    def _read_heredoc_body(self, pending: _PendingHeredoc) -> str:
+    def _read_heredoc_body(self, pending: _PendingHeredoc) -> SourceText:
         """Consume one heredoc body through its matching delimiter line."""
+        start = self._pos
         lines: list[str] = []
+        starts: list[int] = []
+        ends: list[int] = []
+        body_end = start
         while not self._at_end():
+            line_start = self._pos
             end = self._text.find('\n', self._pos)
             line = self._text[self._pos :] if end < 0 else self._text[self._pos : end]
             self._pos = len(self._text) if end < 0 else end + 1
-            candidate = line.lstrip('\t') if pending._strip_tabs else line
-            if candidate == pending._delimiter:
-                return ''.join(f'{text}\n' for text in lines)
+            candidate = line.lstrip('\t') if pending.strip_tabs else line
+            if candidate == pending.delimiter:
+                break
             lines.append(candidate)
-        self._recovery.append(_RECOVERY_HEREDOC)
-        return ''.join(f'{text}\n' for text in lines)
-
-    def _read_to_line_end(self) -> str:
-        """Consume comment text while leaving its line feed for segment parsing."""
-        end = self._text.find('\n', self._pos)
-        end = len(self._text) if end < 0 else end
-        text = self._text[self._pos : end]
-        self._pos = end
-        return text
-
-    def _scan_heredoc_expansions(self, body: str) -> tuple[SubstitutionPart, ...]:
-        """Scan body expansions with structural parsing at each substitution opener."""
-        scanner = _Parser(body, self._depth, recover_heredocs=self._recover_heredocs)
-        found: list[SubstitutionPart] = []
-        while not scanner._at_end():
-            char = scanner._text[scanner._pos]
-            if char == '\\':
-                following = scanner._text[scanner._pos + 1 : scanner._pos + 2]
-                scanner._pos += 2 if following in ('$', '`', '\\', '\n') else 1
-            elif scanner._text.startswith('$(', scanner._pos) or char == '`':
-                part = scanner._parse_dynamic(in_double_quotes=False)
-                if isinstance(part, SubstitutionPart):
-                    found.append(part)
-            else:
-                scanner._pos += 1
-        self._recovery.extend(scanner._recovery)
-        return tuple(found)
+            if pending.strip_tabs:
+                retained = line_start + len(line) - len(candidate)
+                starts.extend(range(retained - start, line_start + len(line) - start))
+                ends.extend(range(retained + 1 - start, line_start + len(line) + 1 - start))
+                starts.append(line_start + len(line) - start)
+                ends.append(self._pos - start)
+            body_end = self._pos
+        else:
+            self._recovery.append(_RECOVERY_HEREDOC)
+        raw = self._view(start, body_end, context='heredoc')
+        body = ''.join(f'{text}\n' for text in lines)
+        if body == raw.text:
+            return raw
+        if not pending.strip_tabs:
+            return SourceText(
+                body,
+                'decoded heredoc',
+                raw,
+                offsets=(*range(len(raw.text) + 1), len(raw.text)),
+            )
+        return SourceText(
+            body,
+            'decoded heredoc',
+            raw,
+            offsets=(*starts, body_end - start),
+            end_offsets=tuple(ends),
+        )
 
     def _recover_heredoc(self, pending: _PendingHeredoc) -> Heredoc:
         """Leave an unmatched body's script in place and share its tail scans."""
         self._recovery.append(_RECOVERY_HEREDOC)
-        if pending._strip_tabs and not self._recovered_tabs:
+        if self._active_body is None:
+            self._active_body = self._view(self._pos, len(self._text), context='heredoc')
+            self._active_body_start = self._pos
+        if pending.strip_tabs and not self._recovered_tabs:
             # Preserve <<- semantics even within continued words and substitutions.
-            tail = '\n'.join(line.lstrip('\t') for line in self._text[self._pos :].split('\n'))
+            starts = list(range(self._pos))
+            ends = list(range(1, self._pos + 1))
+            offset = self._pos
+            lines: list[str] = []
+            for line in self._text[self._pos :].split('\n'):
+                stripped = line.lstrip('\t')
+                lines.append(stripped)
+                retained = offset + len(line) - len(stripped)
+                starts.extend(range(retained, offset + len(line)))
+                ends.extend(range(retained + 1, offset + len(line) + 1))
+                offset += len(line)
+                if offset < len(self._text):
+                    starts.append(offset)
+                    ends.append(offset + 1)
+                offset += 1
+            tail = '\n'.join(lines)
+            original = self._source
+            self._source = SourceText(
+                self._text[: self._pos] + tail,
+                'recovered command',
+                original,
+                offsets=(*starts, len(self._text)),
+                end_offsets=tuple(ends),
+            )
+            body_start = self._active_body_start
+            self._active_body = SourceText(
+                tail,
+                'decoded heredoc',
+                self._active_body,
+                offsets=(
+                    *(value - body_start for value in starts[self._pos :]),
+                    len(self._text) - body_start,
+                ),
+                end_offsets=tuple(value - body_start for value in ends[self._pos :]),
+            )
+            self._active_body_start = self._pos
             self._text = self._text[: self._pos] + tail
             self._heredoc_ends = None
             self._recovered_expansions = False
@@ -524,119 +858,103 @@ class _Parser:
         if not self._recovered_body:
             body = self._text[self._pos :]
             self._recovered_body = True
-        if not pending._quoted and not self._recovered_expansions:
-            expansions = self._scan_heredoc_expansions(self._text[self._pos :])
+        if not pending.quoted and not self._recovered_expansions:
+            expansions = self._scan_heredoc_expansions(
+                self._view(self._pos, len(self._text), context='recovery scan')
+            )
             self._recovered_expansions = True
-        return Heredoc(pending._delimiter, pending._quoted, body, expansions, body_inlined=True)
+        return Heredoc(
+            pending.delimiter,
+            pending.quoted,
+            body,
+            expansions,
+            body_inlined=True,
+            span=pending.span,
+            source=self._active_body if body else None,
+        )
 
     def _drain_heredocs(self, state: _CommandState) -> None:
         """Attach pending bodies and their expansion trees to their segments."""
-        for pending in state._pending:
+        for pending in state.pending:
             if self._recover_heredocs and not self._has_heredoc_end(pending):
-                pending._elements[pending._index] = self._recover_heredoc(pending)
+                pending.elements[pending.index] = self._recover_heredoc(pending)
                 continue
             body = self._read_heredoc_body(pending)
-            expansions = () if pending._quoted else self._scan_heredoc_expansions(body)
-            pending._elements[pending._index] = Heredoc(
-                pending._delimiter,
-                pending._quoted,
-                body,
+            expansions = () if pending.quoted else self._scan_heredoc_expansions(body)
+            pending.elements[pending.index] = Heredoc(
+                pending.delimiter,
+                pending.quoted,
+                body.text,
                 expansions,
+                span=pending.span,
+                source=body,
             )
-        state._pending.clear()
-
-    def _parse_segments(self, *, nested: bool) -> list[Segment]:
-        """Collect segments until this command level ends."""
-        state = _CommandState(nested=nested)
-        while not state._finished:
-            self._parse_segment(state)
-        if state._pending:
-            self._drain_heredocs(state)
-        return [
-            Segment(tuple(elements), terminator)
-            for elements, terminator in zip(
-                state._elements,
-                state._terminators,
-                strict=True,
-            )
-            if elements or terminator not in (None, '\n')
-        ]
-
-    def _parse(self) -> Command:
-        """Parse the complete text as a top-level command."""
-        segments = self._parse_segments(nested=False)
-        return Command(tuple(segments), tuple(self._recovery))
-
-    def _skip_blanks(self) -> None:
-        """Skip unquoted spaces, tabs, and continued line feeds."""
-        while not self._at_end():
-            if self._text[self._pos] in ' \t':
-                self._pos += 1
-            elif self._text.startswith('\\\n', self._pos):
-                self._pos += 2
-            else:
-                return
-
-    def _parse_operator(
-        self,
-        operator: str,
-        elements: list[_Element],
-        state: _CommandState,
-    ) -> None:
-        """Record an operator and collect any heredoc delimiter it introduces."""
-        if operator == '(':
-            state._paren_depth += 1
-        elif operator == ')':
-            state._paren_depth -= 1
-        elements.append(Operator(operator))
-        if operator in ('<<', '<<-'):
-            self._skip_blanks()
-            word, quoted = self._parse_word()
-            delimiter = _quote_removed_text(word)
-            state._pending.append(
-                _PendingHeredoc(
-                    elements,
-                    len(elements),
-                    delimiter,
-                    quoted,
-                    _strip_tabs=operator == '<<-',
-                )
-            )
-            elements.append(Heredoc(delimiter, quoted, ''))
+        state.pending.clear()
 
     def _parse_segment(self, state: _CommandState) -> None:
         """Read one segment while preserving words, operators, and heredocs."""
+        start = self._pos
+        end: int | None = None
         elements: list[_Element] = []
         terminator: str | None = None
         while True:
             self._skip_blanks()
             if self._at_end():
-                state._finished = True
+                state.finished = True
                 break
             char = self._text[self._pos]
             if char == '\n':
                 self._pos += 1
+                end = self._pos
                 self._drain_heredocs(state)
                 terminator = '\n'
                 break
             if char == '#':
-                elements.append(_Comment(self._read_to_line_end()))
+                comment_start = self._pos
+                text = self._read_to_line_end()
+                elements.append(_Comment(text, self._span(comment_start, self._pos)))
                 continue
             operator = self._match_operator()
             if operator is None:
                 word, _ = self._parse_word()
                 elements.append(word)
                 continue
-            if operator == ')' and state._nested and state._paren_depth == 0:
-                state._finished = True
+            if operator == ')' and state.nested and state.paren_depth == 0:
+                state.finished = True
                 break
             self._pos += len(operator)
             if operator in _TERMINATORS:
                 terminator = operator
                 break
             self._parse_operator(operator, elements, state)
-        state._elements.append(elements)
-        state._terminators.append(terminator)
+        state.elements.append(elements)
+        state.terminators.append(terminator)
+        state.spans.append(self._span(start, self._pos if end is None else end))
+
+    def _parse_segments(self, *, nested: bool) -> list[Segment]:
+        """Collect segments until this command level ends."""
+        state = _CommandState(nested=nested)
+        while not state.finished:
+            self._parse_segment(state)
+        if state.pending:
+            self._drain_heredocs(state)
+        return [
+            Segment(tuple(elements), terminator, span)
+            for elements, terminator, span in zip(
+                state.elements,
+                state.terminators,
+                state.spans,
+                strict=True,
+            )
+            if elements or terminator not in (None, '\n')
+        ]
+
+    def parse(self) -> Command:
+        """Parse the complete text as a top-level command."""
+        segments = self._parse_segments(nested=False)
+        return Command(
+            tuple(segments), tuple(self._recovery), SourceSpan(self._source, 0, self._pos)
+        )
 
 
 def _quote_removed_text(word: Word) -> str:
@@ -676,6 +994,17 @@ def _scan_balanced(text: str, start: int, opener: str, closer: str) -> int:
     return len(text)
 
 
+def parse_source(source: SourceText, *, recover_heredocs: bool = False) -> Command:
+    """Parse a mapped shell view while preserving its enclosing source contexts.
+
+    Args:
+        source: Shell scan text and its provenance.
+        recover_heredocs: Whether unmatched bodies remain following segments
+            for conservative detector scans, as in `parse_command`.
+    """
+    return _Parser(source, recover_heredocs=recover_heredocs).parse()
+
+
 def parse_command(text: str, *, recover_heredocs: bool = False) -> Command:
     """Parse shell command text into a total command tree.
 
@@ -689,4 +1018,4 @@ def parse_command(text: str, *, recover_heredocs: bool = False) -> Command:
         The command tree. A parse that needed recovery lists its reasons in
         `Command.recovery`; the tree is never absent.
     """
-    return _Parser(text, recover_heredocs=recover_heredocs)._parse()
+    return parse_source(SourceText(text), recover_heredocs=recover_heredocs)

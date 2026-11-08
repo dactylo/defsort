@@ -19,6 +19,7 @@ from defsort._core._analysis import (
     find_cycles,
     get_node_end_line,
     is_overload_decorated,
+    method_binds_other_names,
 )
 from defsort._core._banners import (
     GapClassification,
@@ -785,7 +786,7 @@ def parse_class_methods(
     banner_pattern: str | re.Pattern[str] | None = None,
     collect_bodies: bool = True,
 ) -> _MethodParseResult:
-    """Extract MethodDefinition objects from a class body.
+    """Extract `MethodDefinition` objects from a class body.
 
     Args:
         cls: The class AST node.
@@ -798,6 +799,12 @@ def parse_class_methods(
 
     Returns:
         Parsed methods, layout, and class-local banner metadata.
+
+    Raises:
+        TypeError: If an active banner pattern is neither a string, a compiled
+            pattern, nor `None`.
+        ValueError: If an active string banner pattern does not compile or uses
+            unsupported syntax. Compilation failures chain `re.error`.
     """
     method_names = {
         m.name for m in cls.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -846,6 +853,7 @@ def parse_class_methods(
                 annotation_refs=annotation_refs,
                 body_refs=body_refs,
                 eager_reads=reads,
+                binds_other_names=method_binds_other_names(func, cls),
                 has_eager_evaluation=bool(
                     func.decorator_list
                     or func.args.defaults
@@ -1027,6 +1035,11 @@ def collect_method_coordinates(
 
     Returns:
         Parsed method metadata keyed by class identity.
+
+    Raises:
+        TypeError: If an active banner pattern is neither a string nor `None`.
+        ValueError: If an active banner pattern does not compile or uses
+            unsupported syntax. Compilation failures chain `re.error`.
     """
     lines = split_physical_lines(source, keepends=True)
     pattern = compile_banner_pattern(banner_pattern) if banners != 'ignore' else None
@@ -1062,6 +1075,11 @@ def collect_method_banner_constraints(
 
     Returns:
         Method constraints in source class and boundary order.
+
+    Raises:
+        TypeError: If an active banner pattern is neither a string nor `None`.
+        ValueError: If an active banner pattern does not compile or uses
+            unsupported syntax. Compilation failures chain `re.error`.
     """
     if policy.banners != 'barriers' or policy.method_order == 'none':
         return []
@@ -1110,6 +1128,10 @@ def per_class_incremental_sort(  # noqa: PLR0911, PLR0913
         LayoutPreservationError: If the requested method order cannot preserve
             layout and comment ownership. The caller must refuse the whole
             file.
+        TypeError: If sorting a new class requires an active policy pattern
+            that is neither a string nor `None`.
+        ValueError: If that pattern does not compile or uses unsupported
+            syntax. Compilation failures chain `re.error`.
     """
     # New class (no baseline match): delegate to full method sort.
     if bl_cls is None:
@@ -1245,6 +1267,9 @@ def sort_file_methods(
         LayoutPreservationError: If a requested method order cannot preserve
             layout and comment ownership. The caller must refuse the whole
             file.
+        TypeError: If an active banner pattern is neither a string nor `None`.
+        ValueError: If an active banner pattern does not compile or uses
+            unsupported syntax. Compilation failures chain `re.error`.
     """
     if policy.method_order == 'none' and policy.banners != 'strip':
         return _FileMethodSortResult(source, (), (), ())

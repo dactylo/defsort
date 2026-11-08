@@ -3,15 +3,15 @@
 import argparse
 import ast
 import enum
+import io
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import redirect_stderr
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import override
 
 from defsort._arguments import add_ordering_arguments, overrides_from_args
-from defsort._color import should_color
 from defsort._config import (
     ResolvedConfig,
     effective_config,
@@ -29,6 +29,7 @@ from defsort._core._api import detect_definition_order
 from defsort._core._full import count_top_level_methods
 from defsort._core._guard import build_guard_params, evaluate_reorder_guard
 from defsort._core._parse import parse_definitions
+from defsort._core._syntax import parse_source
 from defsort._display import (
     build_json_record,
     build_summary_row,
@@ -44,20 +45,18 @@ from defsort._display import (
 from defsort._display._policy import format_policy_block
 from defsort._display._skipped import format_class_blocker
 from defsort._display._types import CliMode, JsonFileRecord, SummaryRow
-from defsort._downstream import stdout_closed
 from defsort._files import (
+    collect_file_groups,
     collect_files,
+    encode_source,
     read_file_result,
     write_source,
 )
 from defsort._git import (
-    UnsupportedGitVersionError,
-    batch_fetch_worktree_baselines,
+    read_head_baselines,
     require_batch_z_support,
-    try_get_repo_root,
 )
 from defsort._main import main as entry_main
-from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import (
     COLOR_MODE_VALUES,
     EXIT_CHANGED,
@@ -65,14 +64,27 @@ from defsort._types import (
     EXIT_OK,
     BlobReadResult,
     BlobReadStatus,
-    ColorMode,
     DetectResult,
     EngineOptions,
-    OrderKind,
     SortOverrides,
     SortResult,
     sort_policy_from_config,
 )
+from defsort._vendor.gitfiles._blobs import UnsupportedGitVersionError
+from defsort._vendor.gitfiles._repo import (
+    RepoDiscoveryResult,
+    RepoDiscoveryStatus,
+    discover_repo_root,
+)
+from defsort._vendor.gitfiles._run import GitCommandError
+from defsort._vendor.hookfront._color import project_color, should_color
+from defsort._vendor.hookfront._diff import DiffSides
+from defsort._vendor.hookfront._notes import OUTSIDE_REPOSITORY, git_unavailable_message
+from defsort._vendor.hookfront._parser import RootParser
+from defsort._vendor.hookfront._streams import stdout_closed
+from defsort._vendor.hookfront._terminal import escape_terminal_text, path_text
+from defsort._vendor.hookfront._version import print_version
+from defsort._vendor.srcfiles import ALIAS_CONFLICT, names_agree
 
 _BASELINE_UNAVAILABLE = 'incremental: unable to read baseline from git'
 _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
@@ -90,29 +102,10 @@ class _FileStatus(enum.Enum):
     UNCHANGED = 'unchanged'
 
 
-class _RootParser(argparse.ArgumentParser):
+class _RootParser(RootParser):
     """Render the option groups, then the commands that have their own parsers."""
 
-    @override
-    def format_help(self, formatter: argparse.HelpFormatter | None = None) -> str:
-        if formatter is None:
-            formatter = self._get_formatter()
-        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
-        formatter.add_text(self.description)
-        for action_group in self._action_groups:
-            formatter.start_section(action_group.title)
-            formatter.add_text(action_group.description)
-            # argparse exposes no public accessor for a group's actions.
-            formatter.add_arguments(action_group._group_actions)  # noqa: SLF001
-            formatter.end_section()
-        for title, commands in _COMMAND_GROUPS:
-            formatter.start_section(title)
-            formatter.add_arguments(
-                [argparse.Action([], name, help=text) for name, text in commands]
-            )
-            formatter.end_section()
-        formatter.add_text(self.epilog)
-        return formatter.format_help()
+    _command_groups = _COMMAND_GROUPS
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +116,7 @@ class _FileSortResult:
     sort_result: SortResult | None = None
     error_message: str | None = None
     encoding: str | None = None
+    raw: bytes = b''
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +135,7 @@ class _ConfigResolver:
     force: bool
     hoist: bool
     add_future: bool
-    warned_configs: set[ResolvedConfig] = field(
+    _warned_configs: set[ResolvedConfig] = field(
         default_factory=set[ResolvedConfig],
         compare=False,
         repr=False,
@@ -152,16 +146,28 @@ class _ConfigResolver:
         repr=False,
     )
 
-    def _for_path(self, path: Path) -> _ResolvedConfig:
-        """Resolve effective configuration for one file."""
+    def for_path(self, path: Path) -> _ResolvedConfig:
+        """Resolve and cache effective configuration for one file.
+
+        Configuration diagnostics go to standard error. Ineffective-policy
+        warnings are emitted once per distinct resolved configuration on this
+        resolver.
+
+        Args:
+            path: File whose configuration and CLI overrides should apply.
+
+        Returns:
+            Effective runtime configuration and engine options. Repeated calls
+            with the same path reuse the cached result.
+        """
         cached = self._cache.get(path)
         if cached is not None:
             return cached
         with render_config_warnings():
             cfg = effective_config(resolve_runtime_config(path), self.overrides)
-        if cfg not in self.warned_configs:
+        if cfg not in self._warned_configs:
             warn_ineffective_policy(cfg.transform)
-            self.warned_configs.add(cfg)
+            self._warned_configs.add(cfg)
         resolved = _ResolvedConfig(
             resolved=cfg,
             options=EngineOptions(
@@ -181,7 +187,6 @@ def _build_parser() -> argparse.ArgumentParser:
         prog='defsort',
         usage='%(prog)s [options] [PATH ...]',
         description='Sort Python functions, classes, and methods by a configurable policy.',
-        allow_abbrev=False,
     )
     parser.add_argument(
         'paths',
@@ -303,7 +308,7 @@ def _file_result_to_json(
     file_result: _FileSortResult,
     options: EngineOptions,
 ) -> JsonFileRecord:
-    """Map a _FileSortResult to the dict format expected by format_json()."""
+    """Map a `_FileSortResult` to the dict format expected by `format_json()`."""
     status_value: str = file_result.status.value
 
     if file_result.status in (_FileStatus.ERROR, _FileStatus.INVALID):
@@ -335,7 +340,7 @@ def _file_result_to_json(
 
 
 def _guarded_skip(result: SortResult, warning: str) -> SortResult:
-    """Clone a SortResult as a guarded skip (new_source reset to original)."""
+    """Clone a `SortResult` as a guarded skip (`new_source` reset to original)."""
     return replace(
         result,
         new_source=result.original_source,
@@ -359,6 +364,8 @@ def _apply_reorder_guard(  # noqa: PLR0911
         return result
     if not config.resolved.guard_enabled:
         return result
+    if baseline is not None and baseline.status is BlobReadStatus.OUTSIDE_REPOSITORY:
+        return _guarded_skip(result, OUTSIDE_REPOSITORY)
     if result.original_source == result.new_source:
         return result
 
@@ -366,7 +373,11 @@ def _apply_reorder_guard(  # noqa: PLR0911
         return result
 
     if baseline.status in (BlobReadStatus.INFRA_ERROR, BlobReadStatus.DECODE_FAILED):
-        return _guarded_skip(result, 'reorder guard: unable to read baseline from git')
+        return _guarded_skip(
+            result,
+            'reorder guard: unable to read baseline from git'
+            + (f': {baseline.detail}' if baseline.detail else ''),
+        )
 
     # CONTENT: parse baseline into definitions for the guard
     assert baseline.content is not None  # noqa: S101
@@ -384,10 +395,10 @@ def _apply_reorder_guard(  # noqa: PLR0911
     return _guarded_skip(result, guard_result.message)
 
 
-def _print_class_blockers(result: SortResult) -> None:
+def _print_class_blockers(result: SortResult, path: str, *, preview: bool = False) -> None:
     """Print class blockers for a processed file."""
     for class_blocker in result.class_blockers:
-        print(format_class_blocker(class_blocker), file=sys.stderr)
+        print(format_class_blocker(class_blocker, path=path, preview=preview), file=sys.stderr)
 
 
 def _print_path_error(path: Path, detail: str) -> None:
@@ -395,19 +406,6 @@ def _print_path_error(path: Path, detail: str) -> None:
     safe_path = escape_terminal_text(path_text(path))
     safe_detail = escape_terminal_text(detail)
     print(f'error: {safe_path}: {safe_detail}', file=sys.stderr)
-
-
-def _print_version() -> int:
-    """Print the installed distribution version without other work."""
-    import importlib.metadata  # noqa: PLC0415
-
-    try:
-        version = importlib.metadata.version('defsort')
-    except importlib.metadata.PackageNotFoundError:
-        print('error: installed distribution metadata for defsort is unavailable', file=sys.stderr)
-        return EXIT_ERROR
-    print(f'defsort {version}')
-    return EXIT_OK
 
 
 def _repo_root_covers_parent(parent: Path, root: Path) -> bool:
@@ -425,10 +423,10 @@ def _repo_root_covers_parent(parent: Path, root: Path) -> bool:
     return True
 
 
-def _discover_repo_roots(paths: list[Path]) -> dict[Path, Path | None]:
+def _discover_repo_roots(paths: list[Path]) -> dict[Path, RepoDiscoveryResult]:
     """Map each resolved path to its git repository root, if any."""
-    repo_roots: dict[Path, Path | None] = {}
-    root_cache: dict[Path, Path | None] = {}
+    repo_roots: dict[Path, RepoDiscoveryResult] = {}
+    root_cache: dict[Path, RepoDiscoveryResult] = {}
     successful_roots: set[Path] = set()
 
     for path in paths:
@@ -441,13 +439,14 @@ def _discover_repo_roots(paths: list[Path]) -> dict[Path, Path | None]:
                 default=None,
             )
             if reusable_root is None or not _repo_root_covers_parent(parent, reusable_root):
-                raw_root = try_get_repo_root(str(parent))
-                discovered_root = Path(raw_root) if raw_root is not None else None
-                root_cache[parent] = discovered_root
-                if discovered_root is not None:
-                    successful_roots.add(discovered_root)
+                discovery = discover_repo_root(str(parent))
+                root_cache[parent] = discovery
+                if discovery.root is not None:
+                    successful_roots.add(Path(discovery.root))
             else:
-                root_cache[parent] = reusable_root
+                root_cache[parent] = RepoDiscoveryResult(
+                    RepoDiscoveryStatus.WORKTREE, root=str(reusable_root)
+                )
         repo_roots[resolved] = root_cache[parent]
 
     return repo_roots
@@ -459,40 +458,68 @@ def _batch_fetch_cli_baselines(
     """Batch-read baseline content for CLI incremental mode."""
     repo_roots = _discover_repo_roots(paths)
     results: dict[Path, BlobReadResult] = {}
-    by_root: dict[Path, list[tuple[Path, str]]] = {}
+    by_root: dict[Path, list[Path]] = {}
 
     for path in paths:
         resolved = path.resolve()
-        root = repo_roots.get(resolved)
-        if root is None:
-            results[path] = BlobReadResult(status=BlobReadStatus.INFRA_ERROR)
+        discovery = repo_roots[resolved]
+        if discovery.status is RepoDiscoveryStatus.ERROR:
+            raise GitCommandError(discovery.detail or 'failed to discover git work tree')
+        if discovery.root is None:
+            results[path] = BlobReadResult(status=BlobReadStatus.OUTSIDE_REPOSITORY)
             continue
+        root = Path(discovery.root)
         try:
             rel = resolved.relative_to(root).as_posix()
         except ValueError:
             results[path] = BlobReadResult(status=BlobReadStatus.INFRA_ERROR)
             continue
-        pairs = by_root.setdefault(root, [])
+        repo_paths = by_root.setdefault(root, [])
         try:
             rel.encode('utf-8')
         except UnicodeEncodeError:
             results[path] = BlobReadResult(status=BlobReadStatus.INFRA_ERROR)
             continue
-        pairs.append((path, rel))
+        repo_paths.append(path)
 
-    for root, pairs in by_root.items():
-        if not pairs:
+    for root, repo_paths in by_root.items():
+        if not repo_paths:
             require_batch_z_support(str(root))
             continue
-        rels = [rel for _, rel in pairs]
-        bl_result = batch_fetch_worktree_baselines(str(root), rels)
-        if bl_result is None:
-            for orig, _ in pairs:
-                results[orig] = BlobReadResult(status=BlobReadStatus.INFRA_ERROR)
-            continue
-        for orig, rel in pairs:
-            results[orig] = bl_result[rel]
+        bl_result = read_head_baselines(str(root), repo_paths)
+        results.update(bl_result)
     return results
+
+
+def _preflight_cli_baselines(
+    paths: list[Path], resolved_configs: list[_ResolvedConfig], diagnostics: io.StringIO
+) -> dict[Path, BlobReadResult] | int | None:
+    """Release deferred diagnostics unless required Git preflight fails."""
+    baseline_configs = [
+        (path, cfg)
+        for path, cfg in zip(paths, resolved_configs, strict=True)
+        if cfg.resolved.incremental or (cfg.resolved.guard_enabled and not cfg.options.force)
+    ]
+    cli_baselines: dict[Path, BlobReadResult] | None = None
+    try:
+        if baseline_configs:
+            cli_baselines = _batch_fetch_cli_baselines([path for path, _ in baseline_configs])
+    except GitCommandError as error:
+        message = git_unavailable_message(
+            error.detail,
+            incremental=any(cfg.resolved.incremental for _, cfg in baseline_configs),
+            guard=any(
+                cfg.resolved.guard_enabled and not cfg.options.force for _, cfg in baseline_configs
+            ),
+        )
+        print('error: ' + escape_terminal_text(message), file=sys.stderr)
+        return EXIT_ERROR
+    except UnsupportedGitVersionError as error:
+        sys.stderr.write(diagnostics.getvalue())
+        print(str(error), file=sys.stderr)
+        return EXIT_ERROR
+    sys.stderr.write(diagnostics.getvalue())
+    return cli_baselines
 
 
 def _run_detect(
@@ -502,13 +529,11 @@ def _run_detect(
     verbose: bool = False,
 ) -> int:
     """Run --detect mode: classify file ordering."""
-    counts: dict[OrderKind, int] = {}
-    total = 0
     entries: list[tuple[str, DetectResult | None]] = []
     error_seen = False
 
     for path in sorted(paths):
-        options = resolver._for_path(path).options  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        options = resolver.for_path(path).options
         try:
             source = read_file_result(path).source
         except (OSError, ValueError, SyntaxError, UnicodeDecodeError) as e:
@@ -516,8 +541,7 @@ def _run_detect(
             error_seen = True
             continue
         try:
-            tree = ast.parse(source)
-            compile(tree, str(path), 'exec')
+            tree = parse_source(source, filename=str(path), check=True)
         except SyntaxError as e:
             _print_path_error(path, str(e))
             error_seen = True
@@ -533,15 +557,18 @@ def _run_detect(
             entries.append((str(path), None))
             continue
 
-        total += 1
-        counts[result.order] = counts.get(result.order, 0) + 1
         entries.append((str(path), result))
 
-    print_detect(entries, (counts, total), verbose=verbose)
+    print_detect(entries, verbose=verbose)
 
     if error_seen:
         return EXIT_ERROR
     return EXIT_OK
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
+    """Run the command-line interface through the shared entry point."""
+    return entry_main(argv)
 
 
 def _run_show_policy(raw_paths: list[str], overrides: SortOverrides) -> int:
@@ -576,7 +603,7 @@ def _run_sort(
     if not config.resolved.incremental or baseline_raw is None:
         return sort_file(source, options=config.options, _tree=tree)
     match baseline_raw.status:
-        case BlobReadStatus.MISSING:
+        case BlobReadStatus.MISSING | BlobReadStatus.OUTSIDE_REPOSITORY:
             return sort_file(source, options=config.options, _tree=tree)
         case BlobReadStatus.CONTENT:
             assert baseline_raw.content is not None  # noqa: S101
@@ -590,22 +617,16 @@ def _run_sort(
             raise AssertionError(baseline_raw.status)
 
 
-def _sort_one_file(  # noqa: PLR0911
+def _sort_read_source(  # noqa: PLR0911
     path: Path,
+    source: str,
+    encoding: str,
     config: _ResolvedConfig,
     baseline: BlobReadResult | None,
 ) -> _FileSortResult:
-    """Read, sort, and guard-check a single file."""
+    """Sort and guard-check one file's decoded source."""
     try:
-        file_result = read_file_result(path)
-    except (OSError, UnicodeDecodeError, SyntaxError, ValueError) as exc:
-        return _FileSortResult(status=_FileStatus.ERROR, error_message=str(exc))
-
-    source, encoding = file_result.source, file_result.encoding
-
-    try:
-        tree = ast.parse(source)
-        compile(tree, str(path), 'exec')
+        tree = parse_source(source, filename=str(path), check=True)
     except (SyntaxError, ValueError) as exc:
         return _FileSortResult(
             status=_FileStatus.INVALID,
@@ -618,7 +639,12 @@ def _sort_one_file(  # noqa: PLR0911
     if (
         config.resolved.incremental
         and baseline is not None
-        and baseline.status in (BlobReadStatus.INFRA_ERROR, BlobReadStatus.DECODE_FAILED)
+        and baseline.status
+        in (
+            BlobReadStatus.INFRA_ERROR,
+            BlobReadStatus.DECODE_FAILED,
+            BlobReadStatus.OUTSIDE_REPOSITORY,
+        )
     ):
         parsed = parse_definitions(
             source,
@@ -633,7 +659,17 @@ def _sort_one_file(  # noqa: PLR0911
                 new_source=source,
                 original_order=parsed.definitions,
                 new_order=parsed.definitions,
-                warning=_BASELINE_UNAVAILABLE,
+                warning=(
+                    OUTSIDE_REPOSITORY
+                    if baseline.status is BlobReadStatus.OUTSIDE_REPOSITORY
+                    else _BASELINE_UNAVAILABLE
+                    + (f': {baseline.detail}' if baseline.detail else '')
+                ),
+                guarded=(
+                    baseline.status is BlobReadStatus.OUTSIDE_REPOSITORY
+                    and config.resolved.guard_enabled
+                    and not config.options.force
+                ),
                 blocking_code=[],
                 skipped=True,
                 total_methods=count_top_level_methods(tree),
@@ -680,17 +716,82 @@ def _sort_one_file(  # noqa: PLR0911
     )
 
 
+def _sort_one_file(
+    path: Path,
+    config: _ResolvedConfig,
+    baseline: BlobReadResult | None,
+) -> _FileSortResult:
+    """Read, sort, and guard-check a single file."""
+    try:
+        file_result = read_file_result(path)
+    except (OSError, UnicodeDecodeError, SyntaxError, ValueError) as exc:
+        return _FileSortResult(status=_FileStatus.ERROR, error_message=str(exc))
+    result = _sort_read_source(path, file_result.source, file_result.encoding, config, baseline)
+    return replace(result, raw=file_result.raw)
+
+
+def _alias_result(
+    path: Path,
+    resolver: _ConfigResolver,
+    baselines: dict[Path, BlobReadResult] | None,
+) -> tuple[_FileSortResult, bytes | None]:
+    """Sort one name of a file, with the bytes it needs or None when that cannot be computed."""
+    config = resolver.for_path(path)
+    file_result = _sort_one_file(path, config, baselines.get(path) if baselines else None)
+    result = file_result.sort_result
+    encoding = file_result.encoding
+    if (
+        file_result.status in (_FileStatus.ERROR, _FileStatus.INVALID)
+        or result is None
+        or encoding is None
+    ):
+        return file_result, None
+    if file_result.status is _FileStatus.CHANGED:
+        return file_result, encode_source(result.new_source, encoding)
+    return file_result, file_result.raw
+
+
+def _group_results(
+    groups: list[list[Path]],
+    resolver: _ConfigResolver,
+    baselines: dict[Path, BlobReadResult] | None,
+) -> Iterator[tuple[list[Path], _FileSortResult | None]]:
+    """Preserve alias write agreement and report outside skips under their own names."""
+    for group in groups:
+        if stdout_closed():
+            return
+        sorted_names = [_alias_result(path, resolver, baselines) for path in group]
+        outside_results = [
+            ([path], result)
+            for path, (result, _) in zip(group, sorted_names, strict=True)
+            if result.sort_result is not None and result.sort_result.warning == OUTSIDE_REPOSITORY
+        ]
+        if not names_agree([needed for _, needed in sorted_names]):
+            yield from outside_results
+            yield group, None
+            continue
+        # Agreeing names keep the original bytes. Each outside name still needs its own skip.
+        yield from outside_results or [(group, sorted_names[0][0])]
+
+
 def _run_json_mode(
-    paths: list[Path],
+    groups: list[list[Path]],
     resolver: _ConfigResolver,
     baselines: dict[Path, BlobReadResult] | None,
 ) -> int:
     """Process files in JSON output mode."""
     records: list[JsonFileRecord] = []
-    for path in paths:
-        config = resolver._for_path(path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        baseline = baselines.get(path) if baselines else None
-        file_result = _sort_one_file(path, config, baseline)
+    for group, file_result in _group_results(groups, resolver, baselines):
+        path = group[0]
+        if file_result is None:
+            names = ', '.join(str(name) for name in group)
+            records.append(
+                build_json_record(
+                    str(path), 'error', warning=f'{ALIAS_CONFLICT}: {names}; not processed'
+                )
+            )
+            continue
+        config = resolver.for_path(path)
         record = _file_result_to_json(path, file_result, config.options)
         records.append(record)
     print(format_json(records))
@@ -704,7 +805,7 @@ def _run_json_mode(
 
 
 def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
-    paths: list[Path],
+    groups: list[list[Path]],
     mode: CliMode,
     resolver: _ConfigResolver,
     baselines: dict[Path, BlobReadResult] | None,
@@ -719,16 +820,20 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
     first_output = True
     changes_seen = False
     error_seen = False
-    skipped_results: list[tuple[str, SortResult, bool]] = []
+    skipped_results: list[tuple[str, SortResult, bool, bool]] = []
     had_output = False
 
-    for path in paths:
+    for group, file_result in _group_results(groups, resolver, baselines):
         if stdout_closed():
             break
-        config = resolver._for_path(path)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        path = group[0]
+        if file_result is None:
+            names = ', '.join(escape_terminal_text(path_text(name)) for name in group)
+            print(f'error: {names}: {ALIAS_CONFLICT}; not processed', file=sys.stderr)
+            error_seen = True
+            continue
+        config = resolver.for_path(path)
         ordering = config.options.policy.definition_order
-        baseline = baselines.get(path) if baselines else None
-        file_result = _sort_one_file(path, config, baseline)
 
         if file_result.status in (_FileStatus.ERROR, _FileStatus.INVALID):
             _print_path_error(path, file_result.error_message or '')
@@ -753,7 +858,20 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 print(constraint_details, file=sys.stderr)
 
         if file_result.status is _FileStatus.SKIPPED:
-            skipped_results.append((str(path), result, config.resolved.show_skips))
+            hoist_clears = False
+            if (
+                mode is CliMode.PREVIEW
+                and result.blocker == 'interstitial'
+                and not config.options.hoist
+            ):
+                assert file_result.encoding is not None  # noqa: S101
+                hoist_config = replace(config, options=replace(config.options, hoist=True))
+                baseline = baselines.get(path) if baselines else None
+                hoist_result = _sort_read_source(
+                    path, result.original_source, file_result.encoding, hoist_config, baseline
+                )
+                hoist_clears = hoist_result.status in (_FileStatus.CHANGED, _FileStatus.UNCHANGED)
+            skipped_results.append((str(path), result, config.resolved.show_skips, hoist_clears))
             changes_seen = True
             continue
 
@@ -770,11 +888,12 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     path,
                     result.new_source,
                     encoding=file_result.encoding,
+                    raw=file_result.raw,
                 )
             except OSError as e:
                 _print_path_error(path, str(e))
                 error_seen = True
-                _print_class_blockers(result)
+                _print_class_blockers(result, str(path))
                 continue
 
         if mode is CliMode.PREVIEW:
@@ -792,31 +911,34 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 had_output = True
             if file_result.status is _FileStatus.CHANGED:
                 changes_seen = True
-            _print_class_blockers(result)
+            _print_class_blockers(result, str(path), preview=True)
 
         elif mode is CliMode.DIFF:
+            assert file_result.encoding is not None  # noqa: S101
+            new_bytes = file_result.raw
             if file_result.status is _FileStatus.CHANGED:
                 changes_seen = True
                 had_output = True
+                new_bytes = encode_source(result.new_source, file_result.encoding)
             print_diff(
-                result,
+                DiffSides(file_result.raw, new_bytes, file_result.encoding),
                 str(path),
                 verbose=verbose,
                 ordering=ordering,
                 color=stdout_color,
             )
-            _print_class_blockers(result)
+            _print_class_blockers(result, str(path))
 
         elif mode is CliMode.SUMMARY:
             if file_result.status is _FileStatus.CHANGED:
                 changes_seen = True
             summary_rows.append(build_summary_row(str(path), result))
-            _print_class_blockers(result)
+            _print_class_blockers(result, str(path))
 
         elif mode is CliMode.WRITE:
             # WRITE does not set changes_seen -- exit 0 after successful writes.
             summary_rows.append(build_summary_row(str(path), result))
-            _print_class_blockers(result)
+            _print_class_blockers(result, str(path))
 
     if summary_rows and mode in (CliMode.SUMMARY, CliMode.WRITE):
         output = format_summary_rows(summary_rows, verbose=verbose, color=stdout_color)
@@ -825,15 +947,15 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
             had_output = True
 
     visible_skips = [
-        (skip_path, skip_result)
-        for skip_path, skip_result, skip_visible in skipped_results
+        (skip_path, skip_result, hoist_clears)
+        for skip_path, skip_result, skip_visible, hoist_clears in skipped_results
         if skip_visible or mode is CliMode.PREVIEW
     ]
     if visible_skips:
         sys.stdout.flush()
         if had_output:
             print(file=sys.stderr)
-        for index, (skip_path, skip_result) in enumerate(visible_skips):
+        for index, (skip_path, skip_result, hoist_clears) in enumerate(visible_skips):
             if index and mode is CliMode.PREVIEW:
                 print(file=sys.stderr)
             print_skipped(
@@ -842,20 +964,35 @@ def _run_text_mode(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 mode=mode,
                 color=stderr_color,
                 verbose=verbose,
+                hoist_clears=hoist_clears,
             )
             if mode in (CliMode.SUMMARY, CliMode.PREVIEW):
-                _print_class_blockers(skip_result)
+                _print_class_blockers(skip_result, skip_path, preview=mode is CliMode.PREVIEW)
 
     return changes_seen, error_seen
 
 
 def run_cli(args: list[str]) -> int:  # noqa: C901, PLR0912
-    """Parse CLI arguments and dispatch the selected operation."""
+    """Parse CLI arguments and dispatch the selected operation.
+
+    The selected mode prints diagnostics or results and may rewrite files when
+    `--write` is selected.
+
+    Args:
+        args: Command-line arguments excluding the executable name.
+
+    Returns:
+        0 on success, 1 when proposed changes or skips need attention, or 2
+        when an error occurs.
+
+    Raises:
+        SystemExit: After displaying help or rejecting command-line arguments.
+    """
     parser = _build_parser()
     options = parser.parse_args(args)
 
     if options.version:
-        return _print_version()
+        return print_version('defsort')
 
     if options.show_policy and options.detect:
         parser.error('--show-policy is not allowed with --detect')
@@ -864,19 +1001,25 @@ def run_cli(args: list[str]) -> int:  # noqa: C901, PLR0912
         return _run_show_policy(options.paths, overrides)
 
     raw_paths: list[str] = options.paths
-    paths = collect_files(raw_paths)
+    diagnostics = io.StringIO()
+    try:
+        with redirect_stderr(diagnostics):
+            groups = collect_file_groups(raw_paths)
+            paths = [path for group in groups for path in group]
+            if not paths:
+                print('warning: no Python files found under the given paths', file=sys.stderr)
 
-    resolver = _ConfigResolver(
-        overrides=overrides,
-        force=options.force,
-        hoist=options.hoist,
-        add_future=not options.no_future,
-    )
-    resolved_configs = [resolver._for_path(path) for path in paths]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    config_colors: set[ColorMode | None] = {cfg.resolved.color for cfg in resolved_configs}
-    config_color: ColorMode | None = (
-        next(iter(config_colors)) if len(config_colors) == 1 else 'auto'
-    )
+            resolver = _ConfigResolver(
+                overrides=overrides,
+                force=options.force,
+                hoist=options.hoist,
+                add_future=not options.no_future,
+            )
+            resolved_configs = [resolver.for_path(path) for path in paths]
+    except BaseException:
+        sys.stderr.write(diagnostics.getvalue())
+        raise
+    config_color = project_color(cfg.resolved.color for cfg in resolved_configs)
 
     stdout_color = should_color(
         sys.stdout,
@@ -891,29 +1034,23 @@ def run_cli(args: list[str]) -> int:  # noqa: C901, PLR0912
 
     if options.detect:
         if options.preview or options.diff or options.write:
+            sys.stderr.write(diagnostics.getvalue())
             parser.error('--detect is not allowed with -p/--preview, -d/--diff, or -w/--write')
         if not options.json:
+            sys.stderr.write(diagnostics.getvalue())
             return _run_detect(
-                paths,
+                [group[0] for group in groups],
                 resolver=resolver,
                 verbose=options.verbose,
             )
         # --detect with --json: silently ignored (detect fields always in JSON)
 
-    needs_baselines = any(
-        cfg.resolved.incremental or cfg.resolved.guard_enabled for cfg in resolved_configs
-    )
-
-    cli_baselines: dict[Path, BlobReadResult] | None = None
-    if needs_baselines:
-        try:
-            cli_baselines = _batch_fetch_cli_baselines(paths)
-        except UnsupportedGitVersionError as error:
-            print(str(error), file=sys.stderr)
-            return EXIT_ERROR
+    cli_baselines = _preflight_cli_baselines(paths, resolved_configs, diagnostics)
+    if isinstance(cli_baselines, int):
+        return cli_baselines
 
     if options.json:
-        exit_code = _run_json_mode(paths, resolver, cli_baselines)
+        exit_code = _run_json_mode(groups, resolver, cli_baselines)
     else:
         multi = len(raw_paths) > 1 or any(Path(path).is_dir() for path in raw_paths)
         if options.write:
@@ -926,7 +1063,7 @@ def run_cli(args: list[str]) -> int:  # noqa: C901, PLR0912
             mode = CliMode.SUMMARY
 
         changes_seen, error_seen = _run_text_mode(
-            paths,
+            groups,
             mode,
             resolver,
             cli_baselines,
@@ -944,17 +1081,5 @@ def run_cli(args: list[str]) -> int:  # noqa: C901, PLR0912
     return exit_code
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the command-line interface through the shared entry point.
-
-    Args:
-        argv: Arguments to parse, or `None` to use `sys.argv`.
-
-    Returns:
-        The process exit status.
-    """
-    return entry_main(argv)
-
-
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_main())

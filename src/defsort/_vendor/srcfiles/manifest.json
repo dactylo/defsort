@@ -1,0 +1,22 @@
+{
+  "version": "0.1.0",
+  "files": {
+    "src/defsort/_vendor/srcfiles/__init__.py": "77a79035a7bb41a42296790487c0e439cc96acc252f22b8f5eee8b1dcbd7ddf4",
+    "src/defsort/_vendor/srcfiles/_errors.py": "e8c4efdfda5daffdc12fa5c1487efdb341ca1f7791d6aefd2c58f052b67f98e7",
+    "src/defsort/_vendor/srcfiles/_keys.py": "7d03d8b4ffcaeff64316cf4053595d3fdca92d55c2f9f02c71a77c907ce353af",
+    "src/defsort/_vendor/srcfiles/_labels.py": "06aee983d13d2b925285f20258bd94a0c6323c6b6ece5ac17acd481474930329",
+    "src/defsort/_vendor/srcfiles/_paths.py": "9294e62bb1f09c43a49a7b90c9e22e6299725f3095c0f74f7244c60968eeffce",
+    "src/defsort/_vendor/srcfiles/_recovery.py": "3f0e31362a3859b5fdda71908c5426a3ec2234de6ade9d8437781d48041eb019",
+    "src/defsort/_vendor/srcfiles/_signals.py": "ec823ef2f65205690d54a0ded39f4be7590e590d5f8561f13dc469f8bb2ed24e",
+    "src/defsort/_vendor/srcfiles/_write.py": "2ee6620e4716a17e48992ad28f16c9a67e2a6652079ae92ccd20211b29c25b45",
+    "tests/srcfiles/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tests/srcfiles/_support.py": "776262bfd503fdc3e537260111f325f786507447727e4d8425b73dd64685bbc6",
+    "tests/srcfiles/test_keys.py": "a37d54e73802e105cf1512471c29e7dc7074cc9bbe34341dc1bc55836396a50d",
+    "tests/srcfiles/test_labels.py": "b705280cf951513b8d3a502cffd05b84eee6e7d4921749dc2c7aeb5d5ac45038",
+    "tests/srcfiles/test_metadata.py": "37f878c45fe1118ac6f4683370a9dad71489a7fa1e398db10f41ca7cdfb3046f",
+    "tests/srcfiles/test_paths.py": "beef6c6dc05f359eef8da08e37219f92599ad53a4031ed5c47824d799f423f26",
+    "tests/srcfiles/test_recovery.py": "a0ec8a9a81b6fb5f4a4d007052c50c29340f48a6d56322c80589a1d4f18afbac",
+    "tests/srcfiles/test_signals.py": "58aec730c7cbccc42b812932d2ad8414ee82520ad74424933bdcc5464c7a05f8",
+    "tests/srcfiles/test_write.py": "e9c2bd1f2f1609327ff8ae91b326801f3f2f5fd29408c2ee223d88aa862bcebc"
+  }
+}

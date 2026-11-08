@@ -43,9 +43,8 @@ def resolve_route(route: str, base: str | None, *, logical: bool) -> str | None:
 
     Args:
         route: Literal directory route, including an MSYS mount path.
-        base: Known directory a relative route is resolved against, or `None`
-            when the invocation directory is unknown; an absolute route never
-            reads it.
+        base: Known directory required for a relative route, or `None` when the
+            invocation directory is unknown. Absolute routes do not use it.
         logical: Whether to normalize path components without resolving
             symlinks.
 
@@ -54,8 +53,9 @@ def resolve_route(route: str, base: str | None, *, logical: bool) -> str | None:
         directory.
 
     Raises:
-        ValueError: If the route is relative and `base` is `None`; the grammar
-            rejects that combination before calling.
+        OSError: If path resolution fails, or inspecting the resolved path
+            fails for a reason other than a missing path or a non-directory
+            component.
     """
     normalized = normalize_msys_path(route)
     path = Path(normalized)

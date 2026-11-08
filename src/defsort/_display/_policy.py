@@ -3,8 +3,8 @@
 from pathlib import Path
 
 from defsort._config import ResolvedConfig
-from defsort._terminal import escape_terminal_text, path_text
 from defsort._types import sort_policy_from_config
+from defsort._vendor.hookfront._terminal import escape_terminal_text, path_text
 
 
 def format_policy_block(

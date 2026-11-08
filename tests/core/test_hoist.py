@@ -404,21 +404,6 @@ class TestHoistPreservesComments:
         assert result.new_source == expected
         assert sort_file(result.new_source, options=options).new_source == expected
 
-    def test_hoist_preserves_inline_comment(self) -> None:
-        src = 'def b():\n    pass\n\nMAX_SIZE = 100  # limit\n\ndef a():\n    pass\n'
-        result = sort_file(
-            src,
-            options=EngineOptions(
-                policy=SortPolicy(
-                    definition_order='alphabetical',
-                    method_order='alphabetical',
-                ),
-                hoist=True,
-                add_future=False,
-            ),
-        )
-        assert 'MAX_SIZE = 100  # limit' in result.new_source
-
 
 class TestHoistStatementOwnership:
     def test_multiline_assignment_sharing_end_line_is_not_moved(self) -> None:

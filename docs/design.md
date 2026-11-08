@@ -1,13 +1,7 @@
 # Concepts and safety
 
-defsort makes definition order a deterministic, configurable project policy. As people and coding
-agents add functions, placement can reflect the sequence of edits. defsort applies an ordering
-convention across those edits, with dependency and alphabetical strategies and separate controls
-for top-level definitions and class methods.
-
-Start with the [quick start](../README.md#quick-start). This guide explains how to choose a policy,
-what sorting preserves, and where its safety checks stop. The [CLI reference](cli.md) lists every
-flag and configuration value.
+Use this guide to choose a definition-ordering policy and understand what defsort preserves. The
+[CLI reference](cli.md) lists the controls; the sections below explain their tradeoffs and limits.
 
 ## Choose an ordering policy
 
@@ -167,15 +161,16 @@ method order. Banners can protect boundaries between stable sections.
 
 The CLI skips blocked candidates and reports why. A hard file-level blocker causes the PreToolUse
 hook to deny the commit; incremental-policy and reorder-guard skips warn instead. PostToolUse
-reports the problem after the edit. See [hook failure behavior](hook.md#blocked-sort) and
+reports the problem after the edit. See [hook failure behavior](hook-reference.md#blocked-sort) and
 [incremental skip conditions](incremental.md#skip-conditions) for the distinctions.
 
 A class-local blocker leaves that class's methods in place while independent safe changes may
 proceed. CLI, JSON, and library reports include these partial outcomes.
 
-`--force` bypasses interstitial-code and large-reorder guards. It never bypasses duplicate-name,
-applicable eager-order, or unresolved annotation blockers, and it does not select
-`allow-reordering`. Preview a forced change before writing it.
+For code between definitions, move the code outside the definition sequence, or use `--hoist` when
+the constant is eligible. `--force` overrides interstitial-code and large-reorder guards; review
+`--diff` output before writing a forced change. It never bypasses duplicate-name, applicable
+eager-order, or unresolved annotation blockers, and it does not select `allow-reordering`.
 
 ### What the checks cover
 
@@ -183,6 +178,8 @@ Covered eager reads include decorators, positional and keyword-only defaults, cl
 keywords, and executable class-suite expressions. The comparison includes original bindings from
 imports and assignments before the definitions. An unresolved read that the sort does not worsen
 does not itself block the change.
+
+#### Covered calls and class creation
 
 The model follows direct bare-name calls and decorators into ordinary sibling functions. It follows
 a sibling generator when a class-suite loop or eager comprehension iterates a direct call, or when
@@ -194,6 +191,8 @@ The model also covers reads from a directly named earlier local base's `__init_s
 directly named local metaclass's `__new__`, and a directly constructed local descriptor's
 `__set_name__`. Rebinding the provider invalidates that relationship.
 
+#### Limits of the model
+
 Aliases, attributes, computed calls, async functions, inherited class-creation hooks, arbitrary
 descriptors or metaclasses, and deeper interprocedural execution remain outside this model. Lazy
 type-alias payloads and type-parameter bounds or defaults are excluded. Lambda payloads below an
@@ -203,18 +202,24 @@ behavior can allow an unsafe one. Preserve authored order when those limits matt
 
 ## Source preservation
 
-defsort moves complete definitions with their decorators and owned comments into the existing
-source layout. It preserves surrounding whitespace, line endings, class headers and footers, and
-the final-newline state. Consecutive overload and property groups move together. Sorting does not
-impose blank-line style; run a formatter for that purpose.
+defsort moves complete definitions and methods, including their decorators and owned comments, into
+the existing source slots. It preserves every character outside those blocks, including blank
+lines, whitespace-filled lines, line-ending sequences, preambles, postambles, class headers and
+footers, final-newline state, and fixed banner layout. File and Git I/O preserve that exact source
+text through decoding and encoding.
 
-Trailing comments sometimes require a blank line to remain distinct from the next definition.
-defsort may relocate one authored blank line per affected boundary, preserving that line's bytes.
-See [source preservation in the CLI reference](cli.md#source-preservation) for exact separator and
-mixed-ending behavior, and [platform compatibility](platform.md) for encoding and file metadata.
+Complete separators between adjacent members of a consecutive same-name definition group or
+property group move intact with that group. Other separators and their ownership metadata are
+reassigned to the remaining source positions.
 
-Three optional transformations change more than position: constant hoisting, future-import
-management, and banner stripping. Each changes only its own source spans.
+To keep an owned trailing comment distinct from the next sortable item, defsort may relocate at
+most one authored blank line per affected boundary. It preserves that line exactly and does not
+change the suffix or final-newline state. At the sole ambiguous mixed-ending seam, it may order an
+adjacent lone CR and LF as LF then CR so they remain two physical endings instead of one CRLF
+ending. Every authored byte remains present; this is not general line-ending normalization.
+
+defsort does not implement top-level or method blank-line style. Run a formatter separately when
+you want it to enforce a style convention.
 
 ### Constant hoisting
 
@@ -223,8 +228,12 @@ the preamble area. This can remove an interstitial-code blocker when the constan
 and is not referenced before its original position. Values containing calls or name references are
 not eligible.
 
-Hoisting preserves the assignment's exact source and adjacent authored blank lines. Hooks and the
-public library do not hoist constants.
+Hoisting moves the assignment's exact source span and the consecutive authored blank lines after
+it, or before it when none follow. Hooks and the public library do not hoist constants.
+
+Hoisting, future-import management, and banner stripping change only their own spans. Future-import
+insertion may add the minimum required line terminator; none of these transformations normalizes
+unrelated whitespace or line endings.
 
 ### Future annotations management
 
@@ -239,10 +248,17 @@ sorting there.
 | Agent hooks, full or incremental       | Never                             | When the cleanup conditions below hold |
 | `defsort.sort()` and `defsort.check()` | Never                             | Never                                  |
 
-Cleanup requires no annotations anywhere in the module and no occurrence of the name `annotations`
-as a load, store, or deletion. It preserves combined or aliased future imports and imports sharing
-their physical lines with comments or other statements. It removes every eligible standalone,
-annotations-only import in one sort. Reflective use through strings is not detected.
+An annotation-free module has no annotated assignment and no function or async-function parameter
+or return annotation at any depth. Removal also preserves the import whenever the name
+`annotations` occurs as a load, store, or deletion, including in a local scope. This protects live
+uses such as `annotations.compiler_flag`; reflective uses through string names are not detected.
+
+When policy authorizes removal, automatic cleanup removes every eligible unused duplicate in one
+sort. Each deletion uses a direct top-level, unaliased, annotations-only import's exclusively owned
+physical-line span. Python's parser accepts legal spacing, parentheses, trailing commas, and line
+continuations, including backslashes. Matching docstring text, aliased or combined imports, and
+comments or peer statements on the candidate lines remain unchanged. Cleanup removes all eligible
+duplicates so another sort produces the same result.
 
 On Python 3.14 and later, adding this import selects stringized annotations instead of the default
 deferred annotation values. defsort applies this cross-version policy without inferring your
